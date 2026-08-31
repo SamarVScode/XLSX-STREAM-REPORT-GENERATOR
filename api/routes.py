@@ -103,6 +103,27 @@ async def get_job_status_route(
 ):
     job = get_job(job_id)
     logs = get_job_log_lines(job_id)
+    tabs = job.get("tabs")
+    if not tabs:
+        report_type = str(job.get("report_type") or "").lower().replace("-", "_")
+        default_tabs = {
+            "2nd_attempt_adherence": ["Summary", "Raw"],
+            "second_attempt_adherence": ["Summary", "Raw"],
+            "ei": ["Summary", "Raw", "FWD", "REV", "Agent Summary"],
+            "tat": ["Summary", "SCM TAT raw data"],
+            "scm_tat": ["Summary", "SCM TAT raw data"],
+            "forward_pendency": ["Summary", "Raw", "CPD-DID"],
+            "reverse_pendency": ["Summary", "Raw", "P0"],
+            "conversion": ["Summary", "Raw"],
+            "nps": ["Summary", "Raw"],
+            "vms_adherence": ["Summary", "Raw"],
+            "vms": ["Summary", "Raw"],
+            "eob": ["Summary", "Raw"],
+            "untraceable": ["Summary", "Raw"],
+            "ut": ["Summary", "Raw"]
+        }
+        tabs = default_tabs.get(report_type, ["Summary", "Raw"])
+
     return {
         "job_id": job_id,
         "status": job.get("status"),
@@ -111,6 +132,7 @@ async def get_job_status_route(
         "report_type": job.get("report_type"),
         "sub_type": job.get("sub_type"),
         "file_name": job.get("file_name"),
+        "tabs": tabs,
         "created_at": job.get("created_at"),
         "completed_at": job.get("completed_at"),
         "logs": logs
