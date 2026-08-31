@@ -74,9 +74,17 @@ def recover_jobs_from_disk() -> None:
                     continue
 
                 if data.get("status") == "processing":
-                    data["status"] = "error"
-                    data["error"] = "Job interrupted by server restart."
-                    data["progress"] = "Failed (server restarted)"
+                    # If job was started recently (< 15 mins) and has source data, auto-resume in thread pool
+                    if now - created_at < 900 and (data.get("source_url") or data.get("file_id")):
+                        data["progress"] = "Server recovered. Resuming async processing..."
+                        active_jobs[jid] = data
+                        _save_job(jid, data)
+                        _pool.submit(_execute_job, jid)
+                        log.info(f"🔄 Auto-resumed interrupted async job {jid} on server boot.")
+                    else:
+                        data["status"] = "error"
+                        data["error"] = "Job interrupted by server restart."
+                        data["progress"] = "Failed (server restarted)"
 
                 active_jobs[jid] = data
                 recovered += 1
