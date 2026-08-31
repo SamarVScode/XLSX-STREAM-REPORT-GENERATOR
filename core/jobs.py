@@ -74,12 +74,24 @@ def recover_jobs_from_disk() -> None:
                     continue
 
                 if data.get("status") == "processing":
-                    # If job was started recently (< 15 mins) and has source data, auto-resume in thread pool
-                    if now - created_at < 900 and (data.get("source_url") or data.get("file_id")):
+                    # If job was started recently (< 15 mins) and has source data, auto-resume via process_job_async
+                    source_url = data.get("source_url")
+                    file_id = data.get("file_id")
+                    report_type = data.get("report_type", "ei")
+                    out_p_str = data.get("output_path")
+                    out_p = Path(out_p_str) if out_p_str else (CACHE_DIR / f"REPORT_{jid}.xlsx")
+
+                    if not file_id and source_url:
+                        try:
+                            file_id = extract_file_id(source_url)
+                        except Exception:
+                            file_id = jid
+
+                    if now - created_at < 900 and (source_url or file_id):
                         data["progress"] = "Server recovered. Resuming async processing..."
                         active_jobs[jid] = data
                         _save_job(jid, data)
-                        _pool.submit(_execute_job, jid)
+                        process_job_async(jid, str(file_id or jid), out_p, report_type)
                         log.info(f"🔄 Auto-resumed interrupted async job {jid} on server boot.")
                     else:
                         data["status"] = "error"
