@@ -96,31 +96,36 @@ def read_raw_data(input_file_path: Path) -> pd.DataFrame:
     sheet_name = _resolve_raw_sheet_name(input_file_path)
     ext = input_file_path.suffix.lower()
     
-    if ext == '.xlsb':
-        if HAS_CALAMINE:
+    if HAS_CALAMINE:
+        try:
             wb = CalamineWorkbook.from_path(str(input_file_path))
             sheet = wb.get_sheet_by_name(sheet_name)
             data = sheet.to_python()
-            if not data:
-                raise ValueError(f"Sheet '{sheet_name}' is empty in input file.")
-            header = [str(c).strip() if c is not None else f"Unnamed_{i}" for i, c in enumerate(data[0])]
-            df = pd.DataFrame(data[1:], columns=header)
-        elif HAS_PYXLSB:
+            if data:
+                header = [str(c).strip() if c is not None else f"Unnamed_{i}" for i, c in enumerate(data[0])]
+                return pd.DataFrame(data[1:], columns=header)
+        except Exception:
+            pass
+
+    if ext == '.xlsb':
+        if HAS_PYXLSB:
             data = []
             with open_xlsb(str(input_file_path)) as wb:
                 with wb.get_sheet(sheet_name) as sheet:
                     for row in sheet.rows():
                         data.append([cell.v for cell in row])
-            if not data:
-                raise ValueError(f"Sheet '{sheet_name}' is empty in input file.")
-            header = [str(c).strip() if c is not None else f"Unnamed_{i}" for i, c in enumerate(data[0])]
-            df = pd.DataFrame(data[1:], columns=header)
-        else:
-            df = pd.read_excel(input_file_path, sheet_name=sheet_name, engine='pyxlsb')
+            if data:
+                header = [str(c).strip() if c is not None else f"Unnamed_{i}" for i, c in enumerate(data[0])]
+                return pd.DataFrame(data[1:], columns=header)
+        try:
+            return pd.read_excel(input_file_path, sheet_name=sheet_name, engine='pyxlsb')
+        except Exception:
+            return pd.read_excel(input_file_path, sheet_name=sheet_name)
     else:
-        df = pd.read_excel(input_file_path, sheet_name=sheet_name)
-        
-    return df
+        try:
+            return pd.read_excel(input_file_path, sheet_name=sheet_name)
+        except Exception:
+            return pd.read_excel(input_file_path, sheet_name=0)
 
 
 def get_short_status(status_str):

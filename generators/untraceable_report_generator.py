@@ -44,16 +44,22 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
     input_path = str(input_file)
     output_path = str(output_file)
 
-    # Read ONLY 'Raw' sheet
-    try:
-        df_raw = pd.read_excel(input_path, sheet_name='Raw', engine='pyxlsb')
-    except Exception as e1:
-        log.warning(f"pyxlsb read failed: {e1}. Trying default pandas engine.")
+    # Read ONLY 'Raw' sheet (try calamine / openpyxl / pyxlsb / default)
+    df_raw = None
+    engines = ['calamine', 'openpyxl', 'pyxlsb', None] if not str(input_path).endswith('.xlsb') else ['pyxlsb', 'calamine', None]
+    
+    for eng in engines:
         try:
-            df_raw = pd.read_excel(input_path, sheet_name='Raw')
-        except Exception as e2:
-            log.warning(f"Sheet 'Raw' read failed: {e2}. Reading first sheet.")
+            df_raw = pd.read_excel(input_path, sheet_name='Raw', engine=eng) if eng else pd.read_excel(input_path, sheet_name='Raw')
+            break
+        except Exception:
+            continue
+
+    if df_raw is None:
+        try:
             df_raw = pd.read_excel(input_path, sheet_name=0)
+        except Exception as e:
+            raise ValueError(f"Could not read spreadsheet '{input_path}': {e}")
 
     # Convert numeric fields
     if 'Amount' in df_raw.columns:

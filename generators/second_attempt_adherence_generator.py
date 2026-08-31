@@ -98,20 +98,27 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     rev_rows = []
     summary_rows = []
 
-    if CalamineWorkbook and input_path.suffix.lower() == '.xlsb':
-        wb_cal = CalamineWorkbook.from_path(input_path)
-        sheet_names = wb_cal.sheet_names
-        
-        if "Summary" in sheet_names:
-            summary_rows = wb_cal.get_sheet_by_name("Summary").to_python()
-        if "FWD" in sheet_names:
-            fwd_rows = wb_cal.get_sheet_by_name("FWD").to_python()
-        if "REV" in sheet_names:
-            rev_rows = wb_cal.get_sheet_by_name("REV").to_python()
-    else:
+    if CalamineWorkbook:
+        try:
+            wb_cal = CalamineWorkbook.from_path(str(input_path))
+            sheet_names = wb_cal.sheet_names
+            
+            if "Summary" in sheet_names:
+                summary_rows = wb_cal.get_sheet_by_name("Summary").to_python()
+            if "FWD" in sheet_names:
+                fwd_rows = wb_cal.get_sheet_by_name("FWD").to_python()
+            if "REV" in sheet_names:
+                rev_rows = wb_cal.get_sheet_by_name("REV").to_python()
+        except Exception:
+            wb_cal = None
+
+    if not summary_rows and not fwd_rows and not rev_rows:
         import pandas as pd
         engine = 'pyxlsb' if input_path.suffix.lower() == '.xlsb' else None
-        xls = pd.ExcelFile(input_path, engine=engine)
+        try:
+            xls = pd.ExcelFile(str(input_path), engine=engine) if engine else pd.ExcelFile(str(input_path))
+        except Exception:
+            xls = pd.ExcelFile(str(input_path))
         if "Summary" in xls.sheet_names:
             summary_rows = pd.read_excel(xls, "Summary", header=None).values.tolist()
         if "FWD" in xls.sheet_names:
