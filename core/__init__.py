@@ -2,10 +2,8 @@
 Core package for ei_stream_server.
 """
 from .downloader import (
-    download_drive_file,
     download_from_url,
     extract_file_id,
-    is_direct_download_url
 )
 from .stream_engine import (
     stream_sheet_rows,
@@ -28,10 +26,8 @@ from .logger import (
 )
 
 __all__ = [
-    "download_drive_file",
     "download_from_url",
     "extract_file_id",
-    "is_direct_download_url",
     "stream_sheet_rows",
     "stream_sheet_dicts",
     "get_sheet_names",

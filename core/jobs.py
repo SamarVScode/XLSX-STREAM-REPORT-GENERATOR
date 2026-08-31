@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional
 from fastapi import HTTPException
 
 from config.settings import CACHE_DIR, CACHE_TTL, CACHE_MAX_AGE, MAX_CONCURRENT_JOBS
-from core.downloader import extract_file_id, download_drive_file, is_direct_download_url, download_from_url
+from core.downloader import extract_file_id, download_from_url
 from core.logger import print_job_start, print_job_step, print_job_success, print_job_error, log_job_message
 from generators import (
     generate_ei_report,
@@ -242,12 +242,9 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
             if needs_download:
                 t0 = time.time()
                 raw_url = active_jobs.get(job_id, {}).get("source_url", "")
-                if raw_url and is_direct_download_url(raw_url):
-                    print_job_step(job_id, 1, "Downloading source file via OAuth URL...")
-                    download_from_url(raw_url, tmp_input, job_id=job_id)
-                else:
-                    print_job_step(job_id, 1, f"Downloading source file from Drive (ID: {file_id})...")
-                    download_drive_file(file_id, tmp_input, job_id=job_id)
+                download_url = raw_url if raw_url else f"https://drive.google.com/uc?export=download&id={file_id}"
+                print_job_step(job_id, 1, f"Downloading source file (ID: {file_id})...")
+                download_from_url(download_url, tmp_input, job_id=job_id)
                 print_job_step(job_id, 1, f"Source file downloaded ({tmp_input.stat().st_size / 1024 / 1024:.2f} MB in {time.time() - t0:.2f}s)")
             else:
                 print_job_step(job_id, 1, f"Using cached source file ({tmp_input.name})")
