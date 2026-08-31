@@ -167,6 +167,9 @@ async def get_job_result(
     if not out_path.exists():
         raise HTTPException(status_code=404, detail="Generated report file has expired or was removed from cache.")
 
+    if out_path.stat().st_size < 1000:
+        raise HTTPException(status_code=500, detail=f"Generated report file is incomplete or empty ({out_path.stat().st_size} bytes).")
+
     download_name = job.get("file_name") or f"EI_REPORT_{job_id}.xlsx"
     return FileResponse(
         path=str(out_path),

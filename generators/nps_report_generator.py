@@ -232,6 +232,10 @@ def generate_nps_report(input_file: Path, output_file: Path):
             ws_raw.cell(row=r_idx, column=c_idx, value=val)
 
     wb_out.save(str(output_file))
+    try:
+        wb_out.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated NPS Report: {output_file}")
 
 def main():

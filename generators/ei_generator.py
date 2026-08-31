@@ -557,5 +557,9 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
 
     log.info("Phase 5: Saving output file")
     wb_out.save(output_file_path)
+    try:
+        wb_out.close()
+    except Exception:
+        pass
     log.info(f"Report saved: {output_file_path}")
     return str(output_file_path)

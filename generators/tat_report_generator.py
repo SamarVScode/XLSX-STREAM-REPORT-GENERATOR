@@ -191,4 +191,8 @@ def generate_tat_report(input_file: Path, output_file: Path):
         ws_raw.append(r)
 
     wb_out.save(str(output_file))
+    try:
+        wb_out.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated SCM TAT Report: {output_file}")

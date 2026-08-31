@@ -358,4 +358,8 @@ def generate_eob_report(input_file: Path, output_file: Path):
 
     # Save Output
     wb.save(output_path)
+    try:
+        wb.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated EOB Report: {output_path.name}")

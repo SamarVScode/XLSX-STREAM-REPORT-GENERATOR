@@ -278,5 +278,9 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
 
     # Save single output file
     wb.save(output_path)
+    try:
+        wb.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated Untraceable Report: {output_path}")
     return output_path

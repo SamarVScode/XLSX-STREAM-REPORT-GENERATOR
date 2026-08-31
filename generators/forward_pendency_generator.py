@@ -355,4 +355,8 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     build_cpd_did_sheet(out_wb, filtered_rows, aging_cat_idx, sdc_idx_new, prio_idx_new, shipment_idx_new, attempt_idx_new)
 
     out_wb.save(output_file)
+    try:
+        out_wb.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated Forward Pendency Report: {output_file}")

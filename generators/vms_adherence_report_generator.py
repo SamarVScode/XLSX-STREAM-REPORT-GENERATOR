@@ -225,6 +225,10 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
         ws_raw_out.column_dimensions[get_column_letter(col)].width = min(max_len + 2, 30)
 
     wb_out.save(str(output_file))
+    try:
+        wb_out.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated VMS Adherence Report: {output_file}")
 
 

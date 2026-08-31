@@ -264,4 +264,8 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     p0_count = build_p0_sheet(out_wb, filtered, header)
 
     out_wb.save(str(output_file))
+    try:
+        out_wb.close()
+    except Exception:
+        pass
     log.info(f"Saved Reverse Pendency Report: {output_file.name} ({len(filtered)} total rows incl header, {p0_count} P0 rows)")
