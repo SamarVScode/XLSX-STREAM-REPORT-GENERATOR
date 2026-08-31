@@ -1,0 +1,20 @@
+======================================================================
+EI STREAM REPORT SERVER — PRODUCTION API CREDENTIALS
+======================================================================
+
+API_KEY:
+OoV81VZ6ugIQ5qu_JNKfDM0jEp0SQyhpuZMaPTv5BbQ
+
+Header Name:
+X-API-KEY
+
+Render.com Environment Variable:
+Key: API_KEY
+Value: OoV81VZ6ugIQ5qu_JNKfDM0jEp0SQyhpuZMaPTv5BbQ
+
+Google Apps Script (Code.js) Variable:
+var API_KEY = "OoV81VZ6ugIQ5qu_JNKfDM0jEp0SQyhpuZMaPTv5BbQ";
+
+GitHub Repository:
+https://github.com/SamarVScode/XLSX-STREAM-REPORT-GENERATOR
+======================================================================
