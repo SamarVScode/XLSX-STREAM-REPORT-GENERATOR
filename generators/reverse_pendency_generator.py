@@ -136,11 +136,17 @@ def build_p0_sheet(out_wb, filtered_rows, header):
     center = Alignment(horizontal="center", vertical="center")
     left = Alignment(horizontal="left", vertical="center")
 
-    tn_idx = header.index('tracking_number')
-    src_dc_idx = header.index('Source DC')
-    aging_idx = header.index('Aging')
-    age_bucket_idx = header.index('Age_Bucket')
-    attempt_idx = header.index('Attempt_Status')
+    col_map = {str(h).strip().lower(): idx for idx, h in enumerate(header) if h is not None}
+    tn_idx = 0
+    for c in ['tracking_number', 'tracking_no', 'tracking_id', 'tracking id', 'waybill', 'awb', 'shipment']:
+        if c in col_map:
+            tn_idx = col_map[c]
+            break
+
+    src_dc_idx = col_map.get('source dc', col_map.get('source_dc', col_map.get('dc', 0)))
+    aging_idx = col_map.get('aging', col_map.get('age', 1))
+    age_bucket_idx = col_map.get('age_bucket', col_map.get('age bucket', len(header) - 1))
+    attempt_idx = col_map.get('attempt_status', col_map.get('status', col_map.get('attempt', 0)))
 
     p0_rows = []
     for row in filtered_rows[1:]:
@@ -195,27 +201,53 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     log.info(f"Reading workbook for Reverse Pendency: {input_file}")
     wb = CalamineWorkbook.from_path(str(input_file))
 
-    if 'Raw' not in wb.sheet_names:
-        raise ValueError(f"Sheet 'Raw' not found. Available: {wb.sheet_names}")
+    target_sheet = None
+    sheet_map = {name.lower(): name for name in wb.sheet_names}
+    for cand in ['raw', 'raw_data', 'data']:
+        if cand in sheet_map:
+            target_sheet = sheet_map[cand]
+            break
+    if not target_sheet:
+        target_sheet = wb.sheet_names[0]
 
-    sheet = wb.get_sheet_by_name('Raw')
+    sheet = wb.get_sheet_by_name(target_sheet)
     rows = list(sheet.iter_rows())
+    if not rows:
+        raise ValueError(f"Sheet '{target_sheet}' is empty.")
     header = rows[0]
 
     log.info(f"Raw sheet: {len(rows)-1} data rows, {len(header)} columns")
 
-    src_dc_idx = header.index('Source DC')
-    region_idx = header.index('Region')
-    aging_idx = header.index('Aging')
-    age_bucket_idx = header.index('Age_Bucket')
+    col_map = {str(h).strip().lower(): idx for idx, h in enumerate(header) if h is not None}
+    
+    src_dc_idx = 0
+    for c in ['source dc', 'source_dc', 'dc']:
+        if c in col_map:
+            src_dc_idx = col_map[c]
+            break
+
+    region_idx = col_map.get('region', None)
+    
+    aging_idx = 1
+    for c in ['aging', 'aging bucket', 'age', 'age_bucket', 'ageing']:
+        if c in col_map:
+            aging_idx = col_map[c]
+            break
+
+    age_bucket_idx = col_map.get('age_bucket') or col_map.get('aging bucket') or col_map.get('age bucket')
+    if age_bucket_idx is None:
+        age_bucket_idx = len(header)
+        header = list(header) + ['Age_Bucket']
 
     filtered = [header]
     for row in rows[1:]:
-        region = str(row[region_idx]).strip() if row[region_idx] else ''
-        src_dc = str(row[src_dc_idx]).strip().upper() if row[src_dc_idx] else ''
-        if region == 'North' and src_dc in ALLOWED_SOURCE_DCS:
+        region = str(row[region_idx]).strip() if (region_idx is not None and len(row) > region_idx and row[region_idx]) else 'North'
+        src_dc = str(row[src_dc_idx]).strip().upper() if (len(row) > src_dc_idx and row[src_dc_idx]) else ''
+        if (region == 'North' or region_idx is None) and src_dc in ALLOWED_SOURCE_DCS:
             row_list = list(row)
-            aging_val = row_list[aging_idx]
+            while len(row_list) <= age_bucket_idx:
+                row_list.append('')
+            aging_val = row_list[aging_idx] if len(row_list) > aging_idx else 0
             bucket = compute_age_bucket(aging_val)
             row_list[age_bucket_idx] = bucket
             filtered.append(row_list)

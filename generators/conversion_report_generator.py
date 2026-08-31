@@ -147,7 +147,15 @@ def _clean_pct_val(val):
 def build_dc_view(input_file: Path) -> pd.DataFrame:
     sheet = _resolve_sheet(input_file, 'E2E_DC')
     df = pd.read_excel(input_file, sheet_name=sheet)
-    df = df[df['Source_DC'].isin(ALLOWED_DCS)].copy()
+    dc_col = None
+    for c in df.columns:
+        if str(c).strip().lower() in ('source_dc', 'source dc', 'dc', 'sourcedc', 'hub'):
+            dc_col = c
+            break
+    if dc_col and dc_col != 'Source_DC':
+        df.rename(columns={dc_col: 'Source_DC'}, inplace=True)
+    if 'Source_DC' in df.columns:
+        df = df[df['Source_DC'].astype(str).str.strip().str.upper().isin(ALLOWED_DCS)].copy()
 
     if 'Picked-up' in df.columns:
         df['Picked-up'] = pd.to_numeric(df['Picked-up'], errors='coerce').fillna(0)
@@ -170,7 +178,15 @@ def build_dc_view(input_file: Path) -> pd.DataFrame:
 def build_agent_view(input_file: Path) -> pd.DataFrame:
     sheet = _resolve_sheet(input_file, 'Agent_view')
     df = pd.read_excel(input_file, sheet_name=sheet)
-    df = df[df['Source_DC'].isin(ALLOWED_DCS)].copy()
+    dc_col = None
+    for c in df.columns:
+        if str(c).strip().lower() in ('source_dc', 'source dc', 'dc', 'sourcedc', 'hub'):
+            dc_col = c
+            break
+    if dc_col and dc_col != 'Source_DC':
+        df.rename(columns={dc_col: 'Source_DC'}, inplace=True)
+    if 'Source_DC' in df.columns:
+        df = df[df['Source_DC'].astype(str).str.strip().str.upper().isin(ALLOWED_DCS)].copy()
 
     # Identify delivery update column name ('del_update' or 'del_ppdate')
     del_col = None

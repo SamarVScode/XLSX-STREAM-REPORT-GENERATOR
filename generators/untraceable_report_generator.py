@@ -80,24 +80,27 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
     df_filtered = df_raw[df_raw[source_dc_col].astype(str).str.strip().str.lower().isin(ALLOWED_DCS_SET_LOWER)].copy()
     log.info(f"Filtered {len(df_filtered)} records out of {len(df_raw)} total records based on dc_config.")
 
+    # Identify Age Bucket column
+    age_bucket_col = None
+    for col in df_filtered.columns:
+        if str(col).strip().lower() in ('age bucket', 'age_bucket', 'aging bucket', 'ageing bucket', 'age'):
+            age_bucket_col = col
+            break
+    if not age_bucket_col:
+        age_bucket_col = 'Age Bucket'
+        if age_bucket_col not in df_filtered.columns:
+            df_filtered[age_bucket_col] = '0-2 Days'
+
     # Determine age bucket order
-    raw_buckets = df_filtered['Age Bucket'].dropna().unique().tolist() if 'Age Bucket' in df_filtered.columns else []
+    raw_buckets = df_filtered[age_bucket_col].dropna().unique().tolist()
     present_buckets = [b for b in STANDARD_AGE_BUCKETS if b in raw_buckets]
     other_buckets = [b for b in raw_buckets if b not in STANDARD_AGE_BUCKETS]
     all_buckets = present_buckets + sorted(other_buckets)
     if not all_buckets:
         all_buckets = STANDARD_AGE_BUCKETS
 
-    # Pivot: Source DC x Age Buckets (Count of ShipmentId)
-    shipment_col = 'ShipmentId' if 'ShipmentId' in df_filtered.columns else df_filtered.columns[0]
-    p_cnt = pd.pivot_table(
-        df_filtered,
-        values=shipment_col,
-        index=source_dc_col,
-        columns='Age Bucket' if 'Age Bucket' in df_filtered.columns else df_filtered.columns[1],
-        aggfunc='count',
-        fill_value=0
-    )
+    # Pivot: Source DC x Age Buckets (Count using groupby.size().unstack())
+    p_cnt = df_filtered.groupby([source_dc_col, age_bucket_col]).size().unstack(fill_value=0)
     p_cnt = p_cnt.reindex(columns=all_buckets, fill_value=0)
 
     # Calculate Sum of Amount for each Source DC

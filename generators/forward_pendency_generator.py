@@ -269,21 +269,15 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     log.info(f"Loading input workbook for Forward Pendency Report: {input_file}")
     in_wb = openpyxl.load_workbook(input_file, data_only=True, read_only=True)
 
-    # Sheet selection with fallback: 'raw_data_North' -> 'raw_data' (with case-insensitive fallback)
+    # Sheet selection with case-insensitive fallback
     target_sheet = None
-    if 'raw_data_North' in in_wb.sheetnames:
-        target_sheet = 'raw_data_North'
-    elif 'raw_data' in in_wb.sheetnames:
-        target_sheet = 'raw_data'
-    else:
-        sheet_map = {name.lower(): name for name in in_wb.sheetnames}
-        if 'raw_data_north' in sheet_map:
-            target_sheet = sheet_map['raw_data_north']
-        elif 'raw_data' in sheet_map:
-            target_sheet = sheet_map['raw_data']
-
-    if not target_sheet:
-        raise ValueError(f"Neither 'raw_data_North' nor 'raw_data' sheet found in input. Available: {in_wb.sheetnames}")
+    sheet_map = {name.lower(): name for name in in_wb.sheetnames}
+    for candidate in ['raw_data_north', 'raw_data', 'raw', 'praw data', 'data']:
+        if candidate in sheet_map:
+            target_sheet = sheet_map[candidate]
+            break
+    if not target_sheet and in_wb.sheetnames:
+        target_sheet = in_wb.sheetnames[0]
 
     in_ws = in_wb[target_sheet]
     log.info(f"Reading rows from '{target_sheet}' sheet...")
@@ -300,16 +294,27 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     for i, row in enumerate(in_ws.iter_rows(values_only=True)):
         if i == 0:
             header_list = list(row)
-            if 'Aging' in header_list:
-                aging_col_idx = header_list.index('Aging')
-            if 'Source_DC' in header_list:
-                sdc_idx = header_list.index('Source_DC')
-            if 'CustomerPriorityV2' in header_list:
-                prio_idx = header_list.index('CustomerPriorityV2')
-            if 'PendingShipments' in header_list:
-                shipment_idx = header_list.index('PendingShipments')
-            if 'Attempt_Status' in header_list:
-                attempt_idx = header_list.index('Attempt_Status')
+            col_map = {str(h).strip().lower(): idx for idx, h in enumerate(header_list) if h is not None}
+            for c in ['aging', 'aging bucket', 'age_bucket', 'ageing']:
+                if c in col_map:
+                    aging_col_idx = col_map[c]
+                    break
+            for c in ['source_dc', 'source dc', 'dc']:
+                if c in col_map:
+                    sdc_idx = col_map[c]
+                    break
+            for c in ['customerpriorityv2', 'priority', 'prio']:
+                if c in col_map:
+                    prio_idx = col_map[c]
+                    break
+            for c in ['pendingshipments', 'tracking_no', 'waybill', 'tracking_id', 'shipment']:
+                if c in col_map:
+                    shipment_idx = col_map[c]
+                    break
+            for c in ['attempt_status', 'status', 'attempt']:
+                if c in col_map:
+                    attempt_idx = col_map[c]
+                    break
 
             header_list.insert(aging_col_idx + 1, 'Aging Category')
             filtered_rows.append(header_list)
