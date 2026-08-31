@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ei-stream-service
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_KEY
+        value: OoV81VZ6ugIQ5qu_JNKfDM0jEp0SQyhpuZMaPTv5BbQ
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: PYTHON_VERSION
+        value: 3.11.0

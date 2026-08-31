@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+*.xlsx
+*.xlsb
+*.csv
+!test_*.py
+.env
+cache/
+ei_stream_cache/
