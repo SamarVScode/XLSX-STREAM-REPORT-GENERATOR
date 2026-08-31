@@ -340,6 +340,10 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     # Save Output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out_wb.save(output_path)
+    try:
+        out_wb.close()
+    except Exception:
+        pass
     log.info(f"Successfully generated 2nd Attempt Adherence report: {output_path} ({output_path.stat().st_size} bytes)")
     return output_path
 

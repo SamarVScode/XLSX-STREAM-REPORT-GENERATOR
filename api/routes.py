@@ -171,8 +171,7 @@ async def get_job_result(
     return FileResponse(
         path=str(out_path),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=download_name,
-        background=BackgroundTask(_cleanup_job_cache, job_id, out_path)
+        filename=download_name
     )
 
 @router.post("/clear-cache")
