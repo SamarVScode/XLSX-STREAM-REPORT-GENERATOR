@@ -47,8 +47,8 @@ def extract_file_id(url_or_id: str) -> str:
     )
 
 def is_direct_download_url(url: str) -> bool:
-    """Returns True if the URL carries an explicit OAuth access_token or API key."""
-    return "access_token" in url or "alt=media" in url
+    """Returns True if the URL carries an explicit OAuth access_token or API key or export format."""
+    return "access_token" in url or "alt=media" in url or "exportFormat=xlsx" in url
 
 def download_from_url(url: str, dest_path: Path) -> Path:
     """
@@ -152,18 +152,21 @@ def download_drive_file(file_id: str, dest_path: Path) -> Path:
     return dest_path
 
 def _validate_downloaded_file(dest_path: Path) -> None:
-    """Raise error if downloaded content is an HTML error page."""
+    """Raise error if downloaded content is an HTML error page instead of a valid spreadsheet."""
     file_size = dest_path.stat().st_size
-    if file_size < 4000:
-        try:
-            with open(dest_path, "r", errors="ignore") as f:
-                head = f.read(2000)
-            if "Google Drive" in head or "Virus scan" in head or "<html" in head.lower():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Downloaded file is an HTML error page. Verify Google Drive sharing permissions."
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+    if file_size < 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Downloaded file is too small ({file_size} bytes). File may be empty or inaccessible."
+        )
+
+    with open(dest_path, "rb") as f:
+        head_bytes = f.read(4096)
+
+    # Check for HTML error or login page
+    head_text = head_bytes[:2048].decode("utf-8", errors="ignore").lower()
+    if "<html" in head_text or "<!doctype html" in head_text or "accounts.google.com" in head_text or "sign in" in head_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Google Drive returned an HTML sign-in/error page instead of an Excel file. Check file sharing permissions ('Anyone with link' viewer) or pass an OAuth access_token."
+        )
