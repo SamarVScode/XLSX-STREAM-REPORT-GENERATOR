@@ -128,6 +128,30 @@ async def get_job_logs_route(
         "logs": logs
     }
 
+import time
+from starlette.background import BackgroundTask
+
+def _cleanup_job_cache(job_id: str, out_path: Path):
+    """Auto-clean memory and disk cache once the report is downloaded, matching clear_jobs.py."""
+    try:
+        time.sleep(3)
+        if out_path.exists():
+            out_path.unlink(missing_ok=True)
+        meta_p = CACHE_DIR / f"JOB_{job_id}.json"
+        if meta_p.exists():
+            meta_p.unlink(missing_ok=True)
+        # Clear any source files and temp outputs associated with this job
+        for p in CACHE_DIR.glob(f"*{job_id}*"):
+            p.unlink(missing_ok=True)
+        for p in CACHE_DIR.glob(f"upload_{job_id}*"):
+            p.unlink(missing_ok=True)
+        # Remove from active_jobs memory map
+        if job_id in active_jobs:
+            del active_jobs[job_id]
+        log.info(f"🧹 Cleaned up cache for job {job_id} after download.")
+    except Exception as e:
+        log.warning(f"Cleanup warning for job {job_id}: {e}")
+
 @router.get("/job/{job_id}/result")
 @router.get("/jobs/{job_id}/result")
 @router.get("/reports/download/{job_id}")
@@ -147,5 +171,23 @@ async def get_job_result(
     return FileResponse(
         path=str(out_path),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=download_name
+        filename=download_name,
+        background=BackgroundTask(_cleanup_job_cache, job_id, out_path)
     )
+
+@router.post("/clear-cache")
+@router.get("/clear-cache")
+async def clear_cache_endpoint(x_api_key: Optional[str] = Depends(verify_api_key)):
+    """Wipes all cached jobs and temporary report files from disk (matching clear_jobs.py)."""
+    patterns = ["JOB_*.json", "REPORT_*.xlsx", "*.xlsx", "*.xlsb", "*.ods", "*.csv", "*.tsv", "*.xls", "*.xlsm"]
+    deleted = 0
+    for pattern in patterns:
+        for f in CACHE_DIR.glob(pattern):
+            try:
+                f.unlink(missing_ok=True)
+                deleted += 1
+            except Exception:
+                pass
+    active_jobs.clear()
+    log.info(f"🧹 Full cache wipe executed: deleted {deleted} files.")
+    return {"status": "ok", "deleted_files": deleted, "cache_dir": str(CACHE_DIR)}
