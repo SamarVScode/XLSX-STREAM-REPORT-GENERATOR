@@ -13,6 +13,7 @@ from core.stream_engine import stream_sheet_rows, get_sheet_names
 
 log = logging.getLogger("ei_stream_server.ei_generator")
 
+# Alias for backward compatibility within this module
 ALLOWED_SOURCE_DC = ALLOWED_SOURCE_DCS
 
 IDENTITY_COLS = 3
@@ -38,8 +39,8 @@ CF_YELLOW_FONT= "854D0E"
 CF_RED_BG     = "FECACA"
 CF_RED_FONT   = "991B1B"
 
-C_WARN_TITLE = "991B1B"
-C_WARN_HDR   = "B91C1C"
+C_WARN_TITLE  = "991B1B"
+C_WARN_HDR    = "B91C1C"
 
 def _fill(hex_color):
     return PatternFill("solid", fgColor=hex_color)
@@ -55,11 +56,37 @@ def _center():
     return Alignment(horizontal="center", vertical="center")
 
 def _fmt_date(dt):
-    if not isinstance(dt, datetime):
-        return str(dt)
-    months = ['Jan','Feb','Mar','Apr','May','Jun',
-              'Jul','Aug','Sep','Oct','Nov','Dec']
-    return f"{dt.day}-{months[dt.month-1]}-{dt.year}"
+    if dt is None:
+        return ""
+    if hasattr(dt, 'year') and hasattr(dt, 'month') and hasattr(dt, 'day'):
+        months = ['Jan','Feb','Mar','Apr','May','Jun',
+                  'Jul','Aug','Sep','Oct','Nov','Dec']
+        return f"{dt.day}-{months[dt.month-1]}-{dt.year}"
+    if isinstance(dt, str):
+        clean = dt.strip().split('T')[0].split(' ')[0]
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y"):
+            try:
+                p = datetime.strptime(clean, fmt)
+                months = ['Jan','Feb','Mar','Apr','May','Jun',
+                          'Jul','Aug','Sep','Oct','Nov','Dec']
+                return f"{p.day}-{months[p.month-1]}-{p.year}"
+            except ValueError:
+                continue
+    return str(dt)
+
+def _get_date_obj(lbl):
+    if isinstance(lbl, datetime):
+        return lbl.date()
+    if hasattr(lbl, 'year') and hasattr(lbl, 'month') and hasattr(lbl, 'day'):
+        return lbl
+    if isinstance(lbl, str):
+        clean = lbl.strip().split('T')[0].split(' ')[0]
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y"):
+            try:
+                return datetime.strptime(clean, fmt).date()
+            except ValueError:
+                continue
+    return None
 
 def _safe_float(val, fallback=0.0):
     try:
@@ -133,11 +160,11 @@ def select_daily_block(blocks):
     daily_blocks = [b for b in blocks if not b['is_wtd']]
 
     for b in daily_blocks:
-        lbl = b['label']
-        if isinstance(lbl, datetime) and lbl.date() == yesterday:
+        d = _get_date_obj(b['label'])
+        if d == yesterday:
             return b
 
-    dated = [(b['label'].date(), b) for b in daily_blocks if isinstance(b['label'], datetime)]
+    dated = [(d, b) for b in daily_blocks if (d := _get_date_obj(b['label'])) is not None]
     if dated:
         dated.sort(key=lambda x: x[0], reverse=True)
         return dated[0][1]
@@ -156,7 +183,8 @@ def select_wtd_block(blocks):
     raise ValueError("No WTD block found.")
 
 def build_date_range(blocks):
-    dates = [b['label'] for b in blocks if not b['is_wtd'] and isinstance(b['label'], datetime)]
+    dates = [_get_date_obj(b['label']) for b in blocks if not b['is_wtd']]
+    dates = [d for d in dates if d is not None]
     if not dates:
         return ''
     dates.sort()
@@ -172,22 +200,22 @@ def parse_raw_tab_stream(file_path: str, raw_sheet_name: str = 'Raw'):
         return [], [], {}, None, None, None, None
 
     headers = [str(h).strip() if h is not None else '' for h in raw_headers]
-    col_map = {h.lower().replace(' ', '_'): idx for idx, h in enumerate(headers)}
+    col_map = {str(h).strip().lower(): idx for idx, h in enumerate(headers) if h is not None}
 
-    def find_col(candidates):
-        for c in candidates:
-            if c in col_map:
-                return col_map[c]
-        for h, idx in col_map.items():
-            for c in candidates:
-                if c in h:
-                    return idx
-        return None
+    dc_idx = None
+    for candidate in ['source_dc', 'source dc', 'dc']:
+        if candidate in col_map:
+            dc_idx = col_map[candidate]
+            break
 
-    dc_idx      = find_col(['source_dc', 'dc', 'sdc', 'source'])
-    track_idx   = find_col(['tracking_id', 'tracking_no', 'tracking_number', 'waybill', 'awb', 'task_id'])
-    fwd_agt_idx = find_col(['agent_name', 'delivery_agent', 'fwd_agent', 'agent', 'rider_name', 'fe_name'])
-    rev_agt_idx = find_col(['pickup_agent', 'rev_agent', 'reverse_agent', 'pickup_fe']) or fwd_agt_idx
+    track_idx = None
+    for candidate in ['final_tracking_no', 'tracking_id', 'tracking id', 'waybill']:
+        if candidate in col_map:
+            track_idx = col_map[candidate]
+            break
+
+    fwd_agt_idx = col_map.get('fwd_agent name') or col_map.get('fwd agent') or col_map.get('fwd_agent')
+    rev_agt_idx = col_map.get('rev_agent name') or col_map.get('rev agent') or col_map.get('rev_agent')
 
     filt_rows = []
     for r in rows_iter:
@@ -203,7 +231,7 @@ def write_summary_sheet(wb, daily_block, wtd_block, date_range_str):
     ws = wb.create_sheet("SUMMARY")
     ws.sheet_view.showGridLines = False
 
-    daily_date_str = _fmt_date(daily_block['label']) if isinstance(daily_block['label'], datetime) else str(daily_block['label'])
+    daily_date_str = _fmt_date(daily_block['label'])
 
     FWD_HEADERS = ['Date', 'Source_DC', 'OFD', 'Forward_Task', 'Fwd_Task_per_1k']
     REV_HEADERS = ['Date', 'Source_DC', 'OFP', 'Reverse_Task', 'Rev_Task_per_1k']
@@ -224,121 +252,127 @@ def write_summary_sheet(wb, daily_block, wtd_block, date_range_str):
         'Weekly Forward EI', '', '', '', '', '',
         'Weekly Reverse EI', '', '', '', ''
     ])
-    output.append(
-        FWD_HEADERS + [''] +
-        REV_HEADERS + [''] +
-        FWD_HEADERS + [''] +
-        REV_HEADERS
-    )
-
-    def _fwd_daily_row(i):
-        if i < len(fwd_daily):
-            r = fwd_daily[i]
-            return [daily_date_str, r['dc'], r['ofd'], r['fwd_task'], r['fwd_1k']]
-        return ['', '', '', '', '']
-
-    def _rev_daily_row(i):
-        if i < len(rev_daily):
-            r = rev_daily[i]
-            return [daily_date_str, r['dc'], r['ofp'], r['rev_task'], r['rev_1k']]
-        return ['', '', '', '', '']
-
-    def _fwd_wtd_row(i):
-        if i < len(fwd_wtd):
-            r = fwd_wtd[i]
-            return [date_range_str, r['dc'], r['ofd'], r['fwd_task'], r['fwd_1k']]
-        return ['', '', '', '', '']
-
-    def _rev_wtd_row(i):
-        if i < len(rev_wtd):
-            r = rev_wtd[i]
-            return [date_range_str, r['dc'], r['ofp'], r['rev_task'], r['rev_1k']]
-        return ['', '', '', '', '']
+    output.append(FWD_HEADERS + [''] + REV_HEADERS + [''] + FWD_HEADERS + [''] + REV_HEADERS)
 
     for i in range(max_rows):
-        output.append(
-            _fwd_daily_row(i) + [''] +
-            _rev_daily_row(i) + [''] +
-            _fwd_wtd_row(i)   + [''] +
-            _rev_wtd_row(i)
-        )
+        f_d = fwd_daily[i] if i < len(fwd_daily) else None
+        r_d = rev_daily[i] if i < len(rev_daily) else None
+        f_w = fwd_wtd[i]   if i < len(fwd_wtd)   else None
+        r_w = rev_wtd[i]   if i < len(rev_wtd)   else None
+        output.append([
+            daily_date_str if f_d else '', f_d['dc'] if f_d else '',
+            f_d['ofd'] if f_d else '', f_d['fwd_task'] if f_d else '',
+            round(f_d['fwd_1k'], 2) if f_d else '',
+            '',
+            daily_date_str if r_d else '', r_d['dc'] if r_d else '',
+            r_d['ofp'] if r_d else '', r_d['rev_task'] if r_d else '',
+            round(r_d['rev_1k'], 2) if r_d else '',
+            '',
+            date_range_str if f_w else '', f_w['dc'] if f_w else '',
+            f_w['ofd'] if f_w else '', f_w['fwd_task'] if f_w else '',
+            round(f_w['fwd_1k'], 2) if f_w else '',
+            '',
+            date_range_str if r_w else '', r_w['dc'] if r_w else '',
+            r_w['ofp'] if r_w else '', r_w['rev_task'] if r_w else '',
+            round(r_w['rev_1k'], 2) if r_w else '',
+        ])
 
-    for r_idx, row in enumerate(output, start=1):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws.cell(row=r_idx, column=c_idx, value=val)
-            cell.alignment = _center()
+    for row_idx, row_data in enumerate(output, start=1):
+        for col_idx, val in enumerate(row_data, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=val)
 
-    def _title(row, c1, c2, bg):
+    total_rows = len(output)
+
+    for r in range(1, total_rows + 1):
+        for fmt_col, fmt in [
+            (1,'@'),(2,'@'),(3,'0'),(4,'0'),(5,'0.00'),
+            (7,'@'),(8,'@'),(9,'0'),(10,'0'),(11,'0.00'),
+            (13,'@'),(14,'@'),(15,'0'),(16,'0'),(17,'0.00'),
+            (19,'@'),(20,'@'),(21,'0'),(22,'0'),(23,'0.00')
+        ]:
+            ws.cell(r, fmt_col).number_format = fmt
+        for c in range(1, 24):
+            ws.cell(r, c).alignment = _center()
+
+    def _style_merged_title(row, c1, c2, bg):
         ws.merge_cells(start_row=row, start_column=c1, end_row=row, end_column=c2)
         cell = ws.cell(row, c1)
         cell.fill = _fill(bg)
         cell.font = _font(C_HDR_FONT, bold=True, size=11)
         cell.alignment = _center()
 
-    def _subhdr(row, c1, c2, bg):
+    def _style_sub_header(row, c1, c2, bg):
         for c in range(c1, c2 + 1):
             cell = ws.cell(row, c)
             cell.fill = _fill(bg)
-            cell.font = _font(C_HDR_FONT, bold=True, size=10)
+            cell.font = _font(C_HDR_FONT, bold=True)
             cell.alignment = _center()
 
-    _title(1, 1, 5, C_FWD_TITLE)
-    _title(1, 7, 11, C_REV_TITLE)
-    _title(1, 13, 17, C_FWD_TITLE)
-    _title(1, 19, 23, C_REV_TITLE)
+    _style_merged_title(1, 1, 5, C_FWD_TITLE)
+    _style_merged_title(1, 7, 11, C_REV_TITLE)
+    _style_merged_title(1, 13, 17, C_FWD_TITLE)
+    _style_merged_title(1, 19, 23, C_REV_TITLE)
 
-    _subhdr(2, 1, 5, C_FWD_HDR)
-    _subhdr(2, 7, 11, C_REV_HDR)
-    _subhdr(2, 13, 17, C_FWD_HDR)
-    _subhdr(2, 19, 23, C_REV_HDR)
+    _style_sub_header(2, 1, 5, C_FWD_HDR)
+    _style_sub_header(2, 7, 11, C_REV_HDR)
+    _style_sub_header(2, 13, 17, C_FWD_HDR)
+    _style_sub_header(2, 19, 23, C_REV_HDR)
 
     bd = _border(C_BORDER)
-    def _apply_borders(r_start, num_rows, c_start, num_cols):
-        for r in range(r_start, r_start + num_rows):
-            for c in range(c_start, c_start + num_cols):
+    def _apply_borders(rs, nr, cs, nc):
+        for r in range(rs, rs + nr):
+            for c in range(cs, cs + nc):
                 ws.cell(r, c).border = bd
 
-    _apply_borders(1, max_rows + 2, 1, 5)
-    _apply_borders(1, max_rows + 2, 7, 5)
-    _apply_borders(1, max_rows + 2, 13, 5)
-    _apply_borders(1, max_rows + 2, 19, 5)
+    if max_daily > 0:
+        _apply_borders(1, 2 + max_daily, 1, 5)
+        _apply_borders(1, 2 + max_daily, 7, 5)
+    if max_weekly > 0:
+        _apply_borders(1, 2 + max_weekly, 13, 5)
+        _apply_borders(1, 2 + max_weekly, 19, 5)
 
-    def _add_cf(col_letter, start_r, end_r):
-        rng = f"{col_letter}{start_r}:{col_letter}{end_r}"
-        green_fill  = PatternFill(start_color=CF_GREEN_BG,  end_color=CF_GREEN_BG,  fill_type="solid")
-        green_font  = Font(color=CF_GREEN_FONT, bold=True)
-        yellow_fill = PatternFill(start_color=CF_YELLOW_BG, end_color=CF_YELLOW_BG, fill_type="solid")
-        yellow_font = Font(color=CF_YELLOW_FONT, bold=True)
-        red_fill    = PatternFill(start_color=CF_RED_BG,    end_color=CF_RED_BG,    fill_type="solid")
-        red_font    = Font(color=CF_RED_FONT, bold=True)
+    def _add_cf(col_letter, r_start, r_end, lo, hi):
+        rng = f"{col_letter}{r_start}:{col_letter}{r_end}"
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator='lessThan', formula=[str(lo)],
+            fill=_fill(CF_GREEN_BG), font=_font(CF_GREEN_FONT)))
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator='between', formula=[str(lo), str(hi)],
+            fill=_fill(CF_YELLOW_BG), font=_font(CF_YELLOW_FONT)))
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator='greaterThan', formula=[str(hi)],
+            fill=_fill(CF_RED_BG), font=_font(CF_RED_FONT)))
 
-        ws.conditional_formatting.add(rng, CellIsRule(operator='lessThan', formula=['10'], fill=green_fill, font=green_font))
-        ws.conditional_formatting.add(rng, CellIsRule(operator='between', formula=['10','15'], fill=yellow_fill, font=yellow_font))
-        ws.conditional_formatting.add(rng, CellIsRule(operator='greaterThan', formula=['15'], fill=red_fill, font=red_font))
+    if max_daily > 0:
+        _add_cf('E', 3, 2 + max_daily, 2.5, 6.0)
+        _add_cf('K', 3, 2 + max_daily, 6.1, 10.0)
+    if max_weekly > 0:
+        _add_cf('Q', 3, 2 + max_weekly, 2.5, 6.0)
+        _add_cf('W', 3, 2 + max_weekly, 6.1, 10.0)
 
-    if max_rows > 0:
-        _add_cf('E', 3, max_rows + 2)
-        _add_cf('K', 3, max_rows + 2)
-        _add_cf('Q', 3, max_rows + 2)
-        _add_cf('W', 3, max_rows + 2)
-
-    for c in range(1, 24):
-        ws.column_dimensions[get_column_letter(c)].width = 18 if (c % 6 != 0) else 4
+    col_widths = {
+        1:16, 2:8, 3:10, 4:14, 5:16, 6:3,
+        7:16, 8:8, 9:10, 10:14, 11:16, 12:3,
+        13:16, 14:8, 15:10, 16:14, 17:16, 18:3,
+        19:16, 20:8, 21:10, 22:14, 23:16
+    }
+    for col, width in col_widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
 
 def write_filtered_dc_tab(wb, headers, filt_rows):
-    ws = wb.create_sheet("Filtered_DC_Data")
+    ws = wb.create_sheet("Filtered_Source_DC")
     for c, h in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="E2E8F0")
-        cell.alignment = _center()
+        cell.font       = Font(bold=True)
+        cell.fill       = PatternFill("solid", fgColor="F1F5F9")
+        cell.alignment  = _center()
     for row in filt_rows:
         ws.append(row)
     for c in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(c)].width = 18
 
 def write_fwd_ei_tab(wb, headers, filt_rows, track_idx):
-    ws = wb.create_sheet("FORWARD EI")
+    ws = wb.create_sheet("FWD EI")
     fwd_rows = []
     for row in filt_rows:
         tno = str(row[track_idx] or '').strip().upper() if track_idx is not None and len(row) > track_idx else ''
@@ -346,8 +380,8 @@ def write_fwd_ei_tab(wb, headers, filt_rows, track_idx):
             fwd_rows.append(row)
     for c, h in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="F1F5F9")
+        cell.font      = Font(bold=True)
+        cell.fill      = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment = _center()
     for row in fwd_rows:
         ws.append(row)
@@ -363,8 +397,8 @@ def write_rev_ei_tab(wb, headers, filt_rows, track_idx):
             rev_rows.append(row)
     for c, h in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="F1F5F9")
+        cell.font      = Font(bold=True)
+        cell.fill      = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment = _center()
     for row in rev_rows:
         ws.append(row)
