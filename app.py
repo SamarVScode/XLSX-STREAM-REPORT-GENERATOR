@@ -5,6 +5,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
+)
+
 SERVER_DIR = Path(__file__).resolve().parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
@@ -17,10 +25,10 @@ log = logging.getLogger("ei_stream_server.app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Booting EI Stream Server: recovering job state from disk...")
+    log.info("🚀 Booting EI Stream Server: recovering job state from disk...")
     recover_jobs_from_disk()
     yield
-    log.info("Shutting down EI Stream Server.")
+    log.info("🛑 Shutting down EI Stream Server.")
 
 def create_app() -> FastAPI:
     app = FastAPI(

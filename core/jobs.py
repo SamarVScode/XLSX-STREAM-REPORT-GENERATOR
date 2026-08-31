@@ -314,7 +314,23 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         else:
             generate_ei_report(str(tmp_input), str(output_path))
 
-        print_job_step(job_id, 2, f"Stream report generated in {time.time() - t_gen:.2f}s")
+        if not output_path.exists() or output_path.stat().st_size < 100:
+            raise RuntimeError(f"Report generator failed to produce a valid file ({output_path.name}). Output size is 0 bytes.")
+
+        out_size_kb = output_path.stat().st_size / 1024
+        print_job_step(job_id, 2, f"Stream report generated ({out_size_kb:.1f} KB in {time.time() - t_gen:.2f}s)")
+
+        # Inspect generated sheet tabs
+        tabs = []
+        try:
+            import openpyxl
+            inspect_wb = openpyxl.load_workbook(str(output_path), read_only=True)
+            tabs = inspect_wb.sheetnames
+            inspect_wb.close()
+            job["tabs"] = tabs
+            log_job_message(job_id, f"📋 Output sheets created: {tabs}")
+        except Exception as tab_err:
+            log.warning(f"Could not inspect output tabs: {tab_err}")
 
         # Immediate Disk Reclamation
         if tmp_input and tmp_input.exists():
@@ -330,7 +346,7 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         _set_job(job_id, job)
 
         duration = time.time() - t_start
-        print_job_success(job_id, duration, output_path.name)
+        print_job_success(job_id, duration, f"{output_path.name} ({out_size_kb:.1f} KB, tabs: {tabs})")
 
     except Exception as e:
         log.exception(f"Job {job_id} failed: {e}")
