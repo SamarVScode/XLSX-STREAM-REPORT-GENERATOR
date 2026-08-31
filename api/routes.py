@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from config.settings import CACHE_DIR
 from core.auth import verify_api_key
 from core.jobs import create_report_job, create_upload_report_job, get_job, active_jobs
+from core.logger import get_job_log_lines
 
 router = APIRouter()
 log = logging.getLogger("ei_stream_server.routes")
@@ -101,6 +102,7 @@ async def get_job_status_route(
     x_api_key: Optional[str] = Depends(verify_api_key)
 ):
     job = get_job(job_id)
+    logs = get_job_log_lines(job_id)
     return {
         "job_id": job_id,
         "status": job.get("status"),
@@ -110,7 +112,20 @@ async def get_job_status_route(
         "sub_type": job.get("sub_type"),
         "file_name": job.get("file_name"),
         "created_at": job.get("created_at"),
-        "completed_at": job.get("completed_at")
+        "completed_at": job.get("completed_at"),
+        "logs": logs
+    }
+
+@router.get("/job/{job_id}/logs")
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs_route(
+    job_id: str,
+    x_api_key: Optional[str] = Depends(verify_api_key)
+):
+    logs = get_job_log_lines(job_id)
+    return {
+        "job_id": job_id,
+        "logs": logs
     }
 
 @router.get("/job/{job_id}/result")

@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from config.settings import CACHE_DIR, CACHE_TTL, CACHE_MAX_AGE, MAX_CONCURRENT_JOBS
 from core.downloader import extract_file_id, download_drive_file, is_direct_download_url, download_from_url
-from core.logger import print_job_start, print_job_step, print_job_success, print_job_error
+from core.logger import print_job_start, print_job_step, print_job_success, print_job_error, log_job_message
 from generators import (
     generate_ei_report,
     generate_forward_pendency_report,
@@ -196,6 +196,7 @@ def generate_proper_report_filename(
 
 
 def background_report_job(job_id: str, file_id: str, output_path: Path, report_type: str = "ei") -> None:
+    log_job_message(job_id, f"Waiting for execution lock (Max concurrent: {MAX_CONCURRENT_JOBS})...")
     acquired = conversion_semaphore.acquire(timeout=600)
     if not acquired:
         job = active_jobs.get(job_id, {})
@@ -206,7 +207,7 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         print_job_error(job_id, "Server busy: concurrent limit reached")
         return
 
-    # Redundancy check: If output was created by a previous identical request while waiting
+    # Redundancy check
     if output_path.exists() and output_path.stat().st_size > 0:
         conversion_semaphore.release()
         job = active_jobs.get(job_id, {})
@@ -214,7 +215,7 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         job["progress"] = "Complete (cached)"
         job["completed_at"] = output_path.stat().st_mtime
         _set_job(job_id, job)
-        log.info(f"Job {job_id} resolved from freshly created output file.")
+        log_job_message(job_id, f"Report already cached ({output_path.name}). Returning instant result.")
         return
 
     t_start = time.time()
@@ -302,7 +303,7 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         if tmp_input and tmp_input.exists():
             try:
                 tmp_input.unlink()
-                log.info(f"🗑️ Reclaimed disk space: Deleted temporary input file {tmp_input.name}")
+                log_job_message(job_id, f"🗑️ Disk Reclaimed: Temporary raw input file deleted ({tmp_input.name})")
             except Exception as del_err:
                 log.warning(f"Could not delete temporary input file {tmp_input.name}: {del_err}")
 
@@ -323,7 +324,6 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         _set_job(job_id, job)
         print_job_error(job_id, str(e))
         
-        # Cleanup temporary input on error as well
         if tmp_input and tmp_input.exists():
             try:
                 tmp_input.unlink()
@@ -354,7 +354,7 @@ def create_report_job(drive_url: str, report_type: str = "ei", sub_type: Optiona
     formatted_name = generate_proper_report_filename(report_type, sub_type=sub_type)
 
     if output_path.exists() and (time.time() - output_path.stat().st_mtime <= CACHE_TTL):
-        log.info(f"Cache hit for drive_url={drive_url[:80]}, report_type={report_type}")
+        log_job_message(cache_key, f"Instant cache hit for {report_type} report.")
         cached_report_date = None
         if report_type == "conversion":
             try:
@@ -388,6 +388,7 @@ def create_report_job(drive_url: str, report_type: str = "ei", sub_type: Optiona
         "file_name": formatted_name
     }
     _set_job(job_id, job)
+    log_job_message(job_id, f"Initialized async job for {report_type} (source: {drive_url[:80]}...)")
 
     process_job_async(job_id, file_id, output_path, report_type)
     return {"job_id": job_id, "status": "processing"}
@@ -418,6 +419,7 @@ def create_upload_report_job(file_bytes: bytes, filename: str = "upload.xlsx", r
         "file_name": formatted_name
     }
     _set_job(job_id, job)
+    log_job_message(job_id, f"Upload received: {filename} ({len(file_bytes)} bytes). Starting generator...")
 
     process_job_async(job_id, file_id, output_path, report_type)
     return {"job_id": job_id, "status": "processing"}

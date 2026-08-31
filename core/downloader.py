@@ -8,7 +8,7 @@ from typing import Optional
 
 log = logging.getLogger("ei_stream_server.downloader")
 
-def _handle_drive_confirm_form(session: requests.Session, html_text: str) -> Optional[requests.Response]:
+def _handle_drive_confirm_form(session: requests.Session, html_text: str, headers: dict = None) -> Optional[requests.Response]:
     """Parse Google Drive HTML warning page form (<form id='download-form'>) and submit it."""
     action_match = re.search(r'<form[^>]*action="([^"]+)"', html_text)
     if not action_match:
@@ -20,7 +20,7 @@ def _handle_drive_confirm_form(session: requests.Session, html_text: str) -> Opt
 
     log.info(f"Submitting Google Drive HTML confirmation form to: {action_url}")
     try:
-        resp = session.get(action_url, params=params, stream=True, timeout=180)
+        resp = session.get(action_url, params=params, headers=headers or {}, stream=True, timeout=180)
         return resp
     except Exception as e:
         log.warning(f"Error submitting Drive confirmation form: {e}")
@@ -48,22 +48,31 @@ def extract_file_id(url_or_id: str) -> str:
 
 def is_direct_download_url(url: str) -> bool:
     """Returns True if the URL carries an explicit OAuth access_token or API key or export format."""
-    return "access_token" in url or "alt=media" in url or "exportFormat=xlsx" in url
+    return "access_token" in url or "alt=media" in url or "exportFormat=xlsx" in url or "googleapis.com" in url
 
 def download_from_url(url: str, dest_path: Path) -> Path:
     """
     Download a file directly from a fully-formed URL in 32KB stream chunks directly to disk.
-    Also handles HTML confirmation pages for large files.
+    Extracts access_token query param to Authorization: Bearer header.
     """
     log.info(f"Direct stream download → '{dest_path.name}' from: {url[:120]}...")
     session = requests.Session()
-    response = session.get(url, stream=True, timeout=120, allow_redirects=True)
+
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    auth_headers = {}
+    if "access_token" in qs:
+        token = qs["access_token"][0]
+        auth_headers["Authorization"] = f"Bearer {token}"
+        log.info(f"Injected Authorization Bearer OAuth token ({token[:8]}...) into download headers.")
+
+    response = session.get(url, headers=auth_headers, stream=True, timeout=120, allow_redirects=True)
 
     if response.status_code == 200:
         content_type = response.headers.get("Content-Type", "").lower()
         if "text/html" in content_type:
             html_text = response.text
-            form_response = _handle_drive_confirm_form(session, html_text)
+            form_response = _handle_drive_confirm_form(session, html_text, headers=auth_headers)
             if form_response and form_response.status_code == 200 and "text/html" not in form_response.headers.get("Content-Type", "").lower():
                 response = form_response
             else:
@@ -75,7 +84,7 @@ def download_from_url(url: str, dest_path: Path) -> Path:
                     else:
                         confirm_url = confirm_link.replace("&amp;", "&")
                     log.info(f"Extracted Google Drive HTML confirm link: {confirm_url[:120]}...")
-                    response = session.get(confirm_url, stream=True, timeout=120)
+                    response = session.get(confirm_url, headers=auth_headers, stream=True, timeout=120)
 
     if response.status_code != 200:
         log.warning(f"Direct URL download returned HTTP {response.status_code}. Retrying via file_id...")
