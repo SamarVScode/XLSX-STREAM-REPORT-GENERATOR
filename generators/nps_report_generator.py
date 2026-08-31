@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-NPS Stream Report Generator Module for ei_stream_server
-======================================================
-Streams rows from NPS spreadsheet, calculates NPS% metrics per DC and Agent in-flight,
-and generates formatted output workbook.
+NPS Report Generator Module for ei_report_server
+================================================
+Reads 'Data' sheet from NPS Excel file, filters rows where Source DC is in allowed list,
+computes Promoter/Neutral/Detractor stats by DC and by Agent, and generates output workbook:
+  1. summary Sheet (Response Breakdown tables by DC & Agent with NPS%)
+  2. raw Sheet (Filtered raw dataset)
 """
 
 import sys
@@ -14,8 +16,15 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config.dc_config import ALLOWED_DCS_SET
-from core.stream_engine import stream_sheet_rows, get_sheet_names
+# Ensure current directory is in sys.path for dc_config import
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+try:
+    from config.dc_config import ALLOWED_DCS_SET
+except ImportError:
+    from dc_config import ALLOWED_DCS_SET
 
 log = logging.getLogger("ei_stream_server.nps_report")
 
@@ -26,57 +35,60 @@ def nps_pct(p, n, d):
     return round((p - d) / total * 100)
 
 def generate_nps_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
-    log.info(f"Stream generating NPS Report: {path}")
+    log.info(f"Loading input workbook for NPS Report: {input_file}")
+    wb_in = openpyxl.load_workbook(str(input_file), data_only=True)
+    if 'Data' not in wb_in.sheetnames:
+        sheet_name = wb_in.sheetnames[0]
+        log.warning(f"Sheet 'Data' not found. Using first sheet: '{sheet_name}'")
+        ws_data = wb_in[sheet_name]
+    else:
+        ws_data = wb_in['Data']
 
-    sheet_names = get_sheet_names(path)
-    target_sheet = 'Data' if 'Data' in sheet_names else sheet_names[0]
-
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
-    try:
-        raw_headers = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    headers = [str(h).strip() if h is not None else '' for h in raw_headers]
+    headers = [cell.value for cell in ws_data[1]]
     
+    # Locate column indices dynamically if available, otherwise use defaults
     source_dc_idx = 28
     option_idx = 4
     agent_idx = 22
     
     for idx, h in enumerate(headers):
-        h_str = h.lower()
-        if h_str in ('source_dc', 'source dc'):
-            source_dc_idx = idx
-        elif h_str in ('option', 'nps_option', 'nps option'):
-            option_idx = idx
-        elif h_str in ('agent_name', 'agent name', 'agent'):
-            agent_idx = idx
+        if h is not None:
+            h_str = str(h).strip().lower()
+            if h_str in ('source_dc', 'source dc'):
+                source_dc_idx = idx
+            elif h_str in ('option', 'nps_option', 'nps option'):
+                option_idx = idx
+            elif h_str in ('agent_name', 'agent name', 'agent'):
+                agent_idx = idx
 
     filtered_rows = []
+    for row in ws_data.iter_rows(min_row=2, values_only=True):
+        if len(row) > source_dc_idx:
+            source_dc = str(row[source_dc_idx]).strip().upper() if row[source_dc_idx] is not None else ''
+            if source_dc in ALLOWED_DCS_SET:
+                filtered_rows.append(row)
+
+    wb_in.close()
+    log.info(f"Filtered {len(filtered_rows)} rows matching allowed DCs")
+
+    # Stats aggregation
     dc_stats = defaultdict(lambda: {'P': 0, 'N': 0, 'D': 0})
     agent_stats = defaultdict(lambda: {'P': 0, 'N': 0, 'D': 0})
 
-    for row in rows_iter:
-        if not row:
-            continue
+    for row in filtered_rows:
+        option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
         source_dc = str(row[source_dc_idx]).strip().upper() if len(row) > source_dc_idx and row[source_dc_idx] is not None else ''
-        if source_dc in ALLOWED_DCS_SET:
-            filtered_rows.append(row)
-            option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
-            agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
+        agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
 
-            if option == 'Promoter':
-                dc_stats[source_dc]['P'] += 1
-                agent_stats[(source_dc, agent)]['P'] += 1
-            elif option == 'Neutral':
-                dc_stats[source_dc]['N'] += 1
-                agent_stats[(source_dc, agent)]['N'] += 1
-            elif option == 'Detractor':
-                dc_stats[source_dc]['D'] += 1
-                agent_stats[(source_dc, agent)]['D'] += 1
-
-    log.info(f"Streamed and filtered {len(filtered_rows)} matching NPS rows.")
+        if option == 'Promoter':
+            dc_stats[source_dc]['P'] += 1
+            agent_stats[(source_dc, agent)]['P'] += 1
+        elif option == 'Neutral':
+            dc_stats[source_dc]['N'] += 1
+            agent_stats[(source_dc, agent)]['N'] += 1
+        elif option == 'Detractor':
+            dc_stats[source_dc]['D'] += 1
+            agent_stats[(source_dc, agent)]['D'] += 1
 
     wb_out = openpyxl.Workbook()
 
@@ -174,7 +186,7 @@ def generate_nps_report(input_file: Path, output_file: Path):
                     cell.font = nps_red_font
         row_num += 1
 
-    # Agent summary rows
+    # Agent summary rows (grouped by DC)
     row_num = 3
     for dc in sorted_dcs:
         agents_in_dc = [(k, v) for k, v in agent_stats.items() if k[0] == dc]
@@ -221,4 +233,18 @@ def generate_nps_report(input_file: Path, output_file: Path):
 
     wb_out.save(str(output_file))
     log.info(f"Successfully generated NPS Report: {output_file}")
-    return str(output_file)
+
+def main():
+    script_dir = Path(__file__).resolve().parent
+    input_file = script_dir.parent / "nps" / "NPS_31-Jul-2026.xlsx"
+    output_file = script_dir.parent / "nps" / "output.xlsx"
+
+    if len(sys.argv) > 1:
+        input_file = Path(sys.argv[1])
+    if len(sys.argv) > 2:
+        output_file = Path(sys.argv[2])
+
+    generate_nps_report(input_file, output_file)
+
+if __name__ == "__main__":
+    main()

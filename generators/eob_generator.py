@@ -1,24 +1,50 @@
 #!/usr/bin/env python3
 """
-EOB Stream Report Generator Module for ei_stream_server
-========================================================
-Streams rows from input spreadsheet, computes Ageing Bucket and Status metrics per DC in-flight,
-and generates formatted output workbook.
+EOB Report Generator Module for ei_report_server
+=================================================
+Reads 'Raw' (or 'raw_data') sheet from input Excel/XLSB file, filters rows where Source_DC is in
+{'ALG', 'AYP', 'DEO', 'JNP', 'MAU', 'MRZ'}, and generates an output workbook with:
+  1. Summary Sheet:
+     - Table 1: Ageing Bucket Wise Priority Shipment Count per Source DC (Cells with count > 0 in Ageing Bucket columns highlighted in Red).
+     - Table 2: Latest Status Count per Source DC (without 'UD' prefix) placed side-by-side.
+     - Starts at Column A (left-most start) with exactly 1 empty column gap between Table 1 and Table 2.
+     - Both tables start at Row 1 (no extra title banners or extra headers).
+     - Worksheet gridlines disabled for empty background cells.
+  2. raw_data Sheet:
+     - Full filtered dataset containing all original columns for target Source DCs.
 """
 
 import logging
 from pathlib import Path
-from collections import defaultdict
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config.dc_config import ALLOWED_SOURCE_DCS
-from core.stream_engine import stream_sheet_rows, get_sheet_names
+# Try fast calamine engine first, fall back to pyxlsb / openpyxl
+try:
+    from python_calamine import CalamineWorkbook
+    HAS_CALAMINE = True
+except ImportError:
+    HAS_CALAMINE = False
+
+try:
+    from pyxlsb import open_workbook as open_xlsb
+    HAS_PYXLSB = True
+except ImportError:
+    HAS_PYXLSB = False
 
 log = logging.getLogger("ei_stream_server.eob_generator")
 
+try:
+    from config.dc_config import ALLOWED_SOURCE_DCS
+except ImportError:
+    try:
+        from dc_config import ALLOWED_SOURCE_DCS
+    except ImportError:
+        ALLOWED_SOURCE_DCS = ['ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'KNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR', 'VNS']
+
+# Dynamic list of target Source DCs from dc_config (excluding 'ALL')
 TARGET_SOURCE_DCS = [dc.upper() for dc in ALLOWED_SOURCE_DCS if str(dc).upper() != 'ALL']
 
 STATUS_SHORTFORMS = {
@@ -40,106 +66,181 @@ STATUS_SHORTFORMS = {
     'Untraceable_BRSNR': 'Untraceable BRSNR',
 }
 
+
+def _resolve_raw_sheet_name(input_file_path: Path) -> str:
+    """Find the raw data sheet name in the workbook ('Raw', 'raw_data', etc.)."""
+    if input_file_path.suffix.lower() == '.xlsb':
+        if HAS_CALAMINE:
+            wb = CalamineWorkbook.from_path(str(input_file_path))
+            sheet_names = wb.sheet_names
+        elif HAS_PYXLSB:
+            with open_xlsb(str(input_file_path)) as wb:
+                sheet_names = wb.sheets
+        else:
+            sheet_names = ['Raw', 'raw_data']
+    else:
+        wb = openpyxl.load_workbook(input_file_path, read_only=True)
+        sheet_names = wb.sheetnames
+        wb.close()
+
+    sheet_map = {name.lower(): name for name in sheet_names}
+    for candidate in ['raw', 'raw_data', 'raw_data_north', 'praw data']:
+        if candidate in sheet_map:
+            return sheet_map[candidate]
+            
+    return sheet_names[0] if sheet_names else 'Raw'
+
+
+def read_raw_data(input_file_path: Path) -> pd.DataFrame:
+    """Reads the raw data sheet from input file."""
+    sheet_name = _resolve_raw_sheet_name(input_file_path)
+    ext = input_file_path.suffix.lower()
+    
+    if ext == '.xlsb':
+        if HAS_CALAMINE:
+            wb = CalamineWorkbook.from_path(str(input_file_path))
+            sheet = wb.get_sheet_by_name(sheet_name)
+            data = sheet.to_python()
+            if not data:
+                raise ValueError(f"Sheet '{sheet_name}' is empty in input file.")
+            header = [str(c).strip() if c is not None else f"Unnamed_{i}" for i, c in enumerate(data[0])]
+            df = pd.DataFrame(data[1:], columns=header)
+        elif HAS_PYXLSB:
+            data = []
+            with open_xlsb(str(input_file_path)) as wb:
+                with wb.get_sheet(sheet_name) as sheet:
+                    for row in sheet.rows():
+                        data.append([cell.v for cell in row])
+            if not data:
+                raise ValueError(f"Sheet '{sheet_name}' is empty in input file.")
+            header = [str(c).strip() if c is not None else f"Unnamed_{i}" for i, c in enumerate(data[0])]
+            df = pd.DataFrame(data[1:], columns=header)
+        else:
+            df = pd.read_excel(input_file_path, sheet_name=sheet_name, engine='pyxlsb')
+    else:
+        df = pd.read_excel(input_file_path, sheet_name=sheet_name)
+        
+    return df
+
+
 def get_short_status(status_str):
     if not status_str or pd.isna(status_str):
         return 'Unknown'
     s = str(status_str).strip()
     return STATUS_SHORTFORMS.get(s, s)
 
+
 def generate_eob_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
+    """Main generator function for EOB Priority & Status Report."""
+    input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Stream generating EOB Report: {path.name}")
 
-    sheet_names = get_sheet_names(path)
-    sheet_map = {name.lower(): name for name in sheet_names}
-    target_sheet = None
-    for candidate in ['raw', 'raw_data', 'raw_data_north', 'praw data']:
-        if candidate in sheet_map:
-            target_sheet = sheet_map[candidate]
-            break
-    if not target_sheet:
-        target_sheet = sheet_names[0] if sheet_names else 'Raw'
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
-    try:
-        raw_headers = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
+    log.info(f"Generating EOB Priority & Status Report for: {input_path.name}")
+    df_raw = read_raw_data(input_path)
 
-    headers = [str(h).strip() if h is not None else f"Unnamed_{i}" for i, h in enumerate(raw_headers)]
-    headers_lower = [h.lower() for h in headers]
+    # Clean up empty trailing rows
+    if 'Tracking No' in df_raw.columns:
+        df_raw = df_raw[df_raw['Tracking No'].notnull() & (df_raw['Tracking No'] != '')]
+    elif 'tracking_id' in df_raw.columns:
+        df_raw = df_raw[df_raw['tracking_id'].notnull() & (df_raw['tracking_id'] != '')]
+    else:
+        df_raw = df_raw.dropna(how='all')
 
-    # Find columns
-    sdc_idx = -1
-    for cand in ['source dc', 'source_dc', 'dc']:
-        if cand in headers_lower:
-            sdc_idx = headers_lower.index(cand)
-            break
-    if sdc_idx == -1:
-        sdc_idx = 0
-
-    status_idx = -1
-    for cand in ['latest status', 'latest_status', 'status_status', 'status']:
-        if cand in headers_lower:
-            status_idx = headers_lower.index(cand)
+    # Detect Source DC column name
+    sdc_col = None
+    for candidate in ['Source DC', 'Source_DC', 'source_dc', 'dc']:
+        if candidate in df_raw.columns:
+            sdc_col = candidate
             break
 
-    ageing_idx = -1
-    for cand in ['ageing bucket', 'ageing_bucket', 'aging bucket', 'aging_bucket']:
-        if cand in headers_lower:
-            ageing_idx = headers_lower.index(cand)
+    if not sdc_col:
+        raise ValueError(f"Could not find 'Source DC' column in raw sheet. Available columns: {list(df_raw.columns)}")
+
+    # Filter for target Source DCs (case-insensitive)
+    df_raw['Source DC Clean'] = df_raw[sdc_col].astype(str).str.strip().str.upper()
+    filtered_df = df_raw[df_raw['Source DC Clean'].isin(TARGET_SOURCE_DCS)].copy()
+
+    log.info(f"Filtered {len(filtered_df)} total records for Source DCs: {TARGET_SOURCE_DCS}")
+
+    # Detect Latest Status column
+    status_col = None
+    for candidate in ['Latest Status', 'Latest_Status', 'status_status', 'status']:
+        if candidate in df_raw.columns:
+            status_col = candidate
             break
 
-    filtered_rows = []
-    t1_counts = defaultdict(lambda: defaultdict(int))
-    t2_counts = defaultdict(lambda: defaultdict(int))
-    seen_buckets = set()
-    seen_statuses = set()
+    if not status_col:
+        status_col = 'Latest Status'
+        filtered_df['Latest Status'] = 'Unknown'
 
-    for row in rows_iter:
-        if not row or len(row) <= sdc_idx:
-            continue
-        sdc = str(row[sdc_idx] or '').strip().upper()
-        if sdc in TARGET_SOURCE_DCS:
-            filtered_rows.append(row)
-            
-            b = str(row[ageing_idx] or 'Unknown').strip() if ageing_idx != -1 and len(row) > ageing_idx else 'Unknown'
-            s_raw = str(row[status_idx] or 'Unknown').strip() if status_idx != -1 and len(row) > status_idx else 'Unknown'
-            s = get_short_status(s_raw)
+    # Detect Ageing Bucket column
+    ageing_col = None
+    for candidate in ['Ageing Bucket', 'Ageing_Bucket', 'Aging Bucket', 'aging_bucket']:
+        if candidate in df_raw.columns:
+            ageing_col = candidate
+            break
 
-            t1_counts[sdc][b] += 1
-            t2_counts[sdc][s] += 1
-            seen_buckets.add(b)
-            seen_statuses.add(s)
+    if not ageing_col:
+        ageing_col = 'Ageing Bucket'
+        filtered_df['Ageing Bucket'] = 'Unknown'
 
-    log.info(f"Streamed and filtered {len(filtered_rows)} matching EOB rows.")
+    # Map Latest Status to shortform
+    filtered_df['Latest Status Short'] = filtered_df[status_col].map(get_short_status)
 
+    # Prepare raw export dataframe
+    raw_export_df = filtered_df.drop(columns=['Source DC Clean', 'Latest Status Short'])
+
+    # --- PIVOT TABLE 1: Source DC (Rows) vs Ageing Bucket (Cols) ---
     ageing_order = ['1-2 days', '3-5 days', '6-10 days', '11-15 days', '16-20 days', '>20 days']
-    sorted_buckets = [b for b in ageing_order if b in seen_buckets]
-    for b in sorted(seen_buckets):
+    existing_buckets = filtered_df[ageing_col].dropna().unique().tolist()
+    sorted_buckets = [b for b in ageing_order if b in existing_buckets]
+    for b in sorted(existing_buckets):
         if b not in sorted_buckets:
             sorted_buckets.append(b)
 
-    sorted_statuses = sorted(list(seen_statuses))
+    t1_df = pd.crosstab(filtered_df['Source DC Clean'], filtered_df[ageing_col])
+    t1_df = t1_df.reindex(index=TARGET_SOURCE_DCS, columns=sorted_buckets, fill_value=0)
+    t1_df['Grand Total'] = t1_df.sum(axis=1)
 
-    # --- BUILD WORKBOOK ---
+    t1_total_row = t1_df.sum(axis=0)
+    t1_total_row.name = 'Grand Total'
+    t1_df = pd.concat([t1_df, pd.DataFrame([t1_total_row])])
+
+    # --- PIVOT TABLE 2: Source DC (Rows) vs Latest Status Shortform (Cols) ---
+    t2_df = pd.crosstab(filtered_df['Source DC Clean'], filtered_df['Latest Status Short'])
+    t2_statuses = sorted(t2_df.columns.tolist())
+    t2_df = t2_df.reindex(index=TARGET_SOURCE_DCS, columns=t2_statuses, fill_value=0)
+    t2_df['Grand Total'] = t2_df.sum(axis=1)
+
+    t2_total_row = t2_df.sum(axis=0)
+    t2_total_row.name = 'Grand Total'
+    t2_df = pd.concat([t2_df, pd.DataFrame([t2_total_row])])
+
+    # --- BUILD OPENPYXL WORKBOOK ---
     wb = openpyxl.Workbook()
+
+    # 1. Summary Sheet
     ws_summary = wb.active
     ws_summary.title = "Summary"
-    ws_summary.sheet_view.showGridLines = False
+    ws_summary.views.sheetView[0].showGridLines = False
 
     font_header = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
     font_data = Font(name='Calibri', size=10, color='1E293B')
     font_total = Font(name='Calibri', size=10, bold=True, color='0F172A')
+
     font_priority = Font(name='Calibri', size=10, bold=True, color='991B1B')
     fill_priority = PatternFill(start_color='FEE2E2', end_color='FEE2E2', fill_type='solid')
+
     fill_header = PatternFill(start_color='1E293B', end_color='1E293B', fill_type='solid')
     fill_total = PatternFill(start_color='F1F5F9', end_color='F1F5F9', fill_type='solid')
     fill_zebra = PatternFill(start_color='F8FAFC', end_color='F8FAFC', fill_type='solid')
 
     border_thin = Side(style='thin', color='CBD5E1')
     border_double = Side(style='double', color='475569')
+
     border_cell = Border(left=border_thin, right=border_thin, top=border_thin, bottom=border_thin)
     border_header = Border(left=border_thin, right=border_thin, top=border_thin, bottom=border_thin)
     border_total = Border(left=border_thin, right=border_thin, top=border_thin, bottom=border_double)
@@ -148,10 +249,10 @@ def generate_eob_report(input_file: Path, output_file: Path):
     align_right = Alignment(horizontal='right', vertical='center')
 
     start_r = 1
-    start_c1 = 1
+    start_c1 = 1  # Column A
 
-    # Write Table 1
-    headers_t1 = ['Source DC'] + sorted_buckets + ['Grand Total']
+    # WRITE TABLE 1
+    headers_t1 = ['Source DC'] + list(t1_df.columns)
     for c_idx, h in enumerate(headers_t1, start=start_c1):
         cell = ws_summary.cell(row=start_r, column=c_idx, value=h)
         cell.font = font_header
@@ -159,62 +260,36 @@ def generate_eob_report(input_file: Path, output_file: Path):
         cell.alignment = align_center
         cell.border = border_header
 
-    tot_buckets_t1 = defaultdict(int)
-    for r_offset, dc in enumerate(TARGET_SOURCE_DCS, start=start_r + 1):
-        c_cell = ws_summary.cell(row=r_offset, column=start_c1, value=dc)
-        c_cell.font = font_data
+    for r_offset, (row_name, row_series) in enumerate(t1_df.iterrows(), start=start_r + 1):
+        is_total = (row_name == 'Grand Total')
+        c_cell = ws_summary.cell(row=r_offset, column=start_c1, value=row_name)
+        c_cell.font = font_total if is_total else font_data
         c_cell.alignment = align_center
-        c_cell.border = border_cell
+        c_cell.border = border_total if is_total else border_cell
+        if is_total:
+            c_cell.fill = fill_total
 
-        row_tot = 0
-        for c_idx, b in enumerate(sorted_buckets, start=start_c1 + 1):
-            cnt = t1_counts[dc][b]
-            row_tot += cnt
-            tot_buckets_t1[b] += cnt
-
-            cell = ws_summary.cell(row=r_offset, column=c_idx, value=cnt)
+        for c_idx, (col_name, val) in enumerate(row_series.items(), start=start_c1 + 1):
+            cell = ws_summary.cell(row=r_offset, column=c_idx, value=int(val))
             cell.alignment = align_right
-            cell.border = border_cell
-            if cnt > 0:
-                cell.fill = fill_priority
-                cell.font = font_priority
+
+            if is_total:
+                cell.font = font_total
+                cell.fill = fill_total
+                cell.border = border_total
             else:
-                cell.font = font_data
-                if r_offset % 2 == 0:
-                    cell.fill = fill_zebra
+                cell.border = border_cell
+                if col_name != 'Grand Total' and val > 0:
+                    cell.fill = fill_priority
+                    cell.font = font_priority
+                else:
+                    cell.font = font_data
+                    if r_offset % 2 == 0:
+                        cell.fill = fill_zebra
 
-        tot_cell = ws_summary.cell(row=r_offset, column=start_c1 + len(sorted_buckets) + 1, value=row_tot)
-        tot_cell.font = font_data
-        tot_cell.alignment = align_right
-        tot_cell.border = border_cell
-
-    # Total Row Table 1
-    t1_tot_row_num = start_r + len(TARGET_SOURCE_DCS) + 1
-    t1_tot_label = ws_summary.cell(row=t1_tot_row_num, column=start_c1, value='Grand Total')
-    t1_tot_label.font = font_total
-    t1_tot_label.fill = fill_total
-    t1_tot_label.alignment = align_center
-    t1_tot_label.border = border_total
-
-    g_total_t1 = 0
-    for c_idx, b in enumerate(sorted_buckets, start=start_c1 + 1):
-        b_sum = tot_buckets_t1[b]
-        g_total_t1 += b_sum
-        cell = ws_summary.cell(row=t1_tot_row_num, column=c_idx, value=b_sum)
-        cell.font = font_total
-        cell.fill = fill_total
-        cell.alignment = align_right
-        cell.border = border_total
-
-    g_tot_cell = ws_summary.cell(row=t1_tot_row_num, column=start_c1 + len(sorted_buckets) + 1, value=g_total_t1)
-    g_tot_cell.font = font_total
-    g_tot_cell.fill = fill_total
-    g_tot_cell.alignment = align_right
-    g_tot_cell.border = border_total
-
-    # Write Table 2 (Side-by-Side)
-    start_c2 = start_c1 + len(headers_t1) + 1
-    headers_t2 = ['Source DC'] + sorted_statuses + ['Grand Total']
+    # WRITE TABLE 2 (Side-by-Side)
+    start_c2 = start_c1 + len(headers_t1) + 1  # 1 empty column gap
+    headers_t2 = ['Source DC'] + list(t2_df.columns)
 
     for c_idx, h in enumerate(headers_t2, start=start_c2):
         cell = ws_summary.cell(row=start_r, column=c_idx, value=h)
@@ -223,54 +298,28 @@ def generate_eob_report(input_file: Path, output_file: Path):
         cell.alignment = align_center
         cell.border = border_header
 
-    tot_stat_t2 = defaultdict(int)
-    for r_offset, dc in enumerate(TARGET_SOURCE_DCS, start=start_r + 1):
-        c_cell = ws_summary.cell(row=r_offset, column=start_c2, value=dc)
-        c_cell.font = font_data
+    for r_offset, (row_name, row_series) in enumerate(t2_df.iterrows(), start=start_r + 1):
+        is_total = (row_name == 'Grand Total')
+        c_cell = ws_summary.cell(row=r_offset, column=start_c2, value=row_name)
+        c_cell.font = font_total if is_total else font_data
         c_cell.alignment = align_center
-        c_cell.border = border_cell
+        c_cell.border = border_total if is_total else border_cell
+        if is_total:
+            c_cell.fill = fill_total
 
-        row_tot = 0
-        for c_idx, s in enumerate(sorted_statuses, start=start_c2 + 1):
-            cnt = t2_counts[dc][s]
-            row_tot += cnt
-            tot_stat_t2[s] += cnt
-
-            cell = ws_summary.cell(row=r_offset, column=c_idx, value=cnt)
+        for c_idx, (col_name, val) in enumerate(row_series.items(), start=start_c2 + 1):
+            cell = ws_summary.cell(row=r_offset, column=c_idx, value=int(val))
             cell.alignment = align_right
-            cell.border = border_cell
-            cell.font = font_data
-            if r_offset % 2 == 0:
-                cell.fill = fill_zebra
 
-        tot_cell = ws_summary.cell(row=r_offset, column=start_c2 + len(sorted_statuses) + 1, value=row_tot)
-        tot_cell.font = font_data
-        tot_cell.alignment = align_right
-        tot_cell.border = border_cell
-
-    # Total Row Table 2
-    t2_tot_row_num = start_r + len(TARGET_SOURCE_DCS) + 1
-    t2_tot_label = ws_summary.cell(row=t2_tot_row_num, column=start_c2, value='Grand Total')
-    t2_tot_label.font = font_total
-    t2_tot_label.fill = fill_total
-    t2_tot_label.alignment = align_center
-    t2_tot_label.border = border_total
-
-    g_total_t2 = 0
-    for c_idx, s in enumerate(sorted_statuses, start=start_c2 + 1):
-        s_sum = tot_stat_t2[s]
-        g_total_t2 += s_sum
-        cell = ws_summary.cell(row=t2_tot_row_num, column=c_idx, value=s_sum)
-        cell.font = font_total
-        cell.fill = fill_total
-        cell.alignment = align_right
-        cell.border = border_total
-
-    g_tot_cell2 = ws_summary.cell(row=t2_tot_row_num, column=start_c2 + len(sorted_statuses) + 1, value=g_total_t2)
-    g_tot_cell2.font = font_total
-    g_tot_cell2.fill = fill_total
-    g_tot_cell2.alignment = align_right
-    g_tot_cell2.border = border_total
+            if is_total:
+                cell.font = font_total
+                cell.fill = fill_total
+                cell.border = border_total
+            else:
+                cell.font = font_data
+                cell.border = border_cell
+                if r_offset % 2 == 0:
+                    cell.fill = fill_zebra
 
     # Column Widths
     gap_col_idx = start_c1 + len(headers_t1)
@@ -290,19 +339,18 @@ def generate_eob_report(input_file: Path, output_file: Path):
 
     # 2. Raw Sheet
     ws_raw = wb.create_sheet(title="Raw")
-    ws_raw.sheet_view.showGridLines = True
+    ws_raw.views.sheetView[0].showGridLines = True
 
-    for c_idx, h in enumerate(headers, start=1):
+    for c_idx, h in enumerate(raw_export_df.columns, start=1):
         cell = ws_raw.cell(row=1, column=c_idx, value=h)
         cell.font = font_header
         cell.fill = fill_header
         cell.alignment = align_center
 
-    for r_idx, row in enumerate(filtered_rows, start=2):
+    for r_idx, row in enumerate(raw_export_df.itertuples(index=False), start=2):
         for c_idx, val in enumerate(row, start=1):
             ws_raw.cell(row=r_idx, column=c_idx, value=val)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save Output
     wb.save(output_path)
     log.info(f"Successfully generated EOB Report: {output_path.name}")
-    return str(output_path)

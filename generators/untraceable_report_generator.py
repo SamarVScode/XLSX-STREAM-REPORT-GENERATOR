@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """
-Untraceable Stream Report Generator Module for ei_stream_server
-==============================================================
-Streams rows from Untraceable spreadsheet, pivots shipment count by Source DC & Age Bucket in-flight,
-and generates formatted output workbook.
+Untraceable Report Generator Module for ei_report_server
+========================================================
+Reads 'Raw' sheet from Untraceable Report file, filters rows where Source DC is in allowed list,
+computes shipment count pivot by Source DC and Age Bucket, and generates output workbook:
+  1. Summary Sheet (Merged 'Age Bucket' super-header, 0-value DCs & 0-cells omitted, soft red highlight for >= 6-10 days)
+  2. Raw Sheet (Filtered raw records for allowed DC Config hubs)
 """
 
 import sys
 import logging
 from pathlib import Path
-from collections import defaultdict
+import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config.dc_config import ALLOWED_DCS_SET_LOWER
-from core.stream_engine import stream_sheet_rows, get_sheet_names
+# Ensure current directory is in sys.path for dc_config import
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+# Import server ALLOWED_DCS_SET_LOWER from config.dc_config
+try:
+    from config.dc_config import ALLOWED_DCS_SET_LOWER
+except ImportError:
+    try:
+        from dc_config import ALLOWED_DCS_SET_LOWER
+    except ImportError:
+        ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
 
 log = logging.getLogger("ei_stream_server.untraceable_report")
 
@@ -26,91 +39,93 @@ STANDARD_AGE_BUCKETS = [
 HIGHLIGHT_AGING_BUCKETS = {'6-10 Days', '11-20 Days', '21-30 Days', '>30 Days', '7-15 Days', '15-30 Days', '30-45 Days', '45+ Days'}
 
 def generate_untraceable_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
-    output_path = Path(output_file)
-    log.info(f"Stream generating Untraceable Report: {path.name}")
+    log.info(f"Loading input workbook for Untraceable Report: {input_file}")
+    
+    input_path = str(input_file)
+    output_path = str(output_file)
 
-    sheet_names = get_sheet_names(path)
-    target_sheet = 'Raw' if 'Raw' in sheet_names else sheet_names[0]
-
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
+    # Read ONLY 'Raw' sheet
     try:
-        raw_headers = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
+        df_raw = pd.read_excel(input_path, sheet_name='Raw', engine='pyxlsb')
+    except Exception as e1:
+        log.warning(f"pyxlsb read failed: {e1}. Trying default pandas engine.")
+        try:
+            df_raw = pd.read_excel(input_path, sheet_name='Raw')
+        except Exception as e2:
+            log.warning(f"Sheet 'Raw' read failed: {e2}. Reading first sheet.")
+            df_raw = pd.read_excel(input_path, sheet_name=0)
 
-    headers = [str(h).strip() if h is not None else f"Unnamed_{i}" for i, h in enumerate(raw_headers)]
-    headers_lower = [h.lower() for h in headers]
+    # Convert numeric fields
+    if 'Amount' in df_raw.columns:
+        df_raw['Amount'] = pd.to_numeric(df_raw['Amount'], errors='coerce').fillna(0)
+    if 'ShipmentAmount' in df_raw.columns:
+        df_raw['ShipmentAmount'] = pd.to_numeric(df_raw['ShipmentAmount'], errors='coerce').fillna(0)
 
-    # Find columns
-    sdc_idx = -1
-    for cand in ['source dc', 'sourcedc', 'source_dc', 'dc']:
-        if cand in headers_lower:
-            sdc_idx = headers_lower.index(cand)
+    # Identify Source DC column
+    source_dc_col = None
+    for col in df_raw.columns:
+        if str(col).strip().lower() in ('source dc', 'sourcedc', 'source_dc', 'dc'):
+            source_dc_col = col
             break
-    if sdc_idx == -1:
-        sdc_idx = 0
+    if not source_dc_col:
+        source_dc_col = 'Source DC'
 
-    bucket_idx = -1
-    for cand in ['age bucket', 'age_bucket', 'aging bucket']:
-        if cand in headers_lower:
-            bucket_idx = headers_lower.index(cand)
-            break
+    # Filter raw data for DC Config hubs only
+    df_filtered = df_raw[df_raw[source_dc_col].astype(str).str.strip().str.lower().isin(ALLOWED_DCS_SET_LOWER)].copy()
+    log.info(f"Filtered {len(df_filtered)} records out of {len(df_raw)} total records based on dc_config.")
 
-    amt_idx = -1
-    for cand in ['amount', 'shipmentamount']:
-        if cand in headers_lower:
-            amt_idx = headers_lower.index(cand)
-            break
-
-    filtered_rows = []
-    dc_bucket_counts = defaultdict(lambda: defaultdict(int))
-    dc_amounts = defaultdict(float)
-    seen_buckets = set()
-
-    for row in rows_iter:
-        if not row or len(row) <= sdc_idx:
-            continue
-        sdc_raw = str(row[sdc_idx] or '').strip()
-        if sdc_raw.lower() in ALLOWED_DCS_SET_LOWER:
-            filtered_rows.append(row)
-            sdc = sdc_raw.upper()
-            
-            b = str(row[bucket_idx] or '0-2 Days').strip() if bucket_idx != -1 and len(row) > bucket_idx else '0-2 Days'
-            seen_buckets.add(b)
-            dc_bucket_counts[sdc][b] += 1
-
-            if amt_idx != -1 and len(row) > amt_idx and row[amt_idx] is not None:
-                try:
-                    dc_amounts[sdc] += float(row[amt_idx])
-                except (ValueError, TypeError):
-                    pass
-
-    log.info(f"Streamed and filtered {len(filtered_rows)} matching Untraceable rows.")
-
-    present_buckets = [b for b in STANDARD_AGE_BUCKETS if b in seen_buckets]
-    other_buckets = [b for b in seen_buckets if b not in STANDARD_AGE_BUCKETS]
+    # Determine age bucket order
+    raw_buckets = df_filtered['Age Bucket'].dropna().unique().tolist() if 'Age Bucket' in df_filtered.columns else []
+    present_buckets = [b for b in STANDARD_AGE_BUCKETS if b in raw_buckets]
+    other_buckets = [b for b in raw_buckets if b not in STANDARD_AGE_BUCKETS]
     all_buckets = present_buckets + sorted(other_buckets)
     if not all_buckets:
         all_buckets = STANDARD_AGE_BUCKETS
 
-    active_dcs = [dc for dc in dc_bucket_counts if sum(dc_bucket_counts[dc].values()) > 0]
-    active_dcs.sort()
+    # Pivot: Source DC x Age Buckets (Count of ShipmentId)
+    shipment_col = 'ShipmentId' if 'ShipmentId' in df_filtered.columns else df_filtered.columns[0]
+    p_cnt = pd.pivot_table(
+        df_filtered,
+        values=shipment_col,
+        index=source_dc_col,
+        columns='Age Bucket' if 'Age Bucket' in df_filtered.columns else df_filtered.columns[1],
+        aggfunc='count',
+        fill_value=0
+    )
+    p_cnt = p_cnt.reindex(columns=all_buckets, fill_value=0)
+
+    # Calculate Sum of Amount for each Source DC
+    amt_col_name = 'Amount' if 'Amount' in df_filtered.columns else ('ShipmentAmount' if 'ShipmentAmount' in df_filtered.columns else None)
+    if amt_col_name:
+        p_amt = df_filtered.groupby(source_dc_col)[amt_col_name].sum()
+        p_cnt['Amount'] = p_amt.reindex(p_cnt.index, fill_value=0)
+    else:
+        p_cnt['Amount'] = 0
+
+    # Filter out DCs with 0 total shipments
+    p_cnt['Total_Shipments'] = p_cnt[all_buckets].sum(axis=1)
+    p_cnt = p_cnt[p_cnt['Total_Shipments'] > 0].drop(columns=['Total_Shipments'])
 
     wb = openpyxl.Workbook()
 
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    # Styling themes
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid") # Dark Navy
     alt_row_fill = PatternFill(start_color="F9FAFB", end_color="F9FAFB", fill_type="solid")
-    aging_highlight_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    font_aging_highlight = Font(name="Calibri", size=11, bold=True, color="9C0006")
+    white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    
+    # Highlight fill for aging bucket 6-10 days or more with count > 0
+    aging_highlight_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid") # Soft Red/Pink
+    font_aging_highlight = Font(name="Calibri", size=11, bold=True, color="9C0006") # Dark Red text
+
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_regular = Font(name="Calibri", size=11)
 
     thin_border_side = Side(border_style="thin", color="D9D9D9")
     border_cell = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+    no_border = Border()
 
     # ----------------------------------------------------
-    # Sheet 1: Summary
+    # Sheet 1: Summary (Outer Gridlines Removed, All Table Cells Have Borders)
     # ----------------------------------------------------
     ws_sum = wb.active
     ws_sum.title = "Summary"
@@ -124,6 +139,7 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
     ws_sum.row_dimensions[1].height = 22
     ws_sum.row_dimensions[2].height = 22
 
+    # --- Header 1: Source DC (Merged A1:A2) ---
     ws_sum.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
     ws_sum.cell(row=1, column=1, value="Source DC")
     for r in range(1, 3):
@@ -133,6 +149,7 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = border_cell
 
+    # --- Header 2: Age Bucket Super Header (Merged B1 to G1) ---
     ws_sum.merge_cells(start_row=1, start_column=age_start_col, end_row=1, end_column=age_end_col)
     ws_sum.cell(row=1, column=age_start_col, value="Age Bucket")
     for col_idx in range(age_start_col, age_end_col + 1):
@@ -142,6 +159,7 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = border_cell
 
+    # Row 2 Sub-Headers for Age Buckets
     for idx, b_text in enumerate(all_buckets):
         col_idx = age_start_col + idx
         c = ws_sum.cell(row=2, column=col_idx, value=b_text)
@@ -150,6 +168,7 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = border_cell
 
+    # --- Header 3: Amount (Merged H1:H2) ---
     ws_sum.merge_cells(start_row=1, start_column=amt_col_idx, end_row=2, end_column=amt_col_idx)
     ws_sum.cell(row=1, column=amt_col_idx, value="Amount")
     for r in range(1, 3):
@@ -159,37 +178,33 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = border_cell
 
+    # Write Table Data (Row 3 onwards, excluding Grand Total)
     row_idx = 3
-    for dc_name in active_dcs:
+    for dc_name, row_data in p_cnt.iterrows():
         c1 = ws_sum.cell(row=row_idx, column=1, value=str(dc_name))
         c1.font = font_regular
         c1.border = border_cell
 
-        for col_idx, b_name in enumerate(all_buckets, start=2):
-            cnt = dc_bucket_counts[dc_name].get(b_name, 0)
-            cell_val = cnt if cnt > 0 else ""
+        for col_idx, b_name in enumerate(list(all_buckets) + ["Amount"], start=2):
+            val = row_data[b_name]
+            cell_val = val if val > 0 else "" # Hide 0 values
             c = ws_sum.cell(row=row_idx, column=col_idx, value=cell_val)
             c.alignment = Alignment(horizontal="right", vertical="center")
-            c.border = border_cell
+            c.border = border_cell # Uniform border for all table cells
+            
             if cell_val != "":
                 c.number_format = "#,##0"
 
-            if b_name in HIGHLIGHT_AGING_BUCKETS and cnt > 0:
+            # Highlight cells in aging bucket columns >= 6-10 days with count > 0
+            if b_name in HIGHLIGHT_AGING_BUCKETS and val > 0:
                 c.fill = aging_highlight_fill
                 c.font = font_aging_highlight
             else:
                 c.font = font_regular
 
-        amt_val = dc_amounts.get(dc_name, 0.0)
-        c_amt = ws_sum.cell(row=row_idx, column=amt_col_idx, value=amt_val if amt_val > 0 else "")
-        c_amt.alignment = Alignment(horizontal="right", vertical="center")
-        c_amt.border = border_cell
-        c_amt.font = font_regular
-        if amt_val > 0:
-            c_amt.number_format = "#,##0"
-
         row_idx += 1
 
+    # Auto-fit column widths for Summary
     for col in ws_sum.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -201,12 +216,13 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         ws_sum.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
     # ----------------------------------------------------
-    # Sheet 2: Raw
+    # Sheet 2: Raw (Filtered Data for DC Config Hubs)
     # ----------------------------------------------------
     ws_raw = wb.create_sheet(title="Raw")
     ws_raw.sheet_view.showGridLines = True
 
-    for col_idx, h_text in enumerate(headers, start=1):
+    raw_headers = list(df_filtered.columns)
+    for col_idx, h_text in enumerate(raw_headers, start=1):
         cell = ws_raw.cell(row=1, column=col_idx, value=h_text)
         cell.font = font_header
         cell.fill = header_fill
@@ -214,21 +230,20 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         cell.border = border_cell
     ws_raw.row_dimensions[1].height = 25
 
-    pincode_idx = headers_lower.index('customerpincode') if 'customerpincode' in headers_lower else -1
-
-    for r_idx, row_values in enumerate(filtered_rows, start=2):
-        use_alt = (r_idx % 2 == 0)
+    for row_idx, row_values in enumerate(df_filtered.values, start=2):
+        use_alt = (row_idx % 2 == 0)
         for col_idx, val in enumerate(row_values, start=1):
-            cell = ws_raw.cell(row=r_idx, column=col_idx)
+            col_name = raw_headers[col_idx - 1]
+            cell = ws_raw.cell(row=row_idx, column=col_idx)
             
-            if val is None or val == '':
+            if pd.isna(val):
                 cell.value = ""
             elif isinstance(val, (int, float)):
                 cell.value = val
-                if col_idx - 1 == amt_idx:
+                if col_name in ['Amount', 'ShipmentAmount']:
                     cell.number_format = "#,##0"
                     cell.alignment = Alignment(horizontal="right")
-                elif col_idx - 1 == pincode_idx:
+                elif col_name == 'CustomerPinCode':
                     cell.number_format = "0"
                     cell.alignment = Alignment(horizontal="center")
                 else:
@@ -252,7 +267,7 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
             max_len = max(max_len, len(val_str))
         ws_raw.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 40)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save single output file
     wb.save(output_path)
     log.info(f"Successfully generated Untraceable Report: {output_path}")
-    return str(output_path)
+    return output_path

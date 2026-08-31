@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Reverse Pendency Stream Generator Module for ei_stream_server
+Reverse Pendency Report Generator Module for ei_report_server
 =============================================================
-Streams rows from input spreadsheet, computes Age_Bucket in-flight, and generates output workbook.
+Reads 'Raw' sheet from input Excel file, filters rows where Region == 'North'
+and Source DC is in allowed list, computes Age_Bucket, and generates output workbook:
+  1. Summary Sheet (Aging wise report)
+  2. P0 reverse pendency Sheet (Aging >= 2 tracking details)
+  3. Raw Sheet (Full filtered dataset)
 """
 
 import logging
 from pathlib import Path
 from collections import defaultdict
+from python_calamine import CalamineWorkbook
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
-from core.stream_engine import stream_sheet_rows, get_sheet_names
-
+try:
+    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
+except ImportError:
+    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
 AGING_CATEGORIES = ['0-2 Days', '3-5 Days', '6-10 Days', '>10 Days']
 
 log = logging.getLogger("ei_stream_server.reverse_pendency")
@@ -55,8 +61,8 @@ def build_summary_sheet(out_wb, filtered_rows, src_dc_idx, age_bucket_idx):
 
     pivot = defaultdict(lambda: defaultdict(int))
     for row in filtered_rows[1:]:
-        dc = str(row[src_dc_idx]).strip().upper() if len(row) > src_dc_idx and row[src_dc_idx] else ''
-        bucket = str(row[age_bucket_idx]).strip() if len(row) > age_bucket_idx and row[age_bucket_idx] else '0-2 Days'
+        dc = str(row[src_dc_idx]).strip().upper() if row[src_dc_idx] else ''
+        bucket = str(row[age_bucket_idx]).strip() if row[age_bucket_idx] else '0-2 Days'
         pivot[dc][bucket] += 1
 
     headers = ["Source DC"] + AGING_CATEGORIES + ["Total Pendency"]
@@ -130,16 +136,16 @@ def build_p0_sheet(out_wb, filtered_rows, header):
     center = Alignment(horizontal="center", vertical="center")
     left = Alignment(horizontal="left", vertical="center")
 
-    tn_idx = header.index('tracking_number') if 'tracking_number' in header else 0
-    src_dc_idx = header.index('Source DC') if 'Source DC' in header else 1
-    aging_idx = header.index('Aging') if 'Aging' in header else 3
-    age_bucket_idx = header.index('Age_Bucket') if 'Age_Bucket' in header else 4
-    attempt_idx = header.index('Attempt_Status') if 'Attempt_Status' in header else 5
+    tn_idx = header.index('tracking_number')
+    src_dc_idx = header.index('Source DC')
+    aging_idx = header.index('Aging')
+    age_bucket_idx = header.index('Age_Bucket')
+    attempt_idx = header.index('Attempt_Status')
 
     p0_rows = []
     for row in filtered_rows[1:]:
         try:
-            aging = float(row[aging_idx]) if len(row) > aging_idx and row[aging_idx] else 0
+            aging = float(row[aging_idx]) if row[aging_idx] else 0
         except (ValueError, TypeError):
             aging = 0
         if aging >= 2:
@@ -167,11 +173,11 @@ def build_p0_sheet(out_wb, filtered_rows, header):
     for r_idx, row in enumerate(p0_rows):
         row_num = r_idx + 3
         vals = [
-            row[tn_idx] if len(row) > tn_idx else '',
-            str(row[src_dc_idx]).strip().upper() if len(row) > src_dc_idx and row[src_dc_idx] else '',
-            row[aging_idx] if len(row) > aging_idx else '',
-            str(row[age_bucket_idx]).strip() if len(row) > age_bucket_idx and row[age_bucket_idx] else '',
-            str(row[attempt_idx]).strip() if len(row) > attempt_idx and row[attempt_idx] else ''
+            row[tn_idx],
+            str(row[src_dc_idx]).strip().upper() if row[src_dc_idx] else '',
+            row[aging_idx],
+            str(row[age_bucket_idx]).strip() if row[age_bucket_idx] else '',
+            str(row[attempt_idx]).strip() if row[attempt_idx] else ''
         ]
         for c_idx, val in enumerate(vals):
             cell = ws.cell(row=row_num, column=c_idx + 1, value=val)
@@ -186,55 +192,35 @@ def build_p0_sheet(out_wb, filtered_rows, header):
     return len(p0_rows)
 
 def generate_reverse_pendency_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
-    log.info(f"Stream generating Reverse Pendency Report: {path}")
-    sheet_names = get_sheet_names(path)
+    log.info(f"Reading workbook for Reverse Pendency: {input_file}")
+    wb = CalamineWorkbook.from_path(str(input_file))
 
-    target_sheet = 'Raw'
-    if 'Raw' not in sheet_names:
-        sheet_map = {name.lower(): name for name in sheet_names}
-        if 'raw' in sheet_map:
-            target_sheet = sheet_map['raw']
-        elif len(sheet_names) > 0:
-            target_sheet = sheet_names[0]
+    if 'Raw' not in wb.sheet_names:
+        raise ValueError(f"Sheet 'Raw' not found. Available: {wb.sheet_names}")
 
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
-    try:
-        raw_header = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
+    sheet = wb.get_sheet_by_name('Raw')
+    rows = list(sheet.iter_rows())
+    header = rows[0]
 
-    header = [str(h).strip() if h is not None else '' for h in raw_header]
+    log.info(f"Raw sheet: {len(rows)-1} data rows, {len(header)} columns")
 
-    src_dc_idx = header.index('Source DC') if 'Source DC' in header else 1
-    region_idx = header.index('Region') if 'Region' in header else 2
-    aging_idx = header.index('Aging') if 'Aging' in header else 3
-    
-    if 'Age_Bucket' not in header:
-        header.insert(aging_idx + 1, 'Age_Bucket')
-        age_bucket_idx = aging_idx + 1
-    else:
-        age_bucket_idx = header.index('Age_Bucket')
+    src_dc_idx = header.index('Source DC')
+    region_idx = header.index('Region')
+    aging_idx = header.index('Aging')
+    age_bucket_idx = header.index('Age_Bucket')
 
     filtered = [header]
-    for row in rows_iter:
-        if not row:
-            continue
-        region = str(row[region_idx]).strip() if len(row) > region_idx and row[region_idx] else ''
-        src_dc = str(row[src_dc_idx]).strip().upper() if len(row) > src_dc_idx and row[src_dc_idx] else ''
-        
-        # If Region is present, check North; otherwise match allowed DCs
-        region_matches = (region.lower() == 'north') if region else True
-        if region_matches and src_dc in ALLOWED_SOURCE_DCS:
+    for row in rows[1:]:
+        region = str(row[region_idx]).strip() if row[region_idx] else ''
+        src_dc = str(row[src_dc_idx]).strip().upper() if row[src_dc_idx] else ''
+        if region == 'North' and src_dc in ALLOWED_SOURCE_DCS:
             row_list = list(row)
-            if len(row_list) <= age_bucket_idx:
-                row_list.extend([None] * (age_bucket_idx - len(row_list) + 1))
-            aging_val = row_list[aging_idx] if len(row_list) > aging_idx else None
+            aging_val = row_list[aging_idx]
             bucket = compute_age_bucket(aging_val)
             row_list[age_bucket_idx] = bucket
             filtered.append(row_list)
 
-    log.info(f"Streamed and filtered {len(filtered) - 1} matching rows.")
+    log.info(f"Filtered: {len(filtered)-1} rows (Region=North, Source DC in target list)")
 
     out_wb = Workbook()
     ws = out_wb.active
@@ -246,5 +232,4 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     p0_count = build_p0_sheet(out_wb, filtered, header)
 
     out_wb.save(str(output_file))
-    log.info(f"Saved Reverse Pendency Report: {output_file.name} ({len(filtered)} rows, {p0_count} P0 rows)")
-    return str(output_file)
+    log.info(f"Saved Reverse Pendency Report: {output_file.name} ({len(filtered)} total rows incl header, {p0_count} P0 rows)")

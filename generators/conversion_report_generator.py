@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Conversion Report Stream Generator Module for ei_stream_server
-==============================================================
-Streams 'E2E_DC' and 'Agent_view' tabs, filters allowed Source_DCs, computes percentages,
+Conversion Report Generator Module for ei_report_server
+========================================================
+Reads 'E2E_DC' and 'Agent_view' tabs from input Excel file,
+filters for allowed Source_DCs, computes percentages and color thresholds,
 and writes formatted output workbook.
 """
 
@@ -10,14 +11,15 @@ import re
 import logging
 from datetime import datetime, date
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional
 import pandas as pd
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-from config.dc_config import ALLOWED_DCS_SET as ALLOWED_DCS
-from core.stream_engine import stream_sheet_rows, stream_sheet_dicts, get_sheet_names
-
+try:
+    from config.dc_config import ALLOWED_DCS_SET as ALLOWED_DCS
+except ImportError:
+    from dc_config import ALLOWED_DCS_SET as ALLOWED_DCS
 PCT_COLS_DC = ['Succ_pickup%', 'Succ_del%', 'COD_Succ_del%', 'PP_Succ_del%']
 
 HEADER_FILL = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid')
@@ -37,53 +39,69 @@ FONT_GREEN = Font(color='006100')
 
 log = logging.getLogger("ei_stream_server.conversion_report")
 
+def _get_all_sheet_names(input_file: Path):
+    """Return all sheet names from the workbook."""
+    import openpyxl
+    wb = openpyxl.load_workbook(input_file, read_only=True)
+    names = wb.sheetnames
+    wb.close()
+    return names
+
+
 def _resolve_sheet(input_file: Path, target: str) -> str:
-    names = get_sheet_names(input_file)
+    """Return the exact sheet name from the workbook that matches target case-insensitively."""
+    names = _get_all_sheet_names(input_file)
     target_lower = target.lower()
     for name in names:
         if name.lower() == target_lower:
             return name
     raise ValueError(f"Sheet '{target}' not found in workbook. Available tabs: {names}")
 
+
 def extract_report_date_from_agent_view(input_file: Path) -> Optional[str]:
+    """
+    Extracts the report date from the first column ('Date') of the 'Agent_view' tab.
+    Returns normalized date string (e.g. '18-08-2026') or None if not found.
+    """
     try:
-        names = get_sheet_names(input_file)
+        import openpyxl
+        wb = openpyxl.load_workbook(str(input_file), read_only=True, data_only=True)
         target_name = None
-        for name in names:
-            norm = name.strip().lower().replace(' ', '_').replace('-', '_')
-            if 'agent_view' in norm or 'agentview' in norm:
+        for name in wb.sheetnames:
+            norm_name = name.strip().lower().replace(' ', '_').replace('-', '_')
+            if 'agent_view' in norm_name or 'agentview' in norm_name:
                 target_name = name
                 break
         if not target_name:
-            for name in names:
+            for name in wb.sheetnames:
                 if 'agent' in name.strip().lower():
                     target_name = name
                     break
-        if not target_name and len(names) > 0:
-            target_name = names[0]
+        if not target_name and len(wb.sheetnames) > 0:
+            target_name = wb.sheetnames[0]
 
-        rows_iter = stream_sheet_rows(input_file, sheet_name=target_name)
-        try:
-            header_row = next(rows_iter)
-        except StopIteration:
-            return None
-
+        ws = wb[target_name]
         date_col_idx = 0
-        for c_idx, h in enumerate(header_row):
-            if h is not None and 'date' in str(h).strip().lower():
-                date_col_idx = c_idx
-                break
-
         found_date_val = None
-        for row in rows_iter:
-            if not row:
-                continue
-            if len(row) > date_col_idx and row[date_col_idx] not in (None, '', 'None', 'nan', 'NaT'):
-                found_date_val = row[date_col_idx]
-                break
-            elif len(row) > 0 and row[0] not in (None, '', 'None', 'nan', 'NaT'):
-                found_date_val = row[0]
-                break
+
+        for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+            if r_idx == 0:
+                for c_idx, h in enumerate(row):
+                    if h is not None and 'date' in str(h).strip().lower():
+                        date_col_idx = c_idx
+                        break
+            else:
+                if len(row) > date_col_idx:
+                    val = row[date_col_idx]
+                    if val is not None and str(val).strip() not in ('', 'None', 'nan', 'NaT'):
+                        found_date_val = val
+                        break
+                if found_date_val is None and len(row) > 0:
+                    val = row[0]
+                    if val is not None and str(val).strip() not in ('', 'None', 'nan', 'NaT'):
+                        found_date_val = val
+                        break
+        wb.close()
 
         if found_date_val is not None:
             if isinstance(found_date_val, (datetime, date)):
@@ -101,8 +119,10 @@ def extract_report_date_from_agent_view(input_file: Path) -> Optional[str]:
         log.warning(f"Could not extract report date from Agent_view: {ex}")
     return None
 
+
 def _clean_pct_val(val):
-    if val is None or val == '' or pd.isna(val):
+    """Convert string, float, or ratio percentage values to standard 0.0 - 1.0 float ratios."""
+    if pd.isna(val):
         return 0.0
     had_pct = False
     if isinstance(val, str):
@@ -123,18 +143,11 @@ def _clean_pct_val(val):
         return val / 100.0
     return val
 
+
 def build_dc_view(input_file: Path) -> pd.DataFrame:
     sheet = _resolve_sheet(input_file, 'E2E_DC')
-    records = []
-    for d in stream_sheet_dicts(input_file, sheet_name=sheet):
-        sdc = str(d.get('Source_DC') or d.get('source_dc') or '').strip().upper()
-        if sdc in ALLOWED_DCS:
-            d['Source_DC'] = sdc
-            records.append(d)
-
-    df = pd.DataFrame(records)
-    if df.empty:
-        df = pd.DataFrame(columns=['Source_DC'] + PCT_COLS_DC)
+    df = pd.read_excel(input_file, sheet_name=sheet)
+    df = df[df['Source_DC'].isin(ALLOWED_DCS)].copy()
 
     if 'Picked-up' in df.columns:
         df['Picked-up'] = pd.to_numeric(df['Picked-up'], errors='coerce').fillna(0)
@@ -145,6 +158,7 @@ def build_dc_view(input_file: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].apply(_clean_pct_val)
 
+    # Recalculate/ensure Succ_pickup% if missing or null
     if 'Picked-up' in df.columns and 'OFP' in df.columns:
         if 'Succ_pickup%' not in df.columns or df['Succ_pickup%'].sum() == 0:
             ofp_denom = df['OFP'].replace(0, float('nan'))
@@ -152,29 +166,25 @@ def build_dc_view(input_file: Path) -> pd.DataFrame:
 
     return df
 
+
 def build_agent_view(input_file: Path) -> pd.DataFrame:
     sheet = _resolve_sheet(input_file, 'Agent_view')
-    records = []
-    for d in stream_sheet_dicts(input_file, sheet_name=sheet):
-        sdc = str(d.get('Source_DC') or d.get('source_dc') or '').strip().upper()
-        if sdc in ALLOWED_DCS:
-            d['Source_DC'] = sdc
-            records.append(d)
+    df = pd.read_excel(input_file, sheet_name=sheet)
+    df = df[df['Source_DC'].isin(ALLOWED_DCS)].copy()
 
-    df = pd.DataFrame(records)
-    if df.empty:
-        df = pd.DataFrame(columns=['Source_DC', 'OFP', 'Picked-up', 'REV %', 'OFD', 'FWD %'])
-
+    # Identify delivery update column name ('del_update' or 'del_ppdate')
     del_col = None
     if 'del_update' in df.columns:
         del_col = 'del_update'
     elif 'del_ppdate' in df.columns:
         del_col = 'del_ppdate'
 
+    # Remove any pre-existing 'Total OFP' or 'Total OFD' columns
     for extra_col in ['Total OFP', 'Total OFD']:
         if extra_col in df.columns:
             df.drop(columns=[extra_col], inplace=True)
 
+    # Coerce numeric columns
     cols_to_coerce = ['OFP', 'Picked-up', 'OFD']
     if del_col:
         cols_to_coerce.append(del_col)
@@ -183,15 +193,18 @@ def build_agent_view(input_file: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+    # REV % = Picked-up / OFP
     if 'OFP' in df.columns and 'Picked-up' in df.columns:
         ofp_denom = df['OFP'].replace(0, float('nan'))
         df['REV %'] = (df['Picked-up'] / ofp_denom).astype('float64').round(4).fillna(0.0)
 
+    # FWD % = del_update / OFD (or del_ppdate / OFD)
     if 'OFD' in df.columns and del_col and del_col in df.columns:
         ofd_denom = df['OFD'].replace(0, float('nan'))
         df['FWD %'] = (df[del_col] / ofd_denom).astype('float64').round(4).fillna(0.0)
 
     return df
+
 
 def _pct_fill_font(value, thresholds):
     lo, mid = thresholds
@@ -229,19 +242,26 @@ def style_sheet(ws, pct_cols=None):
     ws.auto_filter.ref = ws.dimensions
 
 def _col_letter_by_name(ws, col_name: str):
+    """Return the column letter for a header cell matching col_name (case-insensitive)."""
     for cell in ws[1]:
         if cell.value and str(cell.value).strip().lower() == col_name.strip().lower():
             return cell.column_letter
     return None
 
+
 def generate_conversion_report(input_file: Path, output_file: Path, sub_type: str = "Sameday"):
+    """
+    Main generator pipeline for Conversion Report.
+    sub_type: 'Sameday' or 'D-1' — used to prefix sheet names and filename.
+    """
+    # Normalize label: 'sameday' -> 'Sameday', 'd1'/'d-1' -> 'D-1'
     label = sub_type.strip()
     if label.lower() in ("d1", "d-1"):
         label = "D-1"
     elif label.lower() == "sameday":
         label = "Sameday"
 
-    log.info(f"Stream generating Conversion Report [{label}]: {input_file}")
+    log.info(f"Loading input workbook for Conversion Report [{label}]: {input_file}")
     dc_df    = build_dc_view(input_file)
     agent_df = build_agent_view(input_file)
 
@@ -267,6 +287,7 @@ def generate_conversion_report(input_file: Path, output_file: Path, sub_type: st
                 col_let = _col_letter_by_name(ws, col_name)
                 if col_let:
                     dc_pct_cols[col_let] = thresholds
+                    log.info(f"{sheet_dc}: {col_name} mapped to column {col_let}")
             style_sheet(ws, pct_cols=dc_pct_cols if dc_pct_cols else None)
         elif name == sheet_agent:
             rev_col = _col_letter_by_name(ws, 'REV %')
@@ -274,12 +295,13 @@ def generate_conversion_report(input_file: Path, output_file: Path, sub_type: st
             agent_pct_cols = {}
             if rev_col:
                 agent_pct_cols[rev_col] = (0.75, 0.85)
+                log.info(f"{sheet_agent}: REV % at column {rev_col}")
             if fwd_col:
                 agent_pct_cols[fwd_col] = (0.80, 0.90)
+                log.info(f"{sheet_agent}: FWD % at column {fwd_col}")
             style_sheet(ws, pct_cols=agent_pct_cols if agent_pct_cols else None)
         else:
             style_sheet(ws)
     wb.save(output_file)
     wb.close()
     log.info(f"Successfully generated Conversion Report [{label}]: {output_file}")
-    return str(output_file)

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-SCM TAT Stream Report Generator Module for ei_stream_server
-===========================================================
-Streams rows from input spreadsheet, computes completed vs pending counts per DC in-flight,
-and generates formatted output workbook.
+SCM TAT 24Hrs Performance Report Generator Module for ei_report_server
+======================================================================
+Reads 'Data' sheet from input Excel file, detects source DC and status columns,
+filters rows matching allowed DCs from dc_config, computes completed vs pending counts,
+and generates formatted output workbook:
+  1. 'SCM tat performance summary' sheet
+  2. 'SCM TAT raw data' sheet
 """
 
 import sys
@@ -14,8 +17,17 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config.dc_config import ALLOWED_DCS_SET_LOWER
-from core.stream_engine import stream_sheet_rows, get_sheet_names
+# Ensure current directory is in sys.path for dc_config import
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+try:
+    from config.dc_config import ALLOWED_DCS_SET_LOWER
+except ImportError:
+    try:
+        from dc_config import ALLOWED_DCS_SET_LOWER
+    except ImportError:
+        ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
 
 log = logging.getLogger("ei_stream_server.tat_report")
 
@@ -25,7 +37,7 @@ def detect_hub_col(headers):
     for p in priorities:
         if p in lower:
             return lower.index(p)
-    return 28
+    return 28  # Default fallback
 
 def detect_status_col(headers):
     lower = [str(h).strip().lower() if h is not None else '' for h in headers]
@@ -34,43 +46,40 @@ def detect_status_col(headers):
     for idx, h in enumerate(lower):
         if 'status' in h:
             return idx
-    return 4
+    return 4  # Default fallback
 
 def generate_tat_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
-    log.info(f"Stream generating SCM TAT Report: {path}")
+    log.info(f"Loading input workbook for SCM TAT Report: {input_file}")
+    wb_in = openpyxl.load_workbook(str(input_file), data_only=True)
+    ws_data = wb_in['Data'] if 'Data' in wb_in.sheetnames else wb_in.active
 
-    sheet_names = get_sheet_names(path)
-    target_sheet = 'Data' if 'Data' in sheet_names else sheet_names[0]
+    headers = [cell.value for cell in ws_data[1]]
+    rows = []
+    for row in ws_data.iter_rows(min_row=2, values_only=True):
+        rows.append(list(row))
+    wb_in.close()
 
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
-    try:
-        raw_headers = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    headers = [str(h).strip() if h is not None else '' for h in raw_headers]
     hub_idx = detect_hub_col(headers)
     status_idx = detect_status_col(headers)
 
-    filtered_rows = []
-    stats_map = defaultdict(lambda: {'complete': 0, 'not_complete': 0})
+    # Filter rows to allowed DCs
+    filtered_rows = [
+        r for r in rows
+        if len(r) > hub_idx and str(r[hub_idx] or '').strip().lower() in ALLOWED_DCS_SET_LOWER
+    ]
 
-    for row in rows_iter:
-        if not row or len(row) <= max(hub_idx, status_idx):
+    stats_map = defaultdict(lambda: {'complete': 0, 'not_complete': 0})
+    for row in filtered_rows:
+        if len(row) <= max(hub_idx, status_idx):
             continue
         hub = str(row[hub_idx] or '').strip()
+        status = str(row[status_idx] or '').strip().lower()
         if not hub or hub.lower() not in ALLOWED_DCS_SET_LOWER:
             continue
-
-        filtered_rows.append(row)
-        status = str(row[status_idx] or '').strip().lower()
         if status in ('closed', 'task resolved', 'resolved', 'complete', 'completed'):
             stats_map[hub.upper()]['complete'] += 1
         else:
             stats_map[hub.upper()]['not_complete'] += 1
-
-    log.info(f"Streamed and filtered {len(filtered_rows)} matching TAT rows.")
 
     sorted_hubs = sorted(stats_map.keys())
     summary_rows = []
@@ -230,4 +239,3 @@ def generate_tat_report(input_file: Path, output_file: Path):
 
     wb_out.save(str(output_file))
     log.info(f"Successfully generated SCM TAT Report: {output_file}")
-    return str(output_file)

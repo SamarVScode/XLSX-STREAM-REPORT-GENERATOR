@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Forward Pendency Stream Generator Module for ei_stream_server
+Forward Pendency Report Generator Module for ei_report_server
 =============================================================
-Streams rows from input spreadsheet, computes Aging Category in-flight, and generates output workbook.
+Reads 'raw_data_North' from input Excel file, filters rows where Source_DC is in
+{'alg', 'ayp', 'deo', 'jhs', 'jnp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr'},
+computes the 'Aging Category' column right beside 'Aging', and generates output workbook with:
+  1. Summary Sheet (3 Sidewise Tables with Red/Green highlights)
+  2. CPD-DID pendency Sheet (P2 & P3 actual row details)
+  3. RAW Sheet (Full 6,775 filtered rows dataset)
 """
 
 import logging
@@ -11,9 +16,10 @@ from collections import defaultdict
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-
-from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET_LOWER
-from core.stream_engine import stream_sheet_rows, get_sheet_names
+try:
+    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
+except ImportError:
+    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
 
 AGING_CATEGORIES = ['0-2 days', '3-5 days', '5-10 days', '>10 days']
 
@@ -42,10 +48,13 @@ def write_side_table(ws, start_col: int, start_row: int, title: str, headers: li
 
     title_fill = PatternFill("solid", fgColor="1E1B4B")
     title_font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+    
     header_fill = PatternFill("solid", fgColor="312E81")
     header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    
     total_fill = PatternFill("solid", fgColor="E0E7FF")
     total_font = Font(name="Calibri", size=11, bold=True, color="1E1B4B")
+    
     data_font = Font(name="Calibri", size=11, color="1F2937")
     thin_side = Side(style="thin", color="CBD5E1")
     border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
@@ -54,10 +63,11 @@ def write_side_table(ws, start_col: int, start_row: int, title: str, headers: li
 
     red_fill = PatternFill("solid", fgColor="FECACA")
     red_font = Font(name="Calibri", size=11, bold=True, color="991B1B")
+
     green_fill = PatternFill("solid", fgColor="DCFCE7")
     green_font = Font(name="Calibri", size=11, bold=True, color="166534")
 
-    # Title row
+    # Merge title row
     ws.merge_cells(start_row=start_row, start_column=start_col, end_row=start_row, end_column=end_col)
     title_cell = ws.cell(row=start_row, column=start_col, value=title)
     title_cell.font = title_font
@@ -126,9 +136,9 @@ def build_summary_sheet(out_wb, filtered_data_rows, aging_cat_idx, sdc_idx, prio
     t3_pivot = defaultdict(lambda: defaultdict(int))
 
     for r in filtered_data_rows[1:]:
-        sdc = str(r[sdc_idx]).upper() if sdc_idx is not None and len(r) > sdc_idx and r[sdc_idx] is not None else ""
-        cat = str(r[aging_cat_idx]) if len(r) > aging_cat_idx else "0-2 days"
-        prio = str(r[prio_idx]) if prio_idx is not None and len(r) > prio_idx and r[prio_idx] is not None else "Unknown"
+        sdc = str(r[sdc_idx]).upper()
+        cat = str(r[aging_cat_idx])
+        prio = str(r[prio_idx]) if r[prio_idx] is not None else "Unknown"
 
         t1_pivot[sdc][cat] += 1
         t2_pivot[sdc][prio] += 1
@@ -229,12 +239,12 @@ def build_cpd_did_sheet(out_wb, filtered_data_rows, aging_cat_idx, sdc_idx, prio
 
     current_row = 2
     for r in filtered_data_rows[1:]:
-        prio = str(r[prio_idx]) if prio_idx is not None and len(r) > prio_idx and r[prio_idx] is not None else ""
+        prio = str(r[prio_idx]) if r[prio_idx] is not None else ""
         if prio in ("P2", "P3"):
-            shipment = r[shipment_idx] if shipment_idx is not None and len(r) > shipment_idx else ""
-            sdc = str(r[sdc_idx]).upper() if sdc_idx is not None and len(r) > sdc_idx and r[sdc_idx] is not None else ""
-            aging_cat = r[aging_cat_idx] if len(r) > aging_cat_idx else ""
-            attempt_stat = r[attempt_idx] if attempt_idx is not None and len(r) > attempt_idx and r[attempt_idx] is not None else ""
+            shipment = r[shipment_idx]
+            sdc = str(r[sdc_idx]).upper() if r[sdc_idx] is not None else ""
+            aging_cat = r[aging_cat_idx]
+            attempt_stat = r[attempt_idx] if r[attempt_idx] is not None else ""
 
             row_vals = [shipment, sdc, aging_cat, attempt_stat, prio]
             for c_idx, val in enumerate(row_vals, start=1):
@@ -250,64 +260,67 @@ def build_cpd_did_sheet(out_wb, filtered_data_rows, aging_cat_idx, sdc_idx, prio
         ws.column_dimensions[col_letter].width = max(max_len + 4, 16)
 
 def generate_forward_pendency_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
-    if not path.exists():
+    """
+    Main generator pipeline for Forward Pendency Report.
+    """
+    if not Path(input_file).exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    log.info(f"Stream generating Forward Pendency Report: {input_file}")
-    sheet_names = get_sheet_names(path)
+    log.info(f"Loading input workbook for Forward Pendency Report: {input_file}")
+    in_wb = openpyxl.load_workbook(input_file, data_only=True, read_only=True)
 
+    # Sheet selection with fallback: 'raw_data_North' -> 'raw_data' (with case-insensitive fallback)
     target_sheet = None
-    for cand in ['raw_data_north', 'raw_data', 'raw', 'praw data']:
-        for s in sheet_names:
-            if s.lower().replace(' ', '_') == cand:
-                target_sheet = s
-                break
-        if target_sheet:
-            break
-    if not target_sheet and sheet_names:
-        target_sheet = sheet_names[0]
+    if 'raw_data_North' in in_wb.sheetnames:
+        target_sheet = 'raw_data_North'
+    elif 'raw_data' in in_wb.sheetnames:
+        target_sheet = 'raw_data'
+    else:
+        sheet_map = {name.lower(): name for name in in_wb.sheetnames}
+        if 'raw_data_north' in sheet_map:
+            target_sheet = sheet_map['raw_data_north']
+        elif 'raw_data' in sheet_map:
+            target_sheet = sheet_map['raw_data']
 
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
-    try:
-        raw_header = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
+    if not target_sheet:
+        raise ValueError(f"Neither 'raw_data_North' nor 'raw_data' sheet found in input. Available: {in_wb.sheetnames}")
 
-    header_list = [str(h).strip() if h is not None else '' for h in raw_header]
-    headers_lower = [h.lower().replace('_', ' ').replace('-', ' ') for h in header_list]
-    
-    def find_col_idx(candidates, fallback=0):
-        for c in candidates:
-            c_clean = c.lower().replace('_', ' ').replace('-', ' ')
-            if c_clean in headers_lower:
-                return headers_lower.index(c_clean)
-        for idx, h in enumerate(headers_lower):
-            for c in candidates:
-                c_clean = c.lower().replace('_', ' ').replace('-', ' ')
-                if c_clean in h:
-                    return idx
-        return fallback
+    in_ws = in_wb[target_sheet]
+    log.info(f"Reading rows from '{target_sheet}' sheet...")
 
-    aging_col_idx = find_col_idx(['aging', 'ageing', 'aging bucket'], fallback=min(len(header_list)-1, 20))
-    sdc_idx = find_col_idx(['source dc', 'source_dc', 'dc', 'sdc'], fallback=min(len(header_list)-1, 15))
-    prio_idx = find_col_idx(['customerpriorityv2', 'customer priority', 'priority', 'prio'], fallback=min(len(header_list)-1, 13))
-    shipment_idx = find_col_idx(['pendingshipments', 'pending shipments', 'tracking_no', 'tracking no', 'shipment_id'], fallback=0)
-    attempt_idx = find_col_idx(['attempt_status', 'attempt status', 'status'], fallback=min(len(header_list)-1, 23))
-
-    header_list.insert(aging_col_idx + 1, 'Aging Category')
-    filtered_rows = [header_list]
-
-    sdc_idx_new = sdc_idx + 1 if sdc_idx > aging_col_idx else sdc_idx
-    prio_idx_new = prio_idx + 1 if prio_idx > aging_col_idx else prio_idx
-    shipment_idx_new = shipment_idx + 1 if shipment_idx > aging_col_idx else shipment_idx
-    attempt_idx_new = attempt_idx + 1 if attempt_idx > aging_col_idx else attempt_idx
-    aging_cat_idx = aging_col_idx + 1
-
+    filtered_rows = []
+    header_list = None
+    aging_col_idx = 20
+    sdc_idx = 15
+    prio_idx = 13
+    shipment_idx = 1
+    attempt_idx = 23
     total_processed = 0
-    for row in rows_iter:
-        if not row:
+
+    for i, row in enumerate(in_ws.iter_rows(values_only=True)):
+        if i == 0:
+            header_list = list(row)
+            if 'Aging' in header_list:
+                aging_col_idx = header_list.index('Aging')
+            if 'Source_DC' in header_list:
+                sdc_idx = header_list.index('Source_DC')
+            if 'CustomerPriorityV2' in header_list:
+                prio_idx = header_list.index('CustomerPriorityV2')
+            if 'PendingShipments' in header_list:
+                shipment_idx = header_list.index('PendingShipments')
+            if 'Attempt_Status' in header_list:
+                attempt_idx = header_list.index('Attempt_Status')
+
+            header_list.insert(aging_col_idx + 1, 'Aging Category')
+            filtered_rows.append(header_list)
+
+            sdc_idx_new = sdc_idx + 1 if sdc_idx > aging_col_idx else sdc_idx
+            prio_idx_new = prio_idx + 1 if prio_idx > aging_col_idx else prio_idx
+            shipment_idx_new = shipment_idx + 1 if shipment_idx > aging_col_idx else shipment_idx
+            attempt_idx_new = attempt_idx + 1 if attempt_idx > aging_col_idx else attempt_idx
+            aging_cat_idx = aging_col_idx + 1
             continue
+
         total_processed += 1
         raw_sdc = row[sdc_idx] if len(row) > sdc_idx else None
         sdc = str(raw_sdc).strip().lower() if raw_sdc is not None else ''
@@ -319,11 +332,12 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
             row_list.insert(aging_col_idx + 1, aging_cat)
             filtered_rows.append(row_list)
 
-    log.info(f"Streamed {total_processed} source rows. Filtered {len(filtered_rows) - 1} matching rows.")
+    log.info(f"Processed {total_processed} source rows. Filtered {len(filtered_rows) - 1} matching rows.")
+    in_wb.close()
 
     out_wb = openpyxl.Workbook()
     
-    # 1. RAW Sheet
+    # 1. RAW Sheet (Main filtered data tab)
     data_ws = out_wb.active
     data_ws.title = "Raw"
     for r in filtered_rows:
@@ -337,4 +351,3 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
 
     out_wb.save(output_file)
     log.info(f"Successfully generated Forward Pendency Report: {output_file}")
-    return str(output_file)

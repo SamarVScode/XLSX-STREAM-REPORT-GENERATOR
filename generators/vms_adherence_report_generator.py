@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VMS Adherence Stream Report Generator Module for ei_stream_server
-=================================================================
-Streams rows from 'Raw' sheet of VMS Adherence Excel file, filters rows where Source DC is in allowed list,
+VMS Adherence Report Generator Module for ei_report_server
+==========================================================
+Reads 'Raw' sheet from VMS Adherence Excel file, filters rows where Source DC is in allowed list,
 computes summary stats by Source DC, and generates output workbook:
   1. VMS Adherence Summary Sheet
   2. VMS Adherence Raw Data Sheet
@@ -16,8 +16,15 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config.dc_config import ALLOWED_DCS_SET_LOWER
-from core.stream_engine import stream_sheet_rows, get_sheet_names
+# Ensure current directory is in sys.path for dc_config import
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+try:
+    from config.dc_config import ALLOWED_DCS_SET_LOWER
+except ImportError:
+    from dc_config import ALLOWED_DCS_SET_LOWER
 
 log = logging.getLogger("ei_stream_server.vms_adherence_report")
 
@@ -31,38 +38,45 @@ def find_col(headers, names):
 
 
 def generate_vms_adherence_report(input_file: Path, output_file: Path):
-    path = Path(input_file)
-    log.info(f"Stream generating VMS Adherence Report: {path}")
-
-    sheet_names = get_sheet_names(path)
-    target_sheet = 'Raw' if 'Raw' in sheet_names else sheet_names[0]
-
-    rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
+    log.info(f"Loading input workbook for VMS Adherence Report: {input_file}")
     try:
-        raw_headers = next(rows_iter)
-    except StopIteration:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
+        from python_calamine import CalamineWorkbook
+        calamine_wb = CalamineWorkbook.from_path(str(input_file))
+        ws_raw = calamine_wb.get_sheet_by_name('Raw') if 'Raw' in calamine_wb.sheet_names else calamine_wb.get_sheet_by_index(0)
+        raw_python_rows = ws_raw.to_python()
+        headers = raw_python_rows[0] if raw_python_rows else []
+        rows = raw_python_rows[1:] if len(raw_python_rows) > 1 else []
+    except Exception as e:
+        log.warning(f"Calamine read failed: {e}. Falling back to openpyxl.")
+        wb_in = openpyxl.load_workbook(str(input_file), data_only=True)
+        ws_raw = wb_in['Raw'] if 'Raw' in wb_in.sheetnames else wb_in.active
+        headers = [cell.value for cell in ws_raw[1]]
+        rows = [list(row) for row in ws_raw.iter_rows(min_row=2, values_only=True)]
+        wb_in.close()
 
-    headers = [str(h).strip() if h is not None else '' for h in raw_headers]
     source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
     vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
 
-    filtered_rows = []
-    stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
-
-    for row in rows_iter:
-        if not row or len(row) <= max(source_dc_idx, vms_status_idx):
-            continue
-        dc_key = str(row[source_dc_idx] or '').strip().lower()
-        if dc_key in ALLOWED_DCS_SET_LOWER:
-            filtered_rows.append(row)
-            status = str(row[vms_status_idx] or '').strip().lower()
-            if status == 'done':
-                stats[dc_key]['done'] += 1
-            else:
-                stats[dc_key]['not_done'] += 1
+    # Filter rows to allowed DCs using dc_config
+    filtered_rows = [
+        r for r in rows
+        if len(r) > source_dc_idx and str(r[source_dc_idx] or '').strip().lower() in ALLOWED_DCS_SET_LOWER
+    ]
 
     log.info(f"Filtered {len(filtered_rows)} rows matching allowed DCs")
+
+    # Compute summary per Source_DC
+    stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
+
+    for row in filtered_rows:
+        if len(row) <= vms_status_idx:
+            continue
+        status = str(row[vms_status_idx] or '').strip().lower()
+        dc_key = str(row[source_dc_idx] or '').strip().lower()
+        if status == 'done':
+            stats[dc_key]['done'] += 1
+        else:
+            stats[dc_key]['not_done'] += 1
 
     sorted_dcs = sorted(stats.keys())
     summary_rows = []
@@ -212,3 +226,20 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
 
     wb_out.save(str(output_file))
     log.info(f"Successfully generated VMS Adherence Report: {output_file}")
+
+
+def main():
+    script_dir = Path(__file__).resolve().parent
+    input_file = script_dir.parent.parent / "vms adherence" / "VMS_Adherence_Report_30-Jul-2026.xlsx"
+    output_file = script_dir.parent.parent / "vms adherence" / "output.xlsx"
+
+    if len(sys.argv) > 1:
+        input_file = Path(sys.argv[1])
+    if len(sys.argv) > 2:
+        output_file = Path(sys.argv[2])
+
+    generate_vms_adherence_report(input_file, output_file)
+
+
+if __name__ == "__main__":
+    main()
