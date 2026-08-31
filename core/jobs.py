@@ -206,6 +206,17 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
         print_job_error(job_id, "Server busy: concurrent limit reached")
         return
 
+    # Redundancy check: If output was created by a previous identical request while waiting
+    if output_path.exists() and output_path.stat().st_size > 0:
+        conversion_semaphore.release()
+        job = active_jobs.get(job_id, {})
+        job["status"] = "done"
+        job["progress"] = "Complete (cached)"
+        job["completed_at"] = output_path.stat().st_mtime
+        _set_job(job_id, job)
+        log.info(f"Job {job_id} resolved from freshly created output file.")
+        return
+
     t_start = time.time()
     source_desc = "Direct Upload" if str(file_id).startswith("upload_") else f"Google Drive ({file_id})"
     print_job_start(job_id, report_type, source_desc)
@@ -287,10 +298,7 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
 
         print_job_step(job_id, 2, f"Stream report generated in {time.time() - t_gen:.2f}s")
 
-        # ----------------------------------------------------
-        # IMMEDIATE DISK AUTO-CLEANUP
-        # Delete downloaded raw input file to reclaim disk space immediately
-        # ----------------------------------------------------
+        # Immediate Disk Reclamation
         if tmp_input and tmp_input.exists():
             try:
                 tmp_input.unlink()
