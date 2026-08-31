@@ -9,28 +9,76 @@ from typing import Optional
 log = logging.getLogger("ei_stream_server.downloader")
 
 def _handle_drive_confirm_form(session: requests.Session, html_text: str, headers: dict = None) -> Optional[requests.Response]:
-    """Parse Google Drive HTML warning page form (<form id='download-form'>) and submit it."""
+    """Parse Google Drive HTML warning page form (<form id='download-form'>) or download link and submit it."""
+    # 1. Try form matching
     action_match = re.search(r'<form[^>]*action="([^"]+)"', html_text)
-    if not action_match:
-        return None
+    if action_match:
+        action_url = action_match.group(1).replace("&amp;", "&")
+        if action_url.startswith("//"):
+            action_url = "https:" + action_url
+        elif action_url.startswith("/"):
+            action_url = "https://drive.google.com" + action_url
+        elif not action_url.startswith("http"):
+            action_url = "https://drive.usercontent.google.com/" + action_url
 
-    action_url = action_match.group(1).replace("&amp;", "&")
-    inputs = re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', html_text)
-    params = {name: val for name, val in inputs}
+        inputs = re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', html_text)
+        params = {name: val for name, val in inputs}
 
-    log.info(f"Submitting Google Drive HTML confirmation form to: {action_url}")
-    try:
-        resp = session.get(action_url, params=params, headers=headers or {}, stream=True, timeout=180)
-        return resp
-    except Exception as e:
-        log.warning(f"Error submitting Drive confirmation form: {e}")
-        return None
+        log.info(f"Submitting Google Drive HTML confirmation form to: {action_url} (params: {list(params.keys())})")
+        try:
+            resp = session.get(action_url, params=params, headers=headers or {}, stream=True, timeout=180, allow_redirects=True)
+            if resp.status_code == 200 and "text/html" not in resp.headers.get("Content-Type", "").lower():
+                return resp
+        except Exception as e:
+            log.warning(f"Error submitting Drive confirmation form: {e}")
+
+    # 2. Try link matching (uc-download-link or confirm link)
+    link_match = re.search(r'href="([^"]*(?:confirm|download)[^"]*)"', html_text)
+    if link_match:
+        link_url = link_match.group(1).replace("&amp;", "&")
+        if link_url.startswith("//"):
+            link_url = "https:" + link_url
+        elif link_url.startswith("/"):
+            link_url = "https://drive.google.com" + link_url
+        elif not link_url.startswith("http"):
+            link_url = "https://drive.google.com/" + link_url
+
+        log.info(f"Following Google Drive confirmation link: {link_url}")
+        try:
+            resp = session.get(link_url, headers=headers or {}, stream=True, timeout=180, allow_redirects=True)
+            if resp.status_code == 200 and "text/html" not in resp.headers.get("Content-Type", "").lower():
+                return resp
+        except Exception as e:
+            log.warning(f"Error following Drive confirmation link: {e}")
+
+    # 3. Direct usercontent.google.com fallback with confirm=t
+    confirm_token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', html_text) or re.search(r'name="confirm"\s+value="([^"]+)"', html_text)
+    confirm_token = confirm_token_match.group(1) if confirm_token_match else "t"
+    uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html_text)
+    uuid_val = uuid_match.group(1) if uuid_match else None
+    
+    file_id_match = re.search(r'id=([a-zA-Z0-9_-]{25,})', html_text) or re.search(r'name="id"\s+value="([^"]+)"', html_text)
+    if file_id_match:
+        f_id = file_id_match.group(1)
+        fallback_urls = [
+            f"https://drive.usercontent.google.com/download?id={f_id}&export=download&confirm={confirm_token}" + (f"&uuid={uuid_val}" if uuid_val else ""),
+            f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={f_id}"
+        ]
+        for f_url in fallback_urls:
+            try:
+                log.info(f"Trying usercontent confirmation fallback: {f_url}")
+                resp = session.get(f_url, headers=headers or {}, stream=True, timeout=180, allow_redirects=True)
+                if resp.status_code == 200 and "text/html" not in resp.headers.get("Content-Type", "").lower():
+                    return resp
+            except Exception as e:
+                log.warning(f"Failed usercontent fallback ({f_url}): {e}")
+
+    return None
 
 def extract_file_id(url_or_id: str) -> str:
     """Extract Google Drive file ID from a full URL, or return as-is if already a bare ID."""
     url_or_id = url_or_id.strip()
 
-    # Pattern: /spreadsheets/d/<id> or /file/d/<id> or /files/<id>
     match = re.search(r'/(?:d|files)/([a-zA-Z0-9_-]{25,})', url_or_id)
     if match:
         return match.group(1)
@@ -128,7 +176,7 @@ def download_drive_file(file_id: str, dest_path: Path) -> Path:
     session = requests.Session()
     direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     log.info(f"Stream downloading Drive file '{file_id}' → '{dest_path.name}'")
-    response = session.get(direct_url, stream=True, timeout=120)
+    response = session.get(direct_url, stream=True, timeout=120, allow_redirects=True)
 
     # Handle download_warning cookie
     token = None
@@ -139,7 +187,7 @@ def download_drive_file(file_id: str, dest_path: Path) -> Path:
 
     if token:
         confirm_url = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
-        response = session.get(confirm_url, stream=True, timeout=120)
+        response = session.get(confirm_url, stream=True, timeout=120, allow_redirects=True)
 
     # Handle HTML confirmation page or native Google Sheet export
     content_type = response.headers.get("Content-Type", "").lower()
@@ -148,13 +196,6 @@ def download_drive_file(file_id: str, dest_path: Path) -> Path:
         form_response = _handle_drive_confirm_form(session, html_text)
         if form_response and form_response.status_code == 200 and "text/html" not in form_response.headers.get("Content-Type", "").lower():
             return _save_stream_to_file(form_response, dest_path)
-        
-        confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', html_text)
-        if confirm_match:
-            confirm_token = confirm_match.group(1)
-            confirm_url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
-            log.info(f"Extracted confirm token '{confirm_token}' from HTML body.")
-            response = session.get(confirm_url, stream=True, timeout=120)
 
     if response.status_code != 200:
         raise HTTPException(
