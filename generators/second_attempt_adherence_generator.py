@@ -101,14 +101,14 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     if CalamineWorkbook:
         try:
             wb_cal = CalamineWorkbook.from_path(str(input_path))
-            sheet_names = wb_cal.sheet_names
+            sheet_map = {s.lower(): s for s in wb_cal.sheet_names}
             
-            if "Summary" in sheet_names:
-                summary_rows = wb_cal.get_sheet_by_name("Summary").to_python()
-            if "FWD" in sheet_names:
-                fwd_rows = wb_cal.get_sheet_by_name("FWD").to_python()
-            if "REV" in sheet_names:
-                rev_rows = wb_cal.get_sheet_by_name("REV").to_python()
+            if "summary" in sheet_map:
+                summary_rows = wb_cal.get_sheet_by_name(sheet_map["summary"]).to_python()
+            if "fwd" in sheet_map:
+                fwd_rows = wb_cal.get_sheet_by_name(sheet_map["fwd"]).to_python()
+            if "rev" in sheet_map:
+                rev_rows = wb_cal.get_sheet_by_name(sheet_map["rev"]).to_python()
         except Exception:
             wb_cal = None
 
@@ -119,13 +119,14 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
             xls = pd.ExcelFile(str(input_path), engine=engine) if engine else pd.ExcelFile(str(input_path))
         except Exception:
             xls = pd.ExcelFile(str(input_path))
-        if "Summary" in xls.sheet_names:
-            summary_rows = pd.read_excel(xls, "Summary", header=None).values.tolist()
-        if "FWD" in xls.sheet_names:
-            fwd_df = pd.read_excel(xls, "FWD")
+        sheet_map = {s.lower(): s for s in xls.sheet_names}
+        if "summary" in sheet_map:
+            summary_rows = pd.read_excel(xls, sheet_map["summary"], header=None).values.tolist()
+        if "fwd" in sheet_map:
+            fwd_df = pd.read_excel(xls, sheet_map["fwd"])
             fwd_rows = [fwd_df.columns.tolist()] + fwd_df.values.tolist()
-        if "REV" in xls.sheet_names:
-            rev_df = pd.read_excel(xls, "REV")
+        if "rev" in sheet_map:
+            rev_df = pd.read_excel(xls, sheet_map["rev"])
             rev_rows = [rev_df.columns.tolist()] + rev_df.values.tolist()
 
     # 2. Parse & Filter Summary Data Side-by-Side
@@ -169,44 +170,35 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     filtered_raw_records = []
     raw_headers = []
 
+    def _get_dc_idx(h_row):
+        lower = [str(h).strip().lower() for h in h_row if h is not None]
+        for candidate in ['source_dc', 'source dc', 'dc', 'sourcedc', 'hub']:
+            if candidate in lower:
+                return lower.index(candidate)
+        return 0
+
     # Process FWD Raw
     if fwd_rows:
         headers = [str(h).strip() if h is not None else "" for h in fwd_rows[0]]
         raw_headers = ["Flow_Type"] + headers
-        try:
-            dc_idx = headers.index("Source_DC")
-        except ValueError:
-            try:
-                dc_idx = headers.index("DC")
-            except ValueError:
-                dc_idx = -1
-
-        if dc_idx != -1:
-            for row in fwd_rows[1:]:
-                if len(row) > dc_idx and row[dc_idx] is not None:
-                    dc_val = str(row[dc_idx]).strip().upper()
-                    if dc_val in TARGET_DCS:
-                        filtered_raw_records.append(["FWD"] + list(row))
+        dc_idx = _get_dc_idx(headers)
+        for row in fwd_rows[1:]:
+            if len(row) > dc_idx and row[dc_idx] is not None:
+                dc_val = str(row[dc_idx]).strip().upper()
+                if dc_val in TARGET_DCS:
+                    filtered_raw_records.append(["FWD"] + list(row))
 
     # Process REV Raw
     if rev_rows:
         headers = [str(h).strip() if h is not None else "" for h in rev_rows[0]]
         if not raw_headers:
             raw_headers = ["Flow_Type"] + headers
-        try:
-            dc_idx = headers.index("Source_DC")
-        except ValueError:
-            try:
-                dc_idx = headers.index("DC")
-            except ValueError:
-                dc_idx = -1
-
-        if dc_idx != -1:
-            for row in rev_rows[1:]:
-                if len(row) > dc_idx and row[dc_idx] is not None:
-                    dc_val = str(row[dc_idx]).strip().upper()
-                    if dc_val in TARGET_DCS:
-                        filtered_raw_records.append(["REV"] + list(row))
+        dc_idx = _get_dc_idx(headers)
+        for row in rev_rows[1:]:
+            if len(row) > dc_idx and row[dc_idx] is not None:
+                dc_val = str(row[dc_idx]).strip().upper()
+                if dc_val in TARGET_DCS:
+                    filtered_raw_records.append(["REV"] + list(row))
 
     log.info(f"Summary Dotted DC Items: FWD={len(fwd_dict)}, REV={len(rev_dict)}")
     log.info(f"Total Filtered Raw Records: {len(filtered_raw_records)}")
