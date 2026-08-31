@@ -80,13 +80,20 @@ def stream_sheet_rows(
     if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
         try:
             wb = CalamineWorkbook.from_path(str(path))
-            target_sheet = sheet_name or wb.sheet_names[0]
+            target_sheet = sheet_name or (wb.sheet_names[0] if wb.sheet_names else "Sheet1")
+            
             if target_sheet not in wb.sheet_names:
-                # Case-insensitive search
+                # Case-insensitive and normalized search
+                target_clean = str(target_sheet).lower().replace(' ', '_').replace('-', '_')
+                found = False
                 for s in wb.sheet_names:
-                    if s.lower() == str(target_sheet).lower():
+                    s_clean = s.lower().replace(' ', '_').replace('-', '_')
+                    if s_clean == target_clean or target_clean in s_clean:
                         target_sheet = s
+                        found = True
                         break
+                if not found and wb.sheet_names:
+                    target_sheet = wb.sheet_names[0]
 
             sheet = wb.get_sheet_by_name(target_sheet)
             current_row = 1
@@ -120,10 +127,17 @@ def stream_sheet_rows(
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
         target_sheet = sheet_name or wb.sheetnames[0]
         if target_sheet not in wb.sheetnames:
+            target_clean = str(target_sheet).lower().replace(' ', '_').replace('-', '_')
+            found = False
             for s in wb.sheetnames:
-                if s.lower() == str(target_sheet).lower():
+                s_clean = s.lower().replace(' ', '_').replace('-', '_')
+                if s_clean == target_clean or target_clean in s_clean:
                     target_sheet = s
+                    found = True
                     break
+            if not found and wb.sheetnames:
+                target_sheet = wb.sheetnames[0]
+
         ws = wb[target_sheet]
         current_row = 1
         for row in ws.iter_rows(values_only=True):
@@ -153,22 +167,19 @@ def stream_sheet_dicts(
     headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(raw_headers)]
 
     for row in row_iter:
-        if not row or all(v is None or v == '' for v in row):
+        if not row or all(v is None or str(v).strip() == "" for v in row):
             continue
-        # Pad or slice row to match headers
-        padded = list(row) + [None] * (len(headers) - len(row))
-        yield {headers[i]: padded[i] for i in range(len(headers))}
+        row_dict = {}
+        for i, val in enumerate(row):
+            col_name = headers[i] if i < len(headers) else f"col_{i}"
+            row_dict[col_name] = val
+        yield row_dict
 
 
-def inspect_spreadsheet_headers(
-    file_path: Union[str, Path],
-    sheet_name: Optional[str] = None,
-    header_row: int = 1
-) -> List[str]:
-    """Read only the header row in <5ms without parsing the data body."""
-    row_iter = stream_sheet_rows(file_path, sheet_name=sheet_name, start_row=header_row)
-    try:
-        raw_headers = next(row_iter)
-        return [str(h).strip() for h in raw_headers if h is not None]
-    except StopIteration:
-        return []
+def inspect_spreadsheet_headers(file_path: Union[str, Path], sheet_name: Optional[str] = None) -> List[str]:
+    """Inspect first non-empty row of a sheet to detect column headers without loading the file."""
+    rows_iter = stream_sheet_rows(file_path, sheet_name=sheet_name, start_row=1)
+    for row in rows_iter:
+        if row and any(cell is not None and str(cell).strip() != "" for cell in row):
+            return [str(c).strip() if c is not None else "" for c in row]
+    return []

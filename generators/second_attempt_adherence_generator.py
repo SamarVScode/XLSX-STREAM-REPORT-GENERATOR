@@ -12,6 +12,7 @@ import math
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Union, Tuple
+from collections import defaultdict
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -66,7 +67,7 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
         raise FileNotFoundError(f"Input file not found: {path}")
 
     sheet_names = get_sheet_names(path)
-    sheet_map = {s.lower(): s for s in sheet_names}
+    sheet_map = {s.lower().replace(' ', '_'): s for s in sheet_names}
 
     summary_rows = []
     if "summary" in sheet_map:
@@ -106,37 +107,60 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                     "adherence_pct": pct
                 }
 
-    sorted_dcs = sorted(list(set(fwd_dict.keys()) | set(rev_dict.keys())))
-
     filtered_raw_records = []
     raw_headers = []
 
     # Stream FWD Raw
-    if "fwd" in sheet_map:
-        fwd_iter = stream_sheet_rows(path, sheet_name=sheet_map["fwd"])
+    fwd_sheet = None
+    for cand in ['fwd', 'forward', 'fwd_raw', 'raw']:
+        if cand in sheet_map:
+            fwd_sheet = sheet_map[cand]
+            break
+
+    if fwd_sheet:
+        fwd_iter = stream_sheet_rows(path, sheet_name=fwd_sheet)
         try:
             fwd_h = next(fwd_iter)
             fwd_headers = [str(h).strip() if h is not None else "" for h in fwd_h]
             raw_headers = ["Flow_Type"] + fwd_headers
             
             dc_idx = -1
-            for name in ["Source_DC", "source_dc", "DC", "dc"]:
-                if name in fwd_headers:
-                    dc_idx = fwd_headers.index(name)
-                    break
+            adh_idx = -1
+            for idx, name in enumerate(fwd_headers):
+                n_clean = name.lower().replace('_', ' ')
+                if n_clean in ("source dc", "dc", "sdc"):
+                    dc_idx = idx
+                elif "adherence" in n_clean or "status" in n_clean:
+                    adh_idx = idx
 
-            if dc_idx != -1:
-                for row in fwd_iter:
-                    if len(row) > dc_idx and row[dc_idx] is not None:
-                        dc_val = str(row[dc_idx]).strip().upper()
-                        if dc_val in TARGET_DCS:
-                            filtered_raw_records.append(["FWD"] + list(row))
+            for row in fwd_iter:
+                if dc_idx != -1 and len(row) > dc_idx and row[dc_idx] is not None:
+                    dc_val = str(row[dc_idx]).strip().upper()
+                    if dc_val in TARGET_DCS:
+                        filtered_raw_records.append(["FWD"] + list(row))
+                        if not fwd_dict or dc_val not in fwd_dict:
+                            if dc_val not in fwd_dict:
+                                fwd_dict[dc_val] = {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0}
+                            val_str = str(row[adh_idx] or '').strip().lower() if adh_idx != -1 and len(row) > adh_idx else ''
+                            if val_str in ('adherence', 'done', 'yes', '1'):
+                                fwd_dict[dc_val]["adherence"] += 1
+                            else:
+                                fwd_dict[dc_val]["non_adherence"] += 1
+                            tot = fwd_dict[dc_val]["adherence"] + fwd_dict[dc_val]["non_adherence"]
+                            fwd_dict[dc_val]["grand_total"] = tot
+                            fwd_dict[dc_val]["adherence_pct"] = fwd_dict[dc_val]["adherence"] / tot if tot > 0 else 0.0
         except StopIteration:
             pass
 
     # Stream REV Raw
-    if "rev" in sheet_map:
-        rev_iter = stream_sheet_rows(path, sheet_name=sheet_map["rev"])
+    rev_sheet = None
+    for cand in ['rev', 'reverse', 'rev_raw']:
+        if cand in sheet_map:
+            rev_sheet = sheet_map[cand]
+            break
+
+    if rev_sheet:
+        rev_iter = stream_sheet_rows(path, sheet_name=rev_sheet)
         try:
             rev_h = next(rev_iter)
             rev_headers = [str(h).strip() if h is not None else "" for h in rev_h]
@@ -144,19 +168,34 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                 raw_headers = ["Flow_Type"] + rev_headers
 
             dc_idx = -1
-            for name in ["Source_DC", "source_dc", "DC", "dc"]:
-                if name in rev_headers:
-                    dc_idx = rev_headers.index(name)
-                    break
+            adh_idx = -1
+            for idx, name in enumerate(rev_headers):
+                n_clean = name.lower().replace('_', ' ')
+                if n_clean in ("source dc", "dc", "sdc"):
+                    dc_idx = idx
+                elif "adherence" in n_clean or "status" in n_clean:
+                    adh_idx = idx
 
-            if dc_idx != -1:
-                for row in rev_iter:
-                    if len(row) > dc_idx and row[dc_idx] is not None:
-                        dc_val = str(row[dc_idx]).strip().upper()
-                        if dc_val in TARGET_DCS:
-                            filtered_raw_records.append(["REV"] + list(row))
+            for row in rev_iter:
+                if dc_idx != -1 and len(row) > dc_idx and row[dc_idx] is not None:
+                    dc_val = str(row[dc_idx]).strip().upper()
+                    if dc_val in TARGET_DCS:
+                        filtered_raw_records.append(["REV"] + list(row))
+                        if not rev_dict or dc_val not in rev_dict:
+                            if dc_val not in rev_dict:
+                                rev_dict[dc_val] = {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0}
+                            val_str = str(row[adh_idx] or '').strip().lower() if adh_idx != -1 and len(row) > adh_idx else ''
+                            if val_str in ('adherence', 'done', 'yes', '1'):
+                                rev_dict[dc_val]["adherence"] += 1
+                            else:
+                                rev_dict[dc_val]["non_adherence"] += 1
+                            tot = rev_dict[dc_val]["adherence"] + rev_dict[dc_val]["non_adherence"]
+                            rev_dict[dc_val]["grand_total"] = tot
+                            rev_dict[dc_val]["adherence_pct"] = rev_dict[dc_val]["adherence"] / tot if tot > 0 else 0.0
         except StopIteration:
             pass
+
+    sorted_dcs = sorted(list(set(fwd_dict.keys()) | set(rev_dict.keys()) | TARGET_DCS))
 
     out_wb = openpyxl.Workbook()
     
@@ -172,7 +211,6 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
 
     fill_fwd_top = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
     fill_rev_top = PatternFill(start_color="375623", end_color="375623", fill_type="solid")
-
     fill_fwd_sub = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     fill_rev_sub = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
 
@@ -198,89 +236,180 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     for c in range(7, 12):
         ws_sum.cell(row=1, column=c).fill = fill_rev_top
 
-    headers_block_short = ["DC", "Non-Adh", "2nd Adh", "Total", "Adh %"]
-    
-    for idx, h in enumerate(headers_block_short, 1):
+    fwd_sub_headers = ["Source_DC", "Non-Adherence", "Adherence", "Grand Total", "Adherence %"]
+    rev_sub_headers = ["Source_DC", "Non-Adherence", "Adherence", "Grand Total", "Adherence %"]
+
+    for idx, h in enumerate(fwd_sub_headers, start=1):
         cell = ws_sum.cell(row=2, column=idx, value=h)
         cell.font = font_fwd_sub
         cell.fill = fill_fwd_sub
-        cell.alignment = Alignment(horizontal="center" if idx > 1 else "left", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border_thin
 
-    for idx, h in enumerate(headers_block_short, 7):
+    for idx, h in enumerate(rev_sub_headers, start=7):
         cell = ws_sum.cell(row=2, column=idx, value=h)
         cell.font = font_rev_sub
         cell.fill = fill_rev_sub
-        cell.alignment = Alignment(horizontal="center" if idx > 1 else "left", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border_thin
 
-    current_row = 3
+    row_num = 3
+    tot_fwd_non = 0
+    tot_fwd_adh = 0
+    tot_rev_non = 0
+    tot_rev_adh = 0
+
     for dc in sorted_dcs:
-        fwd_item = fwd_dict.get(dc, {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0})
-        rev_item = rev_dict.get(dc, {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0})
+        f_data = fwd_dict.get(dc, {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0})
+        r_data = rev_dict.get(dc, {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0})
 
-        ws_sum.cell(row=current_row, column=1, value=dc).font = font_regular
-        ws_sum.cell(row=current_row, column=2, value=fwd_item["non_adherence"]).number_format = "#,##0"
-        ws_sum.cell(row=current_row, column=3, value=fwd_item["adherence"]).number_format = "#,##0"
-        ws_sum.cell(row=current_row, column=4, value=fwd_item["grand_total"]).number_format = "#,##0"
-        pct_fwd = ws_sum.cell(row=current_row, column=5, value=fwd_item["adherence_pct"])
-        pct_fwd.number_format = "0.0%"
-        fwd_fill, fwd_font = get_adherence_color_styles(fwd_item["adherence_pct"])
-        pct_fwd.fill = fwd_fill
-        pct_fwd.font = fwd_font
+        tot_fwd_non += f_data["non_adherence"]
+        tot_fwd_adh += f_data["adherence"]
+        tot_rev_non += r_data["non_adherence"]
+        tot_rev_adh += r_data["adherence"]
 
-        ws_sum.cell(row=current_row, column=7, value=dc).font = font_regular
-        ws_sum.cell(row=current_row, column=8, value=rev_item["non_adherence"]).number_format = "#,##0"
-        ws_sum.cell(row=current_row, column=9, value=rev_item["adherence"]).number_format = "#,##0"
-        ws_sum.cell(row=current_row, column=10, value=rev_item["grand_total"]).number_format = "#,##0"
-        pct_rev = ws_sum.cell(row=current_row, column=11, value=rev_item["adherence_pct"])
-        pct_rev.number_format = "0.0%"
-        rev_fill, rev_font = get_adherence_color_styles(rev_item["adherence_pct"])
-        pct_rev.fill = rev_fill
-        pct_rev.font = rev_font
+        # FWD Data
+        c1 = ws_sum.cell(row=row_num, column=1, value=dc)
+        c2 = ws_sum.cell(row=row_num, column=2, value=f_data["non_adherence"])
+        c3 = ws_sum.cell(row=row_num, column=3, value=f_data["adherence"])
+        c4 = ws_sum.cell(row=row_num, column=4, value=f_data["grand_total"])
+        c5 = ws_sum.cell(row=row_num, column=5, value=f_data["adherence_pct"])
 
-        for c in range(1, 6):
-            cell = ws_sum.cell(row=current_row, column=c)
-            cell.border = border_thin
-            if c > 1: cell.alignment = Alignment(horizontal="right")
+        c1.alignment = Alignment(horizontal="center", vertical="center")
+        c2.alignment = Alignment(horizontal="right", vertical="center")
+        c3.alignment = Alignment(horizontal="right", vertical="center")
+        c4.alignment = Alignment(horizontal="right", vertical="center")
+        c5.alignment = Alignment(horizontal="right", vertical="center")
 
-        for c in range(7, 12):
-            cell = ws_sum.cell(row=current_row, column=c)
-            cell.border = border_thin
-            if c > 1: cell.alignment = Alignment(horizontal="right")
+        c2.number_format = "#,##0"
+        c3.number_format = "#,##0"
+        c4.number_format = "#,##0"
+        c5.number_format = "0.0%"
 
-        current_row += 1
+        for c in [c1, c2, c3, c4]:
+            c.font = font_regular
+            c.border = border_thin
 
-    compact_widths = {
-        "A": 9,  "B": 10, "C": 10, "D": 9,  "E": 9,
-        "F": 3,
-        "G": 9,  "H": 10, "I": 10, "J": 9,  "K": 9
-    }
-    for col_letter, width in compact_widths.items():
-        ws_sum.column_dimensions[col_letter].width = width
+        f_fill, f_font = get_adherence_color_styles(f_data["adherence_pct"])
+        c5.fill = f_fill
+        c5.font = f_font
+        c5.border = border_thin
+
+        # REV Data
+        c7 = ws_sum.cell(row=row_num, column=7, value=dc)
+        c8 = ws_sum.cell(row=row_num, column=8, value=r_data["non_adherence"])
+        c9 = ws_sum.cell(row=row_num, column=9, value=r_data["adherence"])
+        c10 = ws_sum.cell(row=row_num, column=10, value=r_data["grand_total"])
+        c11 = ws_sum.cell(row=row_num, column=11, value=r_data["adherence_pct"])
+
+        c7.alignment = Alignment(horizontal="center", vertical="center")
+        c8.alignment = Alignment(horizontal="right", vertical="center")
+        c9.alignment = Alignment(horizontal="right", vertical="center")
+        c10.alignment = Alignment(horizontal="right", vertical="center")
+        c11.alignment = Alignment(horizontal="right", vertical="center")
+
+        c8.number_format = "#,##0"
+        c9.number_format = "#,##0"
+        c10.number_format = "#,##0"
+        c11.number_format = "0.0%"
+
+        for c in [c7, c8, c9, c10]:
+            c.font = font_regular
+            c.border = border_thin
+
+        r_fill, r_font = get_adherence_color_styles(r_data["adherence_pct"])
+        c11.fill = r_fill
+        c11.font = r_font
+        c11.border = border_thin
+
+        row_num += 1
+
+    # Total Row
+    tot_fwd_total = tot_fwd_non + tot_fwd_adh
+    tot_fwd_pct = tot_fwd_adh / tot_fwd_total if tot_fwd_total > 0 else 0.0
+
+    tot_rev_total = tot_rev_non + tot_rev_adh
+    tot_rev_pct = tot_rev_adh / tot_rev_total if tot_rev_total > 0 else 0.0
+
+    font_total = Font(name="Calibri", size=9, bold=True)
+
+    c1 = ws_sum.cell(row=row_num, column=1, value="Grand Total")
+    c2 = ws_sum.cell(row=row_num, column=2, value=tot_fwd_non)
+    c3 = ws_sum.cell(row=row_num, column=3, value=tot_fwd_adh)
+    c4 = ws_sum.cell(row=row_num, column=4, value=tot_fwd_total)
+    c5 = ws_sum.cell(row=row_num, column=5, value=tot_fwd_pct)
+
+    c7 = ws_sum.cell(row=row_num, column=7, value="Grand Total")
+    c8 = ws_sum.cell(row=row_num, column=8, value=tot_rev_non)
+    c9 = ws_sum.cell(row=row_num, column=9, value=tot_rev_adh)
+    c10 = ws_sum.cell(row=row_num, column=10, value=tot_rev_total)
+    c11 = ws_sum.cell(row=row_num, column=11, value=tot_rev_pct)
+
+    for cell in [c1, c2, c3, c4, c5, c7, c8, c9, c10, c11]:
+        cell.font = font_total
+        cell.border = border_thin
+
+    c1.alignment = Alignment(horizontal="center", vertical="center")
+    c2.alignment = Alignment(horizontal="right", vertical="center")
+    c3.alignment = Alignment(horizontal="right", vertical="center")
+    c4.alignment = Alignment(horizontal="right", vertical="center")
+    c5.alignment = Alignment(horizontal="right", vertical="center")
+
+    c7.alignment = Alignment(horizontal="center", vertical="center")
+    c8.alignment = Alignment(horizontal="right", vertical="center")
+    c9.alignment = Alignment(horizontal="right", vertical="center")
+    c10.alignment = Alignment(horizontal="right", vertical="center")
+    c11.alignment = Alignment(horizontal="right", vertical="center")
+
+    c2.number_format = "#,##0"
+    c3.number_format = "#,##0"
+    c4.number_format = "#,##0"
+    c5.number_format = "0.0%"
+
+    c8.number_format = "#,##0"
+    c9.number_format = "#,##0"
+    c10.number_format = "#,##0"
+    c11.number_format = "0.0%"
+
+    f_fill, f_font = get_adherence_color_styles(tot_fwd_pct)
+    c5.fill = f_fill
+    c5.font = f_font
+
+    r_fill, r_font = get_adherence_color_styles(tot_rev_pct)
+    c11.fill = r_fill
+    c11.font = r_font
+
+    # Set column widths
+    ws_sum.column_dimensions['F'].width = 3
+    for col in ws_sum.columns:
+        col_letter = get_column_letter(col[0].column)
+        if col_letter != 'F':
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            ws_sum.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
     # --- Tab 2: Raw ---
     ws_raw = out_wb.create_sheet(title="Raw")
     ws_raw.sheet_view.showGridLines = True
 
     if raw_headers:
-        ws_raw.append(raw_headers)
-        font_raw_header = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
-        fill_raw_header = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
-        for col_num in range(1, len(raw_headers) + 1):
-            cell = ws_raw.cell(row=1, column=col_num)
-            cell.font = font_raw_header
-            cell.fill = fill_raw_header
+        for c_idx, h in enumerate(raw_headers, start=1):
+            cell = ws_raw.cell(row=1, column=c_idx, value=h)
+            cell.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            col_letter = get_column_letter(col_num)
-            h_len = len(str(raw_headers[col_num - 1]))
-            ws_raw.column_dimensions[col_letter].width = min(max(h_len + 4, 12), 35)
+    for r_idx, row_vals in enumerate(filtered_raw_records, start=2):
+        for c_idx, val in enumerate(row_vals, start=1):
+            ws_raw.cell(row=r_idx, column=c_idx, value=val)
 
-    for record in filtered_raw_records:
-        ws_raw.append(record)
+    for col in ws_raw.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = 0
+        for cell in col:
+            val_str = str(cell.value or '')
+            max_len = max(max_len, len(val_str))
+        ws_raw.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 35)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     out_wb.save(output_path)
-    log.info(f"Successfully generated 2nd Attempt Adherence report: {output_path}")
+    log.info(f"Successfully generated Second Attempt Adherence report: {output_path.name}")
     return str(output_path)

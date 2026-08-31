@@ -67,8 +67,8 @@ def _safe_float(val, fallback=0.0):
     except (TypeError, ValueError):
         return fallback
 
-def parse_task_per_1k_stream(file_path: str):
-    rows_iter = stream_sheet_rows(file_path, sheet_name='Task_per_1k')
+def parse_task_per_1k_stream(file_path: str, task_sheet_name: str = 'Task_per_1k'):
+    rows_iter = stream_sheet_rows(file_path, sheet_name=task_sheet_name)
     try:
         row1 = next(rows_iter)
     except StopIteration:
@@ -164,8 +164,8 @@ def build_date_range(blocks):
         return _fmt_date(dates[0])
     return f"{_fmt_date(dates[0])} - {_fmt_date(dates[-1])}"
 
-def parse_raw_tab_stream(file_path: str):
-    rows_iter = stream_sheet_rows(file_path, sheet_name='Raw')
+def parse_raw_tab_stream(file_path: str, raw_sheet_name: str = 'Raw'):
+    rows_iter = stream_sheet_rows(file_path, sheet_name=raw_sheet_name)
     try:
         raw_headers = next(rows_iter)
     except StopIteration:
@@ -467,22 +467,34 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
     log.info(f"Stream generating EI report: {source_file_path} → {output_file_path}")
 
     sheet_names = get_sheet_names(source_file_path)
-    sheet_names_lower = [s.lower() for s in sheet_names]
+    sheet_names_lower = [s.lower().replace(' ', '_') for s in sheet_names]
 
-    if 'task_per_1k' not in sheet_names_lower:
-        raise ValueError("Sheet 'Task_per_1k' not found in source workbook")
+    task_sheet = None
+    for cand in ['task_per_1k', 'taskper1k', 'task_per1k']:
+        if cand in sheet_names_lower:
+            task_sheet = sheet_names[sheet_names_lower.index(cand)]
+            break
 
-    log.info("Phase 1: Streaming Task_per_1k tab")
-    blocks = parse_task_per_1k_stream(source_file_path)
+    if not task_sheet:
+        task_sheet = sheet_names[0] if sheet_names else 'Task_per_1k'
+
+    log.info(f"Phase 1: Streaming Task sheet '{task_sheet}'")
+    blocks = parse_task_per_1k_stream(source_file_path, task_sheet_name=task_sheet)
     daily_block = select_daily_block(blocks)
     wtd_block   = select_wtd_block(blocks)
     date_range  = build_date_range(blocks)
 
     log.info("Phase 2: Streaming Raw tab")
-    if 'raw' not in sheet_names_lower:
-        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = [], [], {}, None, None, None, None
+    raw_sheet = None
+    for cand in ['raw', 'raw_data', 'praw_data', 'raw_data_north', 'praw data']:
+        if cand in sheet_names_lower:
+            raw_sheet = sheet_names[sheet_names_lower.index(cand)]
+            break
+
+    if raw_sheet:
+        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_tab_stream(source_file_path, raw_sheet_name=raw_sheet)
     else:
-        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_tab_stream(source_file_path)
+        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = [], [], {}, None, None, None, None
 
     log.info("Phase 3: Building styled output workbook")
     wb_out = openpyxl.Workbook()

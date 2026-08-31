@@ -126,8 +126,8 @@ def build_summary_sheet(out_wb, filtered_data_rows, aging_cat_idx, sdc_idx, prio
     t3_pivot = defaultdict(lambda: defaultdict(int))
 
     for r in filtered_data_rows[1:]:
-        sdc = str(r[sdc_idx]).upper()
-        cat = str(r[aging_cat_idx])
+        sdc = str(r[sdc_idx]).upper() if sdc_idx is not None and len(r) > sdc_idx and r[sdc_idx] is not None else ""
+        cat = str(r[aging_cat_idx]) if len(r) > aging_cat_idx else "0-2 days"
         prio = str(r[prio_idx]) if prio_idx is not None and len(r) > prio_idx and r[prio_idx] is not None else "Unknown"
 
         t1_pivot[sdc][cat] += 1
@@ -250,9 +250,6 @@ def build_cpd_did_sheet(out_wb, filtered_data_rows, aging_cat_idx, sdc_idx, prio
         ws.column_dimensions[col_letter].width = max(max_len + 4, 16)
 
 def generate_forward_pendency_report(input_file: Path, output_file: Path):
-    """
-    Main stream generator pipeline for Forward Pendency Report.
-    """
     path = Path(input_file)
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
@@ -260,20 +257,16 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     log.info(f"Stream generating Forward Pendency Report: {input_file}")
     sheet_names = get_sheet_names(path)
 
-    # Sheet selection with fallback: 'raw_data_North' -> 'raw_data'
     target_sheet = None
-    if 'raw_data_North' in sheet_names:
-        target_sheet = 'raw_data_North'
-    elif 'raw_data' in sheet_names:
-        target_sheet = 'raw_data'
-    else:
-        sheet_map = {name.lower(): name for name in sheet_names}
-        if 'raw_data_north' in sheet_map:
-            target_sheet = sheet_map['raw_data_north']
-        elif 'raw_data' in sheet_map:
-            target_sheet = sheet_map['raw_data']
-        elif len(sheet_names) > 0:
-            target_sheet = sheet_names[0]
+    for cand in ['raw_data_north', 'raw_data', 'raw', 'praw data']:
+        for s in sheet_names:
+            if s.lower().replace(' ', '_') == cand:
+                target_sheet = s
+                break
+        if target_sheet:
+            break
+    if not target_sheet and sheet_names:
+        target_sheet = sheet_names[0]
 
     rows_iter = stream_sheet_rows(path, sheet_name=target_sheet)
     try:
@@ -282,12 +275,25 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
     header_list = [str(h).strip() if h is not None else '' for h in raw_header]
+    headers_lower = [h.lower().replace('_', ' ').replace('-', ' ') for h in header_list]
     
-    aging_col_idx = header_list.index('Aging') if 'Aging' in header_list else 20
-    sdc_idx = header_list.index('Source_DC') if 'Source_DC' in header_list else 15
-    prio_idx = header_list.index('CustomerPriorityV2') if 'CustomerPriorityV2' in header_list else 13
-    shipment_idx = header_list.index('PendingShipments') if 'PendingShipments' in header_list else 1
-    attempt_idx = header_list.index('Attempt_Status') if 'Attempt_Status' in header_list else 23
+    def find_col_idx(candidates, fallback=0):
+        for c in candidates:
+            c_clean = c.lower().replace('_', ' ').replace('-', ' ')
+            if c_clean in headers_lower:
+                return headers_lower.index(c_clean)
+        for idx, h in enumerate(headers_lower):
+            for c in candidates:
+                c_clean = c.lower().replace('_', ' ').replace('-', ' ')
+                if c_clean in h:
+                    return idx
+        return fallback
+
+    aging_col_idx = find_col_idx(['aging', 'ageing', 'aging bucket'], fallback=min(len(header_list)-1, 20))
+    sdc_idx = find_col_idx(['source dc', 'source_dc', 'dc', 'sdc'], fallback=min(len(header_list)-1, 15))
+    prio_idx = find_col_idx(['customerpriorityv2', 'customer priority', 'priority', 'prio'], fallback=min(len(header_list)-1, 13))
+    shipment_idx = find_col_idx(['pendingshipments', 'pending shipments', 'tracking_no', 'tracking no', 'shipment_id'], fallback=0)
+    attempt_idx = find_col_idx(['attempt_status', 'attempt status', 'status'], fallback=min(len(header_list)-1, 23))
 
     header_list.insert(aging_col_idx + 1, 'Aging Category')
     filtered_rows = [header_list]
