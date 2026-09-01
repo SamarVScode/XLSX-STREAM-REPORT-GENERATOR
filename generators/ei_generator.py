@@ -1,20 +1,11 @@
 import sys
 import os
 import logging
-from pathlib import Path
-from datetime import datetime, timedelta, date
-from collections import defaultdict
+from datetime import datetime, timedelta
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
-
-try:
-    from python_calamine import CalamineWorkbook
-    HAS_CALAMINE = True
-except ImportError:
-    HAS_CALAMINE = False
-
 try:
     from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
 except ImportError:
@@ -22,6 +13,7 @@ except ImportError:
 
 log = logging.getLogger("ei_stream_server.ei_generator")
 
+# Alias for backward compatibility within this module
 ALLOWED_SOURCE_DC = ALLOWED_SOURCE_DCS
 
 IDENTITY_COLS = 3
@@ -61,37 +53,11 @@ def _center():
     return Alignment(horizontal="center", vertical="center")
 
 def _fmt_date(dt):
-    if dt is None:
-        return ""
-    if hasattr(dt, 'year') and hasattr(dt, 'month') and hasattr(dt, 'day'):
-        months = ['Jan','Feb','Mar','Apr','May','Jun',
-                  'Jul','Aug','Sep','Oct','Nov','Dec']
-        return f"{dt.day}-{months[dt.month-1]}-{dt.year}"
-    if isinstance(dt, str):
-        clean = dt.strip().split('T')[0].split(' ')[0]
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y"):
-            try:
-                p = datetime.strptime(clean, fmt)
-                months = ['Jan','Feb','Mar','Apr','May','Jun',
-                          'Jul','Aug','Sep','Oct','Nov','Dec']
-                return f"{p.day}-{months[p.month-1]}-{p.year}"
-            except ValueError:
-                continue
-    return str(dt)
-
-def _get_date_obj(lbl):
-    if isinstance(lbl, datetime):
-        return lbl.date()
-    if hasattr(lbl, 'year') and hasattr(lbl, 'month') and hasattr(lbl, 'day'):
-        return lbl
-    if isinstance(lbl, str):
-        clean = lbl.strip().split('T')[0].split(' ')[0]
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y"):
-            try:
-                return datetime.strptime(clean, fmt).date()
-            except ValueError:
-                continue
-    return None
+    if not isinstance(dt, datetime):
+        return str(dt)
+    months = ['Jan','Feb','Mar','Apr','May','Jun',
+              'Jul','Aug','Sep','Oct','Nov','Dec']
+    return f"{dt.day}-{months[dt.month-1]}-{dt.year}"
 
 def _safe_float(val, fallback=0.0):
     try:
@@ -99,48 +65,45 @@ def _safe_float(val, fallback=0.0):
     except (TypeError, ValueError):
         return fallback
 
-def parse_task_per_1k(rows):
-    if not rows or len(rows) < 2:
-        raise ValueError("No data found in Task_per_1k sheet.")
-    row1 = rows[0]
+def parse_task_per_1k(ws):
+    max_col = ws.max_column
+    max_row = ws.max_row
+    row1 = [ws.cell(1, c).value for c in range(1, max_col + 1)]
 
     block_starts = []
     for i in range(IDENTITY_COLS, len(row1)):
         v = row1[i]
         if v is not None:
-            block_starts.append((i, v))
+            block_starts.append((i + 1, v))
 
     if not block_starts:
         raise ValueError("No date/WTD blocks found in Task_per_1k row 1.")
 
     raw_rows = []
-    for r in range(2, len(rows)):
-        row = rows[r]
-        if not row:
-            continue
-        dc = row[0]
+    for r in range(3, max_row + 1):
+        dc = ws.cell(r, 1).value
         if dc is None:
             continue
         dc = str(dc).strip()
         if not dc:
             continue
-        region = row[1] if len(row) > 1 else ""
-        city   = row[2] if len(row) > 2 else ""
-        raw_rows.append((row, dc, region, city))
+        region = ws.cell(r, 2).value
+        city   = ws.cell(r, 3).value
+        raw_rows.append((r, dc, region, city))
 
     blocks = []
     for col_start, label in block_starts:
         is_wtd = isinstance(label, str) and label.strip().upper() == 'WTD'
         block_rows = []
-        for (row, dc, region, city) in raw_rows:
+        for (r, dc, region, city) in raw_rows:
             if dc not in ALLOWED_SOURCE_DC:
                 continue
-            ofd      = _safe_float(row[col_start + IDX_OFD] if len(row) > col_start + IDX_OFD else 0)
-            fwd_task = _safe_float(row[col_start + IDX_FWD_TASK] if len(row) > col_start + IDX_FWD_TASK else 0)
-            fwd_1k   = _safe_float(row[col_start + IDX_FWD_1K] if len(row) > col_start + IDX_FWD_1K else 0)
-            ofp      = _safe_float(row[col_start + IDX_OFP] if len(row) > col_start + IDX_OFP else 0)
-            rev_task = _safe_float(row[col_start + IDX_REV_TASK] if len(row) > col_start + IDX_REV_TASK else 0)
-            rev_1k   = _safe_float(row[col_start + IDX_REV_1K] if len(row) > col_start + IDX_REV_1K else 0)
+            ofd      = _safe_float(ws.cell(r, col_start + IDX_OFD).value)
+            fwd_task = _safe_float(ws.cell(r, col_start + IDX_FWD_TASK).value)
+            fwd_1k   = _safe_float(ws.cell(r, col_start + IDX_FWD_1K).value)
+            ofp      = _safe_float(ws.cell(r, col_start + IDX_OFP).value)
+            rev_task = _safe_float(ws.cell(r, col_start + IDX_REV_TASK).value)
+            rev_1k   = _safe_float(ws.cell(r, col_start + IDX_REV_1K).value)
 
             if ofd == 0 and fwd_task == 0 and ofp == 0 and rev_task == 0:
                 continue
@@ -161,11 +124,11 @@ def select_daily_block(blocks):
     daily_blocks = [b for b in blocks if not b['is_wtd']]
 
     for b in daily_blocks:
-        d = _get_date_obj(b['label'])
-        if d == yesterday:
+        lbl = b['label']
+        if isinstance(lbl, datetime) and lbl.date() == yesterday:
             return b
 
-    dated = [(d, b) for b in daily_blocks if (d := _get_date_obj(b['label'])) is not None]
+    dated = [(b['label'].date(), b) for b in daily_blocks if isinstance(b['label'], datetime)]
     if dated:
         dated.sort(key=lambda x: x[0], reverse=True)
         return dated[0][1]
@@ -184,8 +147,7 @@ def select_wtd_block(blocks):
     raise ValueError("No WTD block found.")
 
 def build_date_range(blocks):
-    dates = [_get_date_obj(b['label']) for b in blocks if not b['is_wtd']]
-    dates = [d for d in dates if d is not None]
+    dates = [b['label'] for b in blocks if not b['is_wtd'] and isinstance(b['label'], datetime)]
     if not dates:
         return ''
     dates.sort()
@@ -197,7 +159,7 @@ def write_summary_sheet(wb, daily_block, wtd_block, date_range_str):
     ws = wb.create_sheet("SUMMARY")
     ws.sheet_view.showGridLines = False
 
-    daily_date_str = _fmt_date(daily_block['label']) if isinstance(daily_block['label'], (datetime, date)) else str(daily_block['label'])
+    daily_date_str = _fmt_date(daily_block['label']) if isinstance(daily_block['label'], datetime) else str(daily_block['label'])
 
     FWD_HEADERS = ['Date', 'Source_DC', 'OFD', 'Forward_Task', 'Fwd_Task_per_1k']
     REV_HEADERS = ['Date', 'Source_DC', 'OFP', 'Reverse_Task', 'Rev_Task_per_1k']
@@ -291,52 +253,49 @@ def write_summary_sheet(wb, daily_block, wtd_block, date_range_str):
                 ws.cell(r, c).border = bd
 
     if max_daily > 0:
-        _apply_borders(3, max_daily, 1, 5)
-        _apply_borders(3, max_daily, 7, 5)
+        _apply_borders(1, 2 + max_daily, 1, 5)
+        _apply_borders(1, 2 + max_daily, 7, 5)
     if max_weekly > 0:
-        _apply_borders(3, max_weekly, 13, 5)
-        _apply_borders(3, max_weekly, 19, 5)
+        _apply_borders(1, 2 + max_weekly, 13, 5)
+        _apply_borders(1, 2 + max_weekly, 19, 5)
 
-    rule_fwd_g = CellIsRule(operator='lessThan', formula=['2.5'], fill=_fill(CF_GREEN_BG), font=_font(CF_GREEN_FONT, bold=True))
-    rule_fwd_y = CellIsRule(operator='between',  formula=['2.5', '6.0'], fill=_fill(CF_YELLOW_BG), font=_font(CF_YELLOW_FONT, bold=True))
-    rule_fwd_r = CellIsRule(operator='greaterThan', formula=['6.0'], fill=_fill(CF_RED_BG), font=_font(CF_RED_FONT, bold=True))
-
-    rule_rev_g = CellIsRule(operator='lessThan', formula=['6.1'], fill=_fill(CF_GREEN_BG), font=_font(CF_GREEN_FONT, bold=True))
-    rule_rev_y = CellIsRule(operator='between',  formula=['6.1', '10.0'], fill=_fill(CF_YELLOW_BG), font=_font(CF_YELLOW_FONT, bold=True))
-    rule_rev_r = CellIsRule(operator='greaterThan', formula=['10.0'], fill=_fill(CF_RED_BG), font=_font(CF_RED_FONT, bold=True))
+    def _add_cf(col_letter, r_start, r_end, lo, hi):
+        rng = f"{col_letter}{r_start}:{col_letter}{r_end}"
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator='lessThan', formula=[str(lo)],
+            fill=_fill(CF_GREEN_BG), font=_font(CF_GREEN_FONT)))
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator='between', formula=[str(lo), str(hi)],
+            fill=_fill(CF_YELLOW_BG), font=_font(CF_YELLOW_FONT)))
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator='greaterThan', formula=[str(hi)],
+            fill=_fill(CF_RED_BG), font=_font(CF_RED_FONT)))
 
     if max_daily > 0:
-        daily_end_row = 2 + max_daily
-        ws.conditional_formatting.add(f"E3:E{daily_end_row}", rule_fwd_g)
-        ws.conditional_formatting.add(f"E3:E{daily_end_row}", rule_fwd_y)
-        ws.conditional_formatting.add(f"E3:E{daily_end_row}", rule_fwd_r)
-        ws.conditional_formatting.add(f"K3:K{daily_end_row}", rule_rev_g)
-        ws.conditional_formatting.add(f"K3:K{daily_end_row}", rule_rev_y)
-        ws.conditional_formatting.add(f"K3:K{daily_end_row}", rule_rev_r)
-
+        _add_cf('E', 3, 2 + max_daily, 2.5, 6.0)
+        _add_cf('K', 3, 2 + max_daily, 6.1, 10.0)
     if max_weekly > 0:
-        weekly_end_row = 2 + max_weekly
-        ws.conditional_formatting.add(f"Q3:Q{weekly_end_row}", rule_fwd_g)
-        ws.conditional_formatting.add(f"Q3:Q{weekly_end_row}", rule_fwd_y)
-        ws.conditional_formatting.add(f"Q3:Q{weekly_end_row}", rule_fwd_r)
-        ws.conditional_formatting.add(f"W3:W{weekly_end_row}", rule_rev_g)
-        ws.conditional_formatting.add(f"W3:W{weekly_end_row}", rule_rev_y)
-        ws.conditional_formatting.add(f"W3:W{weekly_end_row}", rule_rev_r)
+        _add_cf('Q', 3, 2 + max_weekly, 2.5, 6.0)
+        _add_cf('W', 3, 2 + max_weekly, 6.1, 10.0)
 
     col_widths = {
-        1:14, 2:12, 3:10, 4:14, 5:16, 6:3,
-        7:14, 8:12, 9:10, 10:14, 11:16, 12:3,
-        13:16, 14:12, 15:10, 16:14, 17:16, 18:3,
-        19:16, 20:12, 21:10, 22:14, 23:16
+        1:16, 2:8, 3:10, 4:14, 5:16, 6:3,
+        7:16, 8:8, 9:10, 10:14, 11:16, 12:3,
+        13:16, 14:8, 15:10, 16:14, 17:16, 18:3,
+        19:16, 20:8, 21:10, 22:14, 23:16
     }
-    for col_idx, width in col_widths.items():
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    for col, width in col_widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
 
-def parse_raw_rows(rows):
-    if not rows:
-        return [], [], {}, None, None, None, None
-    headers = list(rows[0])
-    col_map = {str(h).strip().lower(): i for i, h in enumerate(headers) if h is not None}
+def parse_raw_tab(ws):
+    max_col = ws.max_column
+    max_row = ws.max_row
+    headers = [ws.cell(1, c).value for c in range(1, max_col + 1)]
+
+    col_map = {}
+    for i, h in enumerate(headers):
+        if h is not None:
+            col_map[str(h).strip().lower()] = i
 
     dc_idx = None
     for candidate in ['source_dc', 'source dc', 'dc']:
@@ -345,68 +304,78 @@ def parse_raw_rows(rows):
             break
 
     track_idx = None
-    for candidate in ['final_tracking_no', 'tracking_id', 'tracking id', 'tracking_no', 'tracking no', 'waybill', 'awb', 'task_id']:
+    for candidate in ['final_tracking_no', 'tracking_id', 'tracking id', 'waybill']:
         if candidate in col_map:
             track_idx = col_map[candidate]
             break
 
-    fwd_agt_idx = col_map.get('fwd_agent name') or col_map.get('fwd agent') or col_map.get('fwd_agent') or col_map.get('agent_name') or col_map.get('agent') or col_map.get('delivery_agent')
-    rev_agt_idx = col_map.get('rev_agent name') or col_map.get('rev agent') or col_map.get('rev_agent') or col_map.get('pickup_agent') or fwd_agt_idx
+    fwd_agt_idx = col_map.get('fwd_agent name') or col_map.get('fwd agent') or col_map.get('fwd_agent')
+    rev_agt_idx = col_map.get('rev_agent name') or col_map.get('rev agent') or col_map.get('rev_agent')
 
     if dc_idx is None:
         raise ValueError('Column Source_DC not found in Raw tab.')
     if track_idx is None:
         raise ValueError('Column Final_tracking_no / Tracking_ID not found in Raw tab.')
 
-    filt_data_rows = []
-    for row in rows[1:]:
+    all_data_rows   = []
+    filt_data_rows  = []
+
+    for row_tuple in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col, values_only=True):
+        row = list(row_tuple)
         if not any(v for v in row):
             continue
+        all_data_rows.append(row)
         dc = str(row[dc_idx] or '').strip()
         if dc in ALLOWED_SOURCE_DC:
-            filt_data_rows.append(list(row))
+            filt_data_rows.append(row)
 
     return headers, filt_data_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx
 
-def write_filtered_dc_tab(wb, headers, filt_data_rows):
-    ws = wb.create_sheet('Filtered_Source_DC')
-    ws.append(headers)
-    for r in filt_data_rows:
-        ws.append(r)
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(1, col_idx)
-        cell.fill = _fill(C_FWD_HDR)
-        cell.font = _font(C_HDR_FONT, bold=True)
-        cell.alignment = _center()
-        ws.column_dimensions[get_column_letter(col_idx)].width = 16
+def write_filtered_dc_tab(wb, headers, filt_rows):
+    ws = wb.create_sheet("Filtered_Source_DC")
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font       = Font(bold=True)
+        cell.fill       = PatternFill("solid", fgColor="F1F5F9")
+        cell.alignment  = _center()
+    for row in filt_rows:
+        ws.append(row)
+    for c in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 18
 
-def write_fwd_ei_tab(wb, headers, filt_data_rows, track_idx):
-    ws = wb.create_sheet('FWD EI')
-    ws.append(headers)
-    for r in filt_data_rows:
-        tn = str(r[track_idx] or '')
-        if tn.startswith(('MYSC', 'MYSD')):
-            ws.append(r)
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(1, col_idx)
-        cell.fill = _fill(C_FWD_HDR)
-        cell.font = _font(C_HDR_FONT, bold=True)
+def write_fwd_ei_tab(wb, headers, filt_rows, track_idx):
+    ws = wb.create_sheet("FWD EI")
+    fwd_rows = []
+    for row in filt_rows:
+        tno = str(row[track_idx] or '').strip().upper()
+        if tno.startswith('MYSC') or tno.startswith('MYSP'):
+            fwd_rows.append(row)
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font      = Font(bold=True)
+        cell.fill      = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment = _center()
-        ws.column_dimensions[get_column_letter(col_idx)].width = 16
+    for row in fwd_rows:
+        ws.append(row)
+    for c in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 18
 
-def write_rev_ei_tab(wb, headers, filt_data_rows, track_idx):
-    ws = wb.create_sheet('REVERSE EI')
-    ws.append(headers)
-    for r in filt_data_rows:
-        tn = str(r[track_idx] or '')
-        if tn.startswith(('MYSR', 'MYSP')):
-            ws.append(r)
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(1, col_idx)
-        cell.fill = _fill(C_REV_HDR)
-        cell.font = _font(C_HDR_FONT, bold=True)
+def write_rev_ei_tab(wb, headers, filt_rows, track_idx):
+    ws = wb.create_sheet("REVERSE EI")
+    rev_rows = []
+    for row in filt_rows:
+        tno = str(row[track_idx] or '').strip().upper()
+        if tno.startswith('MYSR'):
+            rev_rows.append(row)
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font      = Font(bold=True)
+        cell.fill      = PatternFill("solid", fgColor="F1F5F9")
         cell.alignment = _center()
-        ws.column_dimensions[get_column_letter(col_idx)].width = 16
+    for row in rev_rows:
+        ws.append(row)
+    for c in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 18
 
 C_WARN_TITLE = "991B1B"
 C_WARN_HDR   = "B91C1C"
@@ -421,10 +390,10 @@ def write_agent_summary_tab(wb, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, 
         if not dc:
             continue
         tno = str(row[track_idx] or '').strip().upper()
-        if tno.startswith(('MYSC', 'MYSD', 'MYSP')):
-            agent = str(row[fwd_agt_idx] or '').strip() if fwd_agt_idx is not None and len(row) > fwd_agt_idx else ''
+        if tno.startswith('MYSC') or tno.startswith('MYSP'):
+            agent = str(row[fwd_agt_idx] or '').strip() if fwd_agt_idx is not None else ''
         elif tno.startswith('MYSR'):
-            agent = str(row[rev_agt_idx] or '').strip() if rev_agt_idx is not None and len(row) > rev_agt_idx else ''
+            agent = str(row[rev_agt_idx] or '').strip() if rev_agt_idx is not None else ''
         else:
             agent = ''
         if not agent:
@@ -433,9 +402,9 @@ def write_agent_summary_tab(wb, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, 
         counts[dc][agent] = counts[dc].get(agent, 0) + 1
 
     dc_order = ALLOWED_SOURCE_DC
-    agent_rows      = []
+    agent_rows     = []
     counselled_rows = []
-    warned_rows     = []
+    warned_rows    = []
 
     for dc in dc_order:
         if dc not in counts:
@@ -458,127 +427,63 @@ def write_agent_summary_tab(wb, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, 
     output.append(['Agent Summary', '', '', '', 'Agent to be counselled', '', '', '', 'Agents to be Warned', '', ''])
     output.append(['Source_DC', 'Agent Name', 'Count', '', 'Source_DC', 'Agent Name', 'Count', '', 'Source_DC', 'Agent Name', 'Count'])
     for i in range(max_rows):
-        r1 = agent_rows[i]      if i < len(agent_rows)      else ['', '', '']
+        r1 = agent_rows[i]     if i < len(agent_rows)     else ['', '', '']
         r2 = counselled_rows[i] if i < len(counselled_rows) else ['', '', '']
-        r3 = warned_rows[i]     if i < len(warned_rows)     else ['', '', '']
+        r3 = warned_rows[i]    if i < len(warned_rows)    else ['', '', '']
         output.append(r1 + [''] + r2 + [''] + r3)
 
     for r_idx, row in enumerate(output, start=1):
         for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
+            ws.cell(row=r_idx, column=c_idx, value=val).alignment = _center()
 
-    left_align = Alignment(horizontal="left", vertical="center")
-    center_align = Alignment(horizontal="center", vertical="center")
-
-    for r in range(3, len(output) + 1):
-        for c in [1, 3, 5, 7, 9, 11]:
-            ws.cell(r, c).alignment = center_align
-            if c in [3, 7, 11] and ws.cell(r, c).value != '':
-                ws.cell(r, c).number_format = '#,##0'
-        for c in [2, 6, 10]:
-            ws.cell(r, c).alignment = left_align
-
-    def _title(row, c1, c2, bg):
-        ws.merge_cells(start_row=row, start_column=c1, end_row=row, end_column=c2)
-        cell = ws.cell(row, c1)
-        cell.fill = _fill(bg)
-        cell.font = _font(C_HDR_FONT, bold=True, size=11)
-        cell.alignment = center_align
-
-    def _subhdr(row, c1, c2, bg):
-        for c in range(c1, c2 + 1):
-            cell = ws.cell(row, c)
+    if len(output) > 1:
+        def _title(row, c1, c2, bg):
+            ws.merge_cells(start_row=row, start_column=c1, end_row=row, end_column=c2)
+            cell = ws.cell(row, c1)
             cell.fill = _fill(bg)
-            cell.font = _font(C_HDR_FONT, bold=True)
-            cell.alignment = center_align
+            cell.font = _font(C_HDR_FONT, bold=True, size=11)
+            cell.alignment = _center()
 
-    _title(1, 1, 3, C_FWD_TITLE)
-    _title(1, 5, 7, C_REV_TITLE)
-    _title(1, 9, 11, C_WARN_TITLE)
-    _subhdr(2, 1, 3, C_FWD_HDR)
-    _subhdr(2, 5, 7, C_REV_HDR)
-    _subhdr(2, 9, 11, C_WARN_HDR)
+        def _subhdr(row, c1, c2, bg):
+            for c in range(c1, c2 + 1):
+                cell = ws.cell(row, c)
+                cell.fill = _fill(bg)
+                cell.font = _font(C_HDR_FONT, bold=True)
+                cell.alignment = _center()
 
-    bd = _border(C_BORDER)
-    for r in range(1, len(agent_rows) + 3):
-        for c in [1, 2, 3]:
-            ws.cell(r, c).border = bd
+        _title(1, 1, 3, C_FWD_TITLE)
+        _title(1, 5, 7, C_REV_TITLE)
+        _title(1, 9, 11, C_WARN_TITLE)
+        _subhdr(2, 1, 3, C_FWD_HDR)
+        _subhdr(2, 5, 7, C_REV_HDR)
+        _subhdr(2, 9, 11, C_WARN_HDR)
 
-    for r in range(1, len(counselled_rows) + 3):
-        for c in [5, 6, 7]:
-            ws.cell(r, c).border = bd
+        bd = _border(C_BORDER)
+        def _bdr(rs, nr, cs, nc):
+            for r in range(rs, rs + nr):
+                for c in range(cs, cs + nc):
+                    ws.cell(r, c).border = bd
 
-    for r in range(1, len(warned_rows) + 3):
-        for c in [9, 10, 11]:
-            ws.cell(r, c).border = bd
+        data_rows = len(output)
+        _bdr(1, data_rows, 1, 3)
+        _bdr(1, data_rows, 5, 3)
+        _bdr(1, data_rows, 9, 3)
 
-    for c, w in [(1,12),(2,30),(3,10),(4,4),(5,12),(6,30),(7,10),(8,4),(9,12),(10,30),(11,10)]:
+    for c, w in [(1,10),(2,28),(3,8),(4,3),(5,10),(6,28),(7,8),(8,3),(9,10),(10,28),(11,8)]:
         ws.column_dimensions[get_column_letter(c)].width = w
 
 def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
-    path = Path(source_file_path)
-    log.info(f"Generating EI report: {path} → {output_file_path}")
+    log.info(f"Generating EI report: {source_file_path} → {output_file_path}")
 
-    log.info("Phase 1: Loading source workbook (Rust zero-copy streaming)")
-    task_rows = []
-    raw_rows = []
+    log.info("Phase 1: Loading source workbook")
+    wb_src = openpyxl.load_workbook(source_file_path, data_only=True)
 
-    if HAS_CALAMINE:
-        try:
-            cal = CalamineWorkbook.from_path(str(path))
-            sheet_map = {s.lower(): s for s in cal.sheet_names}
-            
-            task_sheet = sheet_map.get('task_per_1k', cal.sheet_names[0])
-            task_rows = cal.get_sheet_by_name(task_sheet).to_python()
-            
-            if 'raw' in sheet_map:
-                raw_sheet = cal.get_sheet_by_name(sheet_map['raw'])
-                raw_iter = iter(raw_sheet.iter_rows())
-                h_row = next(raw_iter, None)
-                if h_row:
-                    raw_rows = [list(h_row)]
-                    dc_cand_idx = None
-                    for idx, h in enumerate(h_row):
-                        if str(h or '').strip().lower() in ('source_dc', 'source dc', 'dc'):
-                            dc_cand_idx = idx
-                            break
-                    for r in raw_iter:
-                        if dc_cand_idx is not None and len(r) > dc_cand_idx:
-                            dc_val = str(r[dc_cand_idx] or '').strip()
-                            if dc_val in ALLOWED_SOURCE_DC:
-                                raw_rows.append(list(r))
-                        else:
-                            raw_rows.append(list(r))
-        except Exception as ex:
-            log.warning(f"Calamine read warning: {ex}. Falling back to openpyxl read_only=True")
-            task_rows = []
-
-    if not task_rows:
-        wb_src = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
-        task_ws = wb_src['Task_per_1k'] if 'Task_per_1k' in wb_src.sheetnames else wb_src.active
-        task_rows = [list(r) for r in task_ws.iter_rows(values_only=True)]
-        if 'Raw' in wb_src.sheetnames:
-            raw_iter = wb_src['Raw'].iter_rows(values_only=True)
-            h_row = next(raw_iter, None)
-            if h_row:
-                raw_rows = [list(h_row)]
-                dc_cand_idx = None
-                for idx, h in enumerate(h_row):
-                    if str(h or '').strip().lower() in ('source_dc', 'source dc', 'dc'):
-                        dc_cand_idx = idx
-                        break
-                for r in raw_iter:
-                    if dc_cand_idx is not None and len(r) > dc_cand_idx:
-                        dc_val = str(r[dc_cand_idx] or '').strip()
-                        if dc_val in ALLOWED_SOURCE_DC:
-                            raw_rows.append(list(r))
-                    else:
-                        raw_rows.append(list(r))
-        wb_src.close()
+    if 'Task_per_1k' not in wb_src.sheetnames:
+        raise ValueError("Sheet 'Task_per_1k' not found in source workbook")
 
     log.info("Phase 2: Parsing Task_per_1k sheet")
-    blocks = parse_task_per_1k(task_rows)
-    log.info(f"  Found {len(blocks)} blocks")
+    blocks = parse_task_per_1k(wb_src['Task_per_1k'])
+    log.info(f"  Found {len(blocks)} blocks ({sum(1 for b in blocks if not b['is_wtd'])} daily, {sum(1 for b in blocks if b['is_wtd'])} WTD)")
 
     daily_block = select_daily_block(blocks)
     wtd_block   = select_wtd_block(blocks)
@@ -586,12 +491,13 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
     log.info(f"  Daily block: {daily_block['label']}, WTD block: {wtd_block['label']}, range: {date_range}")
 
     log.info("Phase 3: Parsing Raw sheet")
-    if not raw_rows:
+    if 'Raw' not in wb_src.sheetnames:
         headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = [], [], {}, None, None, None, None
         log.warning("  Raw sheet not found — skipping FWD/REV tabs")
     else:
-        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_rows(raw_rows)
-        log.info(f"  Total filtered rows: {len(filt_rows)}")
+        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_tab(wb_src['Raw'])
+        log.info(f"  Total rows: {len(filt_rows)}, filtered by allowed DCs")
+    wb_src.close()
 
     log.info("Phase 4: Writing output workbook")
     wb_out = openpyxl.Workbook()
@@ -605,15 +511,9 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
         write_fwd_ei_tab(wb_out, headers, filt_rows, track_idx)
         write_rev_ei_tab(wb_out, headers, filt_rows, track_idx)
         write_agent_summary_tab(wb_out, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx)
+        log.info("  FWD EI, REVERSE EI, Filtered, Agent Summary tabs written")
 
     log.info("Phase 5: Saving output file")
     wb_out.save(output_file_path)
-    try:
-        wb_out.close()
-    except Exception:
-        pass
-    del wb_out, raw_rows, filt_rows
-    import gc
-    gc.collect()
     log.info(f"Report saved: {output_file_path}")
-    return str(output_file_path)
+    return output_file_path
