@@ -446,8 +446,13 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
 
         f.write(b"</sheetData></worksheet>")
 
-    with open(temp_raw_xml, "rb") as f_raw:
-        z_out.writestr("xl/worksheets/sheet2.xml", f_raw.read())
+    with z_out.open("xl/worksheets/sheet2.xml", "w", force_zip64=True) as zf_entry:
+        with open(temp_raw_xml, "rb") as f_raw:
+            while True:
+                buf = f_raw.read(1024 * 1024)
+                if not buf:
+                    break
+                zf_entry.write(buf)
 
     z_out.close()
     z_in.close()

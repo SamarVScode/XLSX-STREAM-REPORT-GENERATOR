@@ -243,7 +243,6 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
             break
 
     attempt_idx = col_map.get('attempt_status', col_map.get('status', col_map.get('attempt', 0)))
-    age_bucket_idx = col_map.get('age_bucket') or col_map.get('aging bucket') or col_map.get('age bucket')
 
     def esc(val):
         if val is None:
@@ -251,76 +250,107 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
         s = str(val)
         return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
 
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_raw_xml = Path(tempfile.gettempdir()) / f"temp_raw_{out_path.stem}.xml"
+    temp_p0_xml  = Path(tempfile.gettempdir()) / f"temp_p0_{out_path.stem}.xml"
+
     pivot = defaultdict(lambda: defaultdict(int))
-    p0_rows = []
     total_filtered = 0
+    p0_count = 0
 
-    raw_headers = list(header)
-    if age_bucket_idx is None:
-        raw_headers.append('Age_Bucket')
-        age_bucket_idx = len(header)
+    raw_headers = list(header) + ['Age_Bucket']
+    p0_headers = ['tracking_number', 'Source DC', 'Aging', 'Age_Bucket', 'Attempt_Status']
 
-    # Write Raw sheet XML directly to disk in 1000-row chunks
-    temp_raw_xml = Path(tempfile.gettempdir()) / f"temp_raw_{output_file.stem}.xml"
-    with open(temp_raw_xml, 'wb') as f_xml:
-        f_xml.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
-        
-        # Header
-        hdr_xml = ['<row r="1">']
-        for c_i, h_val in enumerate(raw_headers, 1):
-            col_let = get_column_letter(c_i)
-            hdr_xml.append(f'<c r="{col_let}1" t="inlineStr"><is><t>{esc(h_val)}</t></is></c>')
-        hdr_xml.append('</row>')
-        f_xml.write(''.join(hdr_xml).encode('utf-8'))
-        
-        row_num = 2
-        chunk = []
-        
-        for row in row_iter:
-            region = str(row[region_idx]).strip() if (region_idx is not None and len(row) > region_idx and row[region_idx]) else 'North'
-            src_dc = str(row[src_dc_idx]).strip().upper() if (len(row) > src_dc_idx and row[src_dc_idx]) else ''
-            if (region == 'North' or region_idx is None) and src_dc in ALLOWED_DCS_SET:
-                total_filtered += 1
-                aging_val = row[aging_idx] if len(row) > aging_idx else 0
-                bucket = compute_age_bucket(aging_val)
-                pivot[src_dc][bucket] += 1
-                
-                try:
-                    aging_f = float(aging_val) if aging_val else 0.0
-                except (ValueError, TypeError):
-                    aging_f = 0.0
-                if aging_f >= 2.0:
-                    p0_rows.append((row[tn_idx], src_dc, aging_val, bucket, str(row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] else '')))
-                
-                r_xml = [f'<row r="{row_num}">']
-                for c_i, val in enumerate(row, 1):
+    f_raw = open(temp_raw_xml, 'wb')
+    f_p0  = open(temp_p0_xml, 'wb')
+
+    f_raw.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+    f_p0.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+
+    # Raw Header
+    hdr_xml = ['<row r="1">']
+    for c_i, h_val in enumerate(raw_headers, 1):
+        hdr_xml.append(f'<c r="{get_column_letter(c_i)}1" t="inlineStr"><is><t>{esc(h_val)}</t></is></c>')
+    hdr_xml.append('</row>')
+    f_raw.write(''.join(hdr_xml).encode('utf-8'))
+
+    # P0 Title & Header
+    p0_title_xml = ['<row r="1">']
+    for c_i in range(1, len(p0_headers) + 1):
+        val = 'P0 reverse pendency (Aging \u2265 2)' if c_i == 1 else ''
+        p0_title_xml.append(f'<c r="{get_column_letter(c_i)}1" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
+    p0_title_xml.append('</row><row r="2">')
+    for c_i, h_val in enumerate(p0_headers, 1):
+        p0_title_xml.append(f'<c r="{get_column_letter(c_i)}2" t="inlineStr"><is><t>{esc(h_val)}</t></is></c>')
+    p0_title_xml.append('</row>')
+    f_p0.write(''.join(p0_title_xml).encode('utf-8'))
+
+    raw_row_num = 2
+    p0_row_num = 3
+    raw_chunk = []
+    p0_chunk = []
+
+    for row in row_iter:
+        region = str(row[region_idx]).strip() if (region_idx is not None and len(row) > region_idx and row[region_idx]) else 'North'
+        src_dc = str(row[src_dc_idx]).strip().upper() if (len(row) > src_dc_idx and row[src_dc_idx]) else ''
+        if (region == 'North' or region_idx is None) and src_dc in ALLOWED_DCS_SET:
+            total_filtered += 1
+            aging_val = row[aging_idx] if len(row) > aging_idx else 0
+            bucket = compute_age_bucket(aging_val)
+            pivot[src_dc][bucket] += 1
+            
+            try:
+                aging_f = float(aging_val) if aging_val else 0.0
+            except (ValueError, TypeError):
+                aging_f = 0.0
+            
+            # Write to Raw chunk
+            r_xml = [f'<row r="{raw_row_num}">']
+            for c_i, val in enumerate(row, 1):
+                col_let = get_column_letter(c_i)
+                if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
+                    r_xml.append(f'<c r="{col_let}{raw_row_num}"><v>{val}</v></c>')
+                else:
+                    r_xml.append(f'<c r="{col_let}{raw_row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
+            r_xml.append(f'<c r="{get_column_letter(len(row)+1)}{raw_row_num}" t="inlineStr"><is><t>{bucket}</t></is></c></row>')
+            raw_chunk.append(''.join(r_xml))
+            raw_row_num += 1
+            
+            # Write to P0 chunk if aging >= 2
+            if aging_f >= 2.0:
+                p0_count += 1
+                p_vals = [row[tn_idx], src_dc, aging_val, bucket, str(row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] else '')]
+                p_xml = [f'<row r="{p0_row_num}">']
+                for c_i, val in enumerate(p_vals, 1):
                     col_let = get_column_letter(c_i)
                     if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
-                        r_xml.append(f'<c r="{col_let}{row_num}"><v>{val}</v></c>')
+                        p_xml.append(f'<c r="{col_let}{p0_row_num}"><v>{val}</v></c>')
                     else:
-                        r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
-                
-                # Age_Bucket column
-                col_let = get_column_letter(len(row) + 1)
-                r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{bucket}</t></is></c>')
-                r_xml.append('</row>')
-                chunk.append(''.join(r_xml))
-                row_num += 1
-                
-                if len(chunk) >= 1000:
-                    f_xml.write(''.join(chunk).encode('utf-8'))
-                    chunk.clear()
+                        p_xml.append(f'<c r="{col_let}{p0_row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
+                p_xml.append('</row>')
+                p0_chunk.append(''.join(p_xml))
+                p0_row_num += 1
 
-        if chunk:
-            f_xml.write(''.join(chunk).encode('utf-8'))
-            chunk.clear()
-            
-        f_xml.write(b'</sheetData></worksheet>')
+            if len(raw_chunk) >= 1000:
+                f_raw.write(''.join(raw_chunk).encode('utf-8'))
+                raw_chunk.clear()
+            if len(p0_chunk) >= 1000:
+                f_p0.write(''.join(p0_chunk).encode('utf-8'))
+                p0_chunk.clear()
 
-    # Build Summary and Critical P0 in small in-memory Workbook (~100 KB RAM)
+    if raw_chunk:
+        f_raw.write(''.join(raw_chunk).encode('utf-8'))
+    if p0_chunk:
+        f_p0.write(''.join(p0_chunk).encode('utf-8'))
+
+    f_raw.write(b'</sheetData></worksheet>')
+    f_p0.write(b'</sheetData></worksheet>')
+    f_raw.close()
+    f_p0.close()
+
+    # Build Summary sheet in tiny openpyxl workbook (~70 rows, ~50 KB RAM)
     out_wb = Workbook()
-    
-    # 1. Summary Sheet
     ws_sum = out_wb.active
     ws_sum.title = 'Summary'
     ws_sum.sheet_view.showGridLines = False
@@ -395,70 +425,48 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
         max_len = max(len(str(ws_sum.cell(r, col).value or '')) for r in range(1, len(data) + 3))
         ws_sum.column_dimensions[letter].width = max(max_len + 3, 14)
 
-    # 2. Critical P0 Sheet
-    ws_p0 = out_wb.create_sheet(title='Critical P0')
-    ws_p0.sheet_view.showGridLines = False
-    out_headers = ['tracking_number', 'Source DC', 'Aging', 'Age_Bucket', 'Attempt_Status']
-    end_col_p0 = len(out_headers)
-    ws_p0.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col_p0)
-    title_cell = ws_p0.cell(row=1, column=1, value='P0 reverse pendency (Aging ≥ 2)')
-    title_cell.font = title_font
-    title_cell.alignment = center
-    for c in range(1, end_col_p0 + 1):
-        cell = ws_p0.cell(row=1, column=c)
-        cell.fill = title_fill
-        cell.border = border
-
-    for i, h in enumerate(out_headers):
-        cell = ws_p0.cell(row=2, column=i + 1, value=h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center
-        cell.border = border
-
-    for r_idx, vals in enumerate(p0_rows):
-        row_num_p = r_idx + 3
-        for c_idx, val in enumerate(vals):
-            cell = ws_p0.cell(row=row_num_p, column=c_idx + 1, value=val)
-            cell.border = border
-            cell.font = data_font
-            cell.alignment = left if c_idx in [0, 4] else center
-
-    col_widths = [20, 14, 10, 14, 22]
-    for i, w in enumerate(col_widths):
-        ws_p0.column_dimensions[get_column_letter(i + 1)].width = w
-
     temp_sum = io.BytesIO()
     out_wb.save(temp_sum)
     temp_sum.seek(0)
     out_wb.close()
-    del out_wb, p0_rows, pivot
+    del out_wb, pivot
     gc.collect()
 
-    # 3. Assemble final zip archive
-    out_path = Path(output_file)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Assemble ZIP archive
     z_in = zipfile.ZipFile(temp_sum, 'r')
     z_out = zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED)
 
     for item in z_in.infolist():
         if item.filename == '[Content_Types].xml':
             ct = z_in.read(item.filename).decode('utf-8')
-            ct = ct.replace('</Types>', '<Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+            ct = ct.replace('</Types>', '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
             z_out.writestr(item.filename, ct)
         elif item.filename == 'xl/workbook.xml':
             wb_xml = z_in.read(item.filename).decode('utf-8')
-            wb_xml = wb_xml.replace('</sheets>', '<sheet name="Raw" sheetId="3" r:id="rId3"/></sheets>')
+            wb_xml = wb_xml.replace('</sheets>', '<sheet name="Critical P0" sheetId="2" r:id="rId2"/><sheet name="Raw" sheetId="3" r:id="rId3"/></sheets>')
             z_out.writestr(item.filename, wb_xml)
         elif item.filename == 'xl/_rels/workbook.xml.rels':
             wb_rels = z_in.read(item.filename).decode('utf-8')
-            wb_rels = wb_rels.replace('</Relationships>', '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/></Relationships>')
+            wb_rels = wb_rels.replace('</Relationships>', '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/></Relationships>')
             z_out.writestr(item.filename, wb_rels)
         else:
             z_out.writestr(item, z_in.read(item.filename))
 
-    with open(temp_raw_xml, 'rb') as f_raw:
-        z_out.writestr('xl/worksheets/sheet3.xml', f_raw.read())
+    with z_out.open('xl/worksheets/sheet2.xml', 'w', force_zip64=True) as zf_entry:
+        with open(temp_p0_xml, 'rb') as f_p0:
+            while True:
+                buf = f_p0.read(1024 * 1024)
+                if not buf:
+                    break
+                zf_entry.write(buf)
+
+    with z_out.open('xl/worksheets/sheet3.xml', 'w', force_zip64=True) as zf_entry:
+        with open(temp_raw_xml, 'rb') as f_raw:
+            while True:
+                buf = f_raw.read(1024 * 1024)
+                if not buf:
+                    break
+                zf_entry.write(buf)
 
     z_out.close()
     z_in.close()
@@ -469,5 +477,11 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
         except Exception:
             pass
 
+    if temp_p0_xml.exists():
+        try:
+            temp_p0_xml.unlink()
+        except Exception:
+            pass
+
     gc.collect()
-    log.info(f"Saved Reverse Pendency Report: {output_file.name} ({total_filtered} filtered rows)")
+    log.info(f"Saved Reverse Pendency Report: {output_file.name} ({total_filtered} filtered rows, {p0_count} P0 rows)")
