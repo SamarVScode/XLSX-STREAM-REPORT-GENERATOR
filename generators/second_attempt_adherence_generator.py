@@ -16,6 +16,7 @@ import sys
 import math
 import logging
 from pathlib import Path
+import tempfile
 from typing import List, Dict, Any, Union, Tuple
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -307,6 +308,7 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     raw_headers = []
     fwd_rows_iter = []
     rev_rows_iter = []
+    raw_rows_iter = []
     dc_idx = 0
 
     if wb_cal:
@@ -325,6 +327,16 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
             if not raw_headers and h_rev:
                 raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_rev]
                 dc_idx = _get_dc_idx(h_rev)
+        if not fwd_rows_iter and not rev_rows_iter:
+            for cand in ["raw", "raw_data", "data", "sheet1"]:
+                if cand in sheet_map:
+                    raw_sheet = wb_cal.get_sheet_by_name(sheet_map[cand])
+                    raw_rows_iter = raw_sheet.iter_rows()
+                    h_raw = next(raw_rows_iter, None)
+                    if h_raw:
+                        raw_headers = [str(h).strip() if h is not None else "" for h in h_raw]
+                        dc_idx = _get_dc_idx(h_raw)
+                    break
     else:
         in_wb = openpyxl.load_workbook(str(input_path), read_only=True, data_only=True)
         sheet_map = {s.lower(): s for s in in_wb.sheetnames}
@@ -342,9 +354,20 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
             if not raw_headers and h_rev:
                 raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_rev]
                 dc_idx = _get_dc_idx(h_rev)
+        if not fwd_rows_iter and not rev_rows_iter:
+            for cand in ["raw", "raw_data", "data", "sheet1"]:
+                if cand in sheet_map:
+                    ws_raw = in_wb[sheet_map[cand]]
+                    raw_rows_iter = ws_raw.iter_rows(values_only=True)
+                    h_raw = next(raw_rows_iter, None)
+                    if h_raw:
+                        raw_headers = [str(h).strip() if h is not None else "" for h in h_raw]
+                        dc_idx = _get_dc_idx(h_raw)
+                    break
 
     raw_record_count = 0
-    with z_out.open("xl/worksheets/sheet2.xml", "w") as f:
+    temp_raw_xml = Path(tempfile.gettempdir()) / f"temp_raw_2nd_{output_path.stem}.xml"
+    with open(temp_raw_xml, "wb") as f:
         f.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
         row_num = 1
 
@@ -358,6 +381,8 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
             f.write("".join(hdr_xml).encode("utf-8"))
             row_num += 1
 
+        chunk = []
+
         # FWD
         for row in fwd_rows_iter:
             if len(row) > dc_idx and row[dc_idx] is not None:
@@ -370,9 +395,12 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                         else:
                             r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
                     r_xml.append("</row>")
-                    f.write("".join(r_xml).encode("utf-8"))
+                    chunk.append("".join(r_xml))
                     row_num += 1
                     raw_record_count += 1
+                    if len(chunk) >= 1000:
+                        f.write("".join(chunk).encode("utf-8"))
+                        chunk.clear()
 
         # REV
         for row in rev_rows_iter:
@@ -386,14 +414,49 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                         else:
                             r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
                     r_xml.append("</row>")
-                    f.write("".join(r_xml).encode("utf-8"))
+                    chunk.append("".join(r_xml))
                     row_num += 1
                     raw_record_count += 1
+                    if len(chunk) >= 1000:
+                        f.write("".join(chunk).encode("utf-8"))
+                        chunk.clear()
+
+        # Raw (Combined)
+        for row in raw_rows_iter:
+            if len(row) > dc_idx and row[dc_idx] is not None:
+                if str(row[dc_idx]).strip().upper() in TARGET_DCS:
+                    r_xml = [f'<row r="{row_num}">']
+                    for c_i, val in enumerate(row, 1):
+                        col_let = get_column_letter(c_i)
+                        if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
+                            r_xml.append(f'<c r="{col_let}{row_num}"><v>{val}</v></c>')
+                        else:
+                            r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
+                    r_xml.append("</row>")
+                    chunk.append("".join(r_xml))
+                    row_num += 1
+                    raw_record_count += 1
+                    if len(chunk) >= 1000:
+                        f.write("".join(chunk).encode("utf-8"))
+                        chunk.clear()
+
+        if chunk:
+            f.write("".join(chunk).encode("utf-8"))
+            chunk.clear()
 
         f.write(b"</sheetData></worksheet>")
 
+    with open(temp_raw_xml, "rb") as f_raw:
+        z_out.writestr("xl/worksheets/sheet2.xml", f_raw.read())
+
     z_out.close()
     z_in.close()
+
+    if temp_raw_xml.exists():
+        try:
+            temp_raw_xml.unlink()
+        except Exception:
+            pass
 
     log.info(f"Summary DC Items: FWD={len(fwd_dict)}, REV={len(rev_dict)}")
     log.info(f"Total Streamed Raw Records: {raw_record_count}")
