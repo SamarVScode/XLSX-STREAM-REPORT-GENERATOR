@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from collections import defaultdict
 from python_calamine import CalamineWorkbook
+import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
