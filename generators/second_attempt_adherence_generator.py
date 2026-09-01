@@ -258,116 +258,145 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     for col_letter, width in compact_widths.items():
         ws_sum.column_dimensions[col_letter].width = width
 
-    # --- Tab 2: Raw (Streamed directly row by row) ---
-    ws_raw = out_wb.create_sheet(title="Raw")
-    ws_raw.views.sheetView[0].showGridLines = True
+    # 3. Stream Raw Data Directly to Zip XML
+    import io
+    import zipfile
 
-    def _get_dc_idx(h_row):
-        lower = [str(h).strip().lower() for h in h_row if h is not None]
-        for candidate in ['source_dc', 'source dc', 'dc', 'sourcedc', 'hub']:
-            if candidate in lower:
-                return lower.index(candidate)
-        return 0
-
-    raw_headers_written = False
-    raw_record_count = 0
-
-    if wb_cal:
-        sheet_map = {s.lower(): s for s in wb_cal.sheet_names}
-        # Stream FWD
-        if "fwd" in sheet_map:
-            fwd_sheet = wb_cal.get_sheet_by_name(sheet_map["fwd"])
-            fwd_iter = iter(fwd_sheet.iter_rows())
-            header_row = next(fwd_iter, None)
-            if header_row:
-                raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in header_row]
-                ws_raw.append(raw_headers)
-                raw_headers_written = True
-                dc_idx = _get_dc_idx(header_row)
-                for row in fwd_iter:
-                    if len(row) > dc_idx and row[dc_idx] is not None:
-                        if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                            ws_raw.append(["FWD"] + list(row))
-                            raw_record_count += 1
-
-        # Stream REV
-        if "rev" in sheet_map:
-            rev_sheet = wb_cal.get_sheet_by_name(sheet_map["rev"])
-            rev_iter = iter(rev_sheet.iter_rows())
-            header_row = next(rev_iter, None)
-            if header_row:
-                dc_idx = _get_dc_idx(header_row)
-                if not raw_headers_written:
-                    raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in header_row]
-                    ws_raw.append(raw_headers)
-                    raw_headers_written = True
-                for row in rev_iter:
-                    if len(row) > dc_idx and row[dc_idx] is not None:
-                        if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                            ws_raw.append(["REV"] + list(row))
-                            raw_record_count += 1
-    else:
-        # openpyxl read_only stream fallback
-        in_wb = openpyxl.load_workbook(str(input_path), read_only=True, data_only=True)
-        sheet_map = {s.lower(): s for s in in_wb.sheetnames}
-        if "fwd" in sheet_map:
-            ws_fwd = in_wb[sheet_map["fwd"]]
-            fwd_iter = ws_fwd.iter_rows(values_only=True)
-            header_row = next(fwd_iter, None)
-            if header_row:
-                raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in header_row]
-                ws_raw.append(raw_headers)
-                raw_headers_written = True
-                dc_idx = _get_dc_idx(header_row)
-                for row in fwd_iter:
-                    if len(row) > dc_idx and row[dc_idx] is not None:
-                        if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                            ws_raw.append(["FWD"] + list(row))
-                            raw_record_count += 1
-
-        if "rev" in sheet_map:
-            ws_rev = in_wb[sheet_map["rev"]]
-            rev_iter = ws_rev.iter_rows(values_only=True)
-            header_row = next(rev_iter, None)
-            if header_row:
-                dc_idx = _get_dc_idx(header_row)
-                if not raw_headers_written:
-                    raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in header_row]
-                    ws_raw.append(raw_headers)
-                    raw_headers_written = True
-                for row in rev_iter:
-                    if len(row) > dc_idx and row[dc_idx] is not None:
-                        if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                            ws_raw.append(["REV"] + list(row))
-                            raw_record_count += 1
-        in_wb.close()
-
-    # Style Raw header
-    font_raw_header = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
-    fill_raw_header = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
-    for col_num in range(1, ws_raw.max_column + 1):
-        cell = ws_raw.cell(row=1, column=col_num)
-        cell.font = font_raw_header
-        cell.fill = fill_raw_header
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        col_letter = get_column_letter(col_num)
-        h_len = len(str(cell.value or ''))
-        ws_raw.column_dimensions[col_letter].width = min(max(h_len + 4, 12), 35)
-
-    log.info(f"Summary DC Items: FWD={len(fwd_dict)}, REV={len(rev_dict)}")
-    log.info(f"Total Streamed Raw Records: {raw_record_count}")
-
-    # Save Output
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    out_wb.save(output_path)
+    temp_sum = io.BytesIO()
+    out_wb.save(temp_sum)
+    temp_sum.seek(0)
     try:
         out_wb.close()
     except Exception:
         pass
-
     del out_wb
     gc.collect()
 
+    z_in = zipfile.ZipFile(temp_sum, "r")
+    z_out = zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED)
+
+    for item in z_in.infolist():
+        if item.filename == "[Content_Types].xml":
+            ct = z_in.read(item.filename).decode("utf-8")
+            ct = ct.replace("</Types>", '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+            z_out.writestr(item.filename, ct)
+        elif item.filename == "xl/workbook.xml":
+            wb_xml = z_in.read(item.filename).decode("utf-8")
+            wb_xml = wb_xml.replace("</sheets>", '<sheet name="Raw" sheetId="2" r:id="rId2"/></sheets>')
+            z_out.writestr(item.filename, wb_xml)
+        elif item.filename == "xl/_rels/workbook.xml.rels":
+            wb_rels = z_in.read(item.filename).decode("utf-8")
+            wb_rels = wb_rels.replace("</Relationships>", '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>')
+            z_out.writestr(item.filename, wb_rels)
+        else:
+            z_out.writestr(item, z_in.read(item.filename))
+
+    def _get_dc_idx(h_row):
+        lower = [str(h).strip().lower() for h in h_row if h is not None]
+        for candidate in ["source_dc", "source dc", "dc", "sourcedc", "hub"]:
+            if candidate in lower:
+                return lower.index(candidate)
+        return 0
+
+    def esc(val):
+        if val is None:
+            return ""
+        s = str(val)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+    raw_headers = []
+    fwd_rows_iter = []
+    rev_rows_iter = []
+    dc_idx = 0
+
+    if wb_cal:
+        sheet_map = {s.lower(): s for s in wb_cal.sheet_names}
+        if "fwd" in sheet_map:
+            fwd_sheet = wb_cal.get_sheet_by_name(sheet_map["fwd"])
+            fwd_rows_iter = fwd_sheet.iter_rows()
+            h_fwd = next(fwd_rows_iter, None)
+            if h_fwd:
+                raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_fwd]
+                dc_idx = _get_dc_idx(h_fwd)
+        if "rev" in sheet_map:
+            rev_sheet = wb_cal.get_sheet_by_name(sheet_map["rev"])
+            rev_rows_iter = rev_sheet.iter_rows()
+            h_rev = next(rev_rows_iter, None)
+            if not raw_headers and h_rev:
+                raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_rev]
+                dc_idx = _get_dc_idx(h_rev)
+    else:
+        in_wb = openpyxl.load_workbook(str(input_path), read_only=True, data_only=True)
+        sheet_map = {s.lower(): s for s in in_wb.sheetnames}
+        if "fwd" in sheet_map:
+            ws_fwd = in_wb[sheet_map["fwd"]]
+            fwd_rows_iter = ws_fwd.iter_rows(values_only=True)
+            h_fwd = next(fwd_rows_iter, None)
+            if h_fwd:
+                raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_fwd]
+                dc_idx = _get_dc_idx(h_fwd)
+        if "rev" in sheet_map:
+            ws_rev = in_wb[sheet_map["rev"]]
+            rev_rows_iter = ws_rev.iter_rows(values_only=True)
+            h_rev = next(rev_rows_iter, None)
+            if not raw_headers and h_rev:
+                raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_rev]
+                dc_idx = _get_dc_idx(h_rev)
+
+    raw_record_count = 0
+    with z_out.open("xl/worksheets/sheet2.xml", "w") as f:
+        f.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+        row_num = 1
+
+        # Header
+        if raw_headers:
+            hdr_xml = ['<row r="1">']
+            for c_i, h in enumerate(raw_headers, 1):
+                col_let = get_column_letter(c_i)
+                hdr_xml.append(f'<c r="{col_let}1" t="inlineStr"><is><t>{esc(h)}</t></is></c>')
+            hdr_xml.append("</row>")
+            f.write("".join(hdr_xml).encode("utf-8"))
+            row_num += 1
+
+        # FWD
+        for row in fwd_rows_iter:
+            if len(row) > dc_idx and row[dc_idx] is not None:
+                if str(row[dc_idx]).strip().upper() in TARGET_DCS:
+                    r_xml = [f'<row r="{row_num}"><c r="A{row_num}" t="inlineStr"><is><t>FWD</t></is></c>']
+                    for c_i, val in enumerate(row, 2):
+                        col_let = get_column_letter(c_i)
+                        if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
+                            r_xml.append(f'<c r="{col_let}{row_num}"><v>{val}</v></c>')
+                        else:
+                            r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
+                    r_xml.append("</row>")
+                    f.write("".join(r_xml).encode("utf-8"))
+                    row_num += 1
+                    raw_record_count += 1
+
+        # REV
+        for row in rev_rows_iter:
+            if len(row) > dc_idx and row[dc_idx] is not None:
+                if str(row[dc_idx]).strip().upper() in TARGET_DCS:
+                    r_xml = [f'<row r="{row_num}"><c r="A{row_num}" t="inlineStr"><is><t>REV</t></is></c>']
+                    for c_i, val in enumerate(row, 2):
+                        col_let = get_column_letter(c_i)
+                        if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
+                            r_xml.append(f'<c r="{col_let}{row_num}"><v>{val}</v></c>')
+                        else:
+                            r_xml.append(f'<c r="{col_let}{row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
+                    r_xml.append("</row>")
+                    f.write("".join(r_xml).encode("utf-8"))
+                    row_num += 1
+                    raw_record_count += 1
+
+        f.write(b"</sheetData></worksheet>")
+
+    z_out.close()
+    z_in.close()
+
+    log.info(f"Summary DC Items: FWD={len(fwd_dict)}, REV={len(rev_dict)}")
+    log.info(f"Total Streamed Raw Records: {raw_record_count}")
     log.info(f"Successfully generated 2nd Attempt Adherence report: {output_path} ({output_path.stat().st_size} bytes)")
     return output_path
 
