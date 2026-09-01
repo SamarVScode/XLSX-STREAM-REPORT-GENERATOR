@@ -53,8 +53,12 @@ async def convert_async(
     drive_url: str = Query(..., description="Google Drive URL"),
     report_type: str = Query("ei", description="Report generator type"),
     sub_type: Optional[str] = Query(None, description="Report sub-type (e.g. sameday, d1)"),
+    access_token: Optional[str] = Query(None, description="Optional Google OAuth access token"),
     x_api_key: Optional[str] = Depends(verify_api_key)
 ):
+    if access_token and "access_token=" not in drive_url:
+        sep = "&" if "?" in drive_url else "?"
+        drive_url = f"{drive_url}{sep}access_token={access_token}"
     return create_report_job(drive_url, report_type=report_type, sub_type=sub_type)
 
 @router.post("/convert-upload")
@@ -131,6 +135,7 @@ async def get_job_status_route(
         "error": job.get("error"),
         "report_type": job.get("report_type"),
         "sub_type": job.get("sub_type"),
+        "report_date": job.get("report_date"),
         "file_name": job.get("file_name"),
         "tabs": tabs,
         "created_at": job.get("created_at"),

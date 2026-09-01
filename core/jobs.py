@@ -382,7 +382,7 @@ def process_job_async(job_id: str, file_id: str, output_path: Path, report_type:
 def create_report_job(drive_url: str, report_type: str = "ei", sub_type: Optional[str] = None) -> Dict[str, str]:
     evict_old_jobs()
     file_id = extract_file_id(drive_url)
-    cache_key = f"{file_id}_{report_type}"
+    cache_key = f"{file_id}_{report_type}_{sub_type}" if sub_type else f"{file_id}_{report_type}"
     output_path = CACHE_DIR / f"REPORT_{cache_key}.xlsx"
     formatted_name = generate_proper_report_filename(report_type, sub_type=sub_type)
 

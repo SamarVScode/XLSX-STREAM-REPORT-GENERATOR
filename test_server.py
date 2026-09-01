@@ -170,6 +170,38 @@ def test_vms_stream():
         generate_vms_adherence_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
 
+def test_second_attempt_stream():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        src_xlsx = tmp_path / "second_attempt_src.xlsx"
+        out_xlsx = tmp_path / "second_attempt_out.xlsx"
+        
+        wb = Workbook()
+        
+        # 1. Summary sheet
+        ws_sum = wb.active
+        ws_sum.title = "Summary"
+        ws_sum.append(["FWD Metrics", "", "", "", "", "", "REV Metrics", "", "", "", ""])
+        ws_sum.append(["Source DC", "Non Adherence", "Adherence", "Grand Total", "Adherence %", "", "Source DC", "Non Adherence", "Adherence", "Grand Total", "Adherence %"])
+        ws_sum.append(["ALG", 5, 45, 50, 0.90, "", "ALG", 2, 18, 20, 0.90])
+        ws_sum.append(["AYP", 10, 15, 25, 0.60, "", "AYP", 1, 9, 10, 0.90])
+        
+        # 2. FWD sheet
+        ws_fwd = wb.create_sheet("FWD")
+        ws_fwd.append(["Tracking_No", "Source_DC", "Agent", "Status"])
+        ws_fwd.append(["TRK001", "ALG", "Agent 1", "Delivered"])
+        ws_fwd.append(["TRK002", "AYP", "Agent 2", "Undelivered"])
+        
+        # 3. REV sheet
+        ws_rev = wb.create_sheet("REV")
+        ws_rev.append(["Tracking_No", "Source_DC", "Agent", "Status"])
+        ws_rev.append(["TRK003", "ALG", "Agent 3", "Returned"])
+        
+        wb.save(src_xlsx)
+        
+        generate_second_attempt_adherence_report(src_xlsx, out_xlsx)
+        assert out_xlsx.exists()
+
 def test_eob_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
