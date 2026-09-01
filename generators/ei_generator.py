@@ -512,7 +512,23 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
             task_rows = cal.get_sheet_by_name(task_sheet).to_python()
             
             if 'raw' in sheet_map:
-                raw_rows = cal.get_sheet_by_name(sheet_map['raw']).to_python()
+                raw_sheet = cal.get_sheet_by_name(sheet_map['raw'])
+                raw_iter = iter(raw_sheet.iter_rows())
+                h_row = next(raw_iter, None)
+                if h_row:
+                    raw_rows = [list(h_row)]
+                    dc_cand_idx = None
+                    for idx, h in enumerate(h_row):
+                        if str(h or '').strip().lower() in ('source_dc', 'source dc', 'dc'):
+                            dc_cand_idx = idx
+                            break
+                    for r in raw_iter:
+                        if dc_cand_idx is not None and len(r) > dc_cand_idx:
+                            dc_val = str(r[dc_cand_idx] or '').strip()
+                            if dc_val in ALLOWED_SOURCE_DC:
+                                raw_rows.append(list(r))
+                        else:
+                            raw_rows.append(list(r))
         except Exception as ex:
             log.warning(f"Calamine read warning: {ex}. Falling back to openpyxl read_only=True")
             task_rows = []
@@ -522,7 +538,22 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
         task_ws = wb_src['Task_per_1k'] if 'Task_per_1k' in wb_src.sheetnames else wb_src.active
         task_rows = [list(r) for r in task_ws.iter_rows(values_only=True)]
         if 'Raw' in wb_src.sheetnames:
-            raw_rows = [list(r) for r in wb_src['Raw'].iter_rows(values_only=True)]
+            raw_iter = wb_src['Raw'].iter_rows(values_only=True)
+            h_row = next(raw_iter, None)
+            if h_row:
+                raw_rows = [list(h_row)]
+                dc_cand_idx = None
+                for idx, h in enumerate(h_row):
+                    if str(h or '').strip().lower() in ('source_dc', 'source dc', 'dc'):
+                        dc_cand_idx = idx
+                        break
+                for r in raw_iter:
+                    if dc_cand_idx is not None and len(r) > dc_cand_idx:
+                        dc_val = str(r[dc_cand_idx] or '').strip()
+                        if dc_val in ALLOWED_SOURCE_DC:
+                            raw_rows.append(list(r))
+                    else:
+                        raw_rows.append(list(r))
         wb_src.close()
 
     log.info("Phase 2: Parsing Task_per_1k sheet")
@@ -540,7 +571,7 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
         log.warning("  Raw sheet not found — skipping FWD/REV tabs")
     else:
         headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_rows(raw_rows)
-        log.info(f"  Total rows: {len(filt_rows)}, filtered by allowed DCs")
+        log.info(f"  Total filtered rows: {len(filt_rows)}")
 
     log.info("Phase 4: Writing output workbook")
     wb_out = openpyxl.Workbook()
@@ -561,5 +592,8 @@ def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
         wb_out.close()
     except Exception:
         pass
+    del wb_out, raw_rows, filt_rows
+    import gc
+    gc.collect()
     log.info(f"Report saved: {output_file_path}")
     return str(output_file_path)

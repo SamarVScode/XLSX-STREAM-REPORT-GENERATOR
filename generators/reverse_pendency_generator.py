@@ -269,7 +269,8 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     except Exception:
         pass
 
-    del out_wb
+    tot_len = len(filtered)
+    del out_wb, rows, filtered
     import gc
     gc.collect()
-    log.info(f"Saved Reverse Pendency Report: {output_file.name} ({len(filtered)} total rows incl header, {p0_count} P0 rows)")
+    log.info(f"Saved Reverse Pendency Report: {output_file.name} ({tot_len} total rows, {p0_count} P0 rows)")
