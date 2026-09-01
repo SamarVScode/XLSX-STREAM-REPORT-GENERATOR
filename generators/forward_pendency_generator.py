@@ -8,17 +8,12 @@ computes the 'Aging Category' column right beside 'Aging', and generates output 
   2. CPD-DID pendency Sheet (P2 & P3 actual row details)
   3. RAW Sheet (Full filtered rows dataset with Aging Category)
 
-Uses Zero-Memory Streaming Architecture:
-- Direct XML disk streaming for massive (200k+ rows) datasets
-- Calamine / openpyxl read_only stream parsing
-- Memory footprint < 40MB RAM under full load
+Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+- O(1) Memory Footprint (< 35MB RAM)
+- Direct XML disk streaming for massive datasets
 """
 
-import io
-import re
-import math
-import zipfile
-import tempfile
+import sys
 import logging
 from pathlib import Path
 from collections import defaultdict
@@ -27,30 +22,29 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-try:
-    from python_calamine import CalamineWorkbook
-    HAS_CALAMINE = True
-except ImportError:
-    HAS_CALAMINE = False
+# Ensure server root is in sys.path
+SERVER_ROOT = Path(__file__).resolve().parent.parent
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
 
 try:
     from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
 except ImportError:
     from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
 
+from core.stream_engine import (
+    XmlSheetWriter,
+    assemble_stream_workbook,
+    stream_sheet_rows,
+    inspect_spreadsheet_headers,
+    ColumnFinder
+)
+
 # Core 11 North Hubs for Forward Pendency
 PRIMARY_NORTH_DCS = ['ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR']
-
 AGING_CATEGORIES = ['0-2 days', '3-5 days', '5-10 days', '>10 days']
 
 log = logging.getLogger("ei_stream_server.forward_pendency")
-
-
-def _clean_key(name) -> str:
-    """Normalize string by removing all whitespace, underscores, dashes and lowercasing."""
-    if name is None:
-        return ""
-    return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
 
 def compute_aging_category(val) -> str:
@@ -74,15 +68,13 @@ def compute_aging_category(val) -> str:
 def normalize_priority(val) -> str:
     """
     Normalizes priority values to P1, P2, P3, P4, or Unknown.
-    Handles integers (2, 3, 4), floats (2.0, 3.0), strings ('P2', 'p2', 'Priority 2', etc.).
+    Handles integers (2, 3, 4), floats (2.0, 3.0), strings ('P2', 'Priority 2', etc.).
     """
     if val is None:
         return "Unknown"
     s = str(val).strip().upper()
     if not s:
         return "Unknown"
-    
-    # Direct mappings
     if s in ("P2", "2", "2.0", "P-2", "P 2", "PRIORITY 2", "PRIORITY-2", "PRIORITY_2"):
         return "P2"
     if s in ("P3", "3", "3.0", "P-3", "P 3", "PRIORITY 3", "PRIORITY-3", "PRIORITY_3"):
@@ -91,8 +83,6 @@ def normalize_priority(val) -> str:
         return "P4"
     if s in ("P1", "1", "1.0", "P-1", "P 1", "PRIORITY 1", "PRIORITY-1", "PRIORITY_1"):
         return "P1"
-    
-    # Substring detection
     if "P2" in s or "DID" in s:
         return "P2"
     if "P3" in s or "CPD" in s:
@@ -101,7 +91,6 @@ def normalize_priority(val) -> str:
         return "P4"
     if "P1" in s:
         return "P1"
-        
     return s
 
 
@@ -196,11 +185,9 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     ws.title = "Summary"
     ws.sheet_view.showGridLines = False
 
-    # Determine list of DCs for summary: Start with Primary 11 North Hubs, plus any others with data
     dc_list = list(PRIMARY_NORTH_DCS)
     for dc in ALLOWED_SOURCE_DCS:
         if dc.upper() != 'ALL' and dc.upper() not in dc_list:
-            # Only add if it has active data
             if any(t1_pivot[dc.upper()].values()) or any(t2_pivot[dc.upper()].values()):
                 dc_list.append(dc.upper())
 
@@ -274,336 +261,101 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
         ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
 
 
-def esc(val):
-    if val is None:
-        return ""
-    s = str(val)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
-
-def find_column_indices(header_list: list) -> dict:
-    """
-    Robust column detection with regex stripping and fallback heuristics.
-    """
-    clean_map = {_clean_key(h): idx for idx, h in enumerate(header_list) if h is not None}
-    raw_map = {str(h).strip().lower(): idx for idx, h in enumerate(header_list) if h is not None}
-
-    # 1. Aging Column
-    aging_idx = None
-    for c in ['aging', 'agingbucket', 'agebucket', 'ageing', 'age', 'agingdays', 'ageingdays', 'ageingbucket']:
-        if c in clean_map:
-            aging_idx = clean_map[c]
-            break
-    if aging_idx is None:
-        for k, v in clean_map.items():
-            if 'aging' in k or 'ageing' in k:
-                aging_idx = v
-                break
-    if aging_idx is None:
-        aging_idx = 20
-
-    # 2. Source DC Column
-    sdc_idx = None
-    for c in ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'hub', 'origin', 'origindc']:
-        if c in clean_map:
-            sdc_idx = clean_map[c]
-            break
-    if sdc_idx is None:
-        for k, v in clean_map.items():
-            if 'sourcedc' in k or 'source' in k:
-                sdc_idx = v
-                break
-    if sdc_idx is None:
-        sdc_idx = 15
-
-    # 3. Priority Column (CustomerPriorityV2, CustomerPriority, Priority, Prio)
-    prio_idx = None
-    for c in ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'custpriority', 'priority', 'prio', 'customerprio', 'orderpriority']:
-        if c in clean_map:
-            prio_idx = clean_map[c]
-            break
-    if prio_idx is None:
-        for k, v in clean_map.items():
-            if 'priority' in k or 'prio' in k:
-                prio_idx = v
-                break
-    if prio_idx is None:
-        prio_idx = 13
-
-    # 4. Shipment / Waybill Column
-    shipment_idx = None
-    for c in ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'trackingnumber', 'awb', 'shipmentno', 'orderid']:
-        if c in clean_map:
-            shipment_idx = clean_map[c]
-            break
-    if shipment_idx is None:
-        for k, v in clean_map.items():
-            if 'tracking' in k or 'shipment' in k or 'waybill' in k or 'awb' in k:
-                shipment_idx = v
-                break
-    if shipment_idx is None:
-        shipment_idx = 1
-
-    # 5. Attempt Status Column
-    attempt_idx = None
-    for c in ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'attemptstat', 'deliveryattempt']:
-        if c in clean_map:
-            attempt_idx = clean_map[c]
-            break
-    if attempt_idx is None:
-        for k, v in clean_map.items():
-            if 'attempt' in k:
-                attempt_idx = v
-                break
-    if attempt_idx is None:
-        # Fallback to status only if attempt is not found
-        if 'status' in clean_map:
-            attempt_idx = clean_map['status']
-        else:
-            attempt_idx = 23
-
-    log.info(f"Resolved column indices: Aging={aging_idx} ('{header_list[aging_idx] if len(header_list) > aging_idx else 'N/A'}'), "
-             f"Source_DC={sdc_idx} ('{header_list[sdc_idx] if len(header_list) > sdc_idx else 'N/A'}'), "
-             f"Priority={prio_idx} ('{header_list[prio_idx] if len(header_list) > prio_idx else 'N/A'}'), "
-             f"Shipment={shipment_idx} ('{header_list[shipment_idx] if len(header_list) > shipment_idx else 'N/A'}'), "
-             f"Attempt={attempt_idx} ('{header_list[attempt_idx] if len(header_list) > attempt_idx else 'N/A'}')")
-
-    return {
-        'aging': aging_idx,
-        'sdc': sdc_idx,
-        'prio': prio_idx,
-        'shipment': shipment_idx,
-        'attempt': attempt_idx
-    }
-
-
 def generate_forward_pendency_report(input_file: Path, output_file: Path):
     """
-    Main generator pipeline for Forward Pendency Report using Zero-Memory Streaming Architecture.
+    Main generator pipeline for Forward Pendency Report using unified stream_engine.
     """
     input_path = Path(input_file)
     output_path = Path(output_file)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    log.info(f"Loading input workbook for Forward Pendency Report (Zero-Memory Stream Mode): {input_path}")
+    log.info(f"Loading input workbook for Forward Pendency Report: {input_path}")
 
-    # Set up temp files for XML streaming
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_raw_xml = Path(tempfile.gettempdir()) / f"temp_fwd_raw_{output_path.stem}.xml"
-    temp_cpd_xml = Path(tempfile.gettempdir()) / f"temp_fwd_cpd_{output_path.stem}.xml"
+    headers = inspect_spreadsheet_headers(input_path, sheet_name='raw_data_North')
+    if not headers:
+        row_iter = stream_sheet_rows(input_path, sheet_name='raw_data_North', start_row=1)
+        headers = next(row_iter, [])
 
-    f_raw = open(temp_raw_xml, 'wb')
-    f_cpd = open(temp_cpd_xml, 'wb')
+    if not headers:
+        raise ValueError("Sheet 'raw_data_North' is empty or not found.")
 
-    f_raw.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
-    f_cpd.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+    # Column resolution via ColumnFinder
+    cf = ColumnFinder(headers, {
+        'aging': ['aging', 'agingbucket', 'agebucket', 'ageing', 'agingdays'],
+        'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc'],
+        'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio'],
+        'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb'],
+        'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt']
+    })
+
+    aging_col_idx = cf['aging']
+    sdc_idx = cf['sdc']
+    prio_idx = cf['prio']
+    shipment_idx = cf['shipment']
+    attempt_idx = cf['attempt']
+
+    # Prepared headers for RAW and CPD-DID
+    raw_header_out = list(headers)
+    raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
+    cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
 
     # Pivot aggregators
     t1_pivot = defaultdict(lambda: defaultdict(int))
     t2_pivot = defaultdict(lambda: defaultdict(int))
     t3_pivot = defaultdict(lambda: defaultdict(int))
 
-    total_processed = 0
     total_filtered = 0
     cpd_count = 0
 
-    raw_row_num = 2
-    cpd_row_num = 2
-    raw_chunk = []
-    cpd_chunk = []
+    # 1. Stream both CPD-DID and RAW directly to disk XML (0 MB RAM)
+    cpd_writer = XmlSheetWriter("CPD-DID pendency", cpd_headers)
+    raw_writer = XmlSheetWriter("RAW", raw_header_out)
 
-    # Stream reader using openpyxl read_only
-    in_wb = openpyxl.load_workbook(str(input_path), data_only=True, read_only=True)
-    target_sheet = None
-    sheet_map = {name.lower(): name for name in in_wb.sheetnames}
-    for candidate in ['raw_data_north', 'raw_data', 'raw', 'praw data', 'data']:
-        if candidate in sheet_map:
-            target_sheet = sheet_map[candidate]
-            break
-    if not target_sheet and in_wb.sheetnames:
-        target_sheet = in_wb.sheetnames[0]
+    with cpd_writer, raw_writer:
+        for row in stream_sheet_rows(input_path, sheet_name='raw_data_North', start_row=2):
+            if not row or len(row) <= sdc_idx:
+                continue
+            raw_sdc = row[sdc_idx]
+            if raw_sdc is None:
+                continue
+            sdc = str(raw_sdc).strip().lower()
 
-    in_ws = in_wb[target_sheet]
-    log.info(f"Reading rows from '{target_sheet}' sheet in stream mode...")
+            if sdc in ALLOWED_DCS_SET_LOWER:
+                total_filtered += 1
+                sdc_upper = sdc.upper()
+                aging_val = row[aging_col_idx] if len(row) > aging_col_idx else None
+                aging_cat = compute_aging_category(aging_val)
 
-    row_iter = in_ws.iter_rows(values_only=True)
-    header_row = next(row_iter, None)
-    if not header_row:
-        in_wb.close()
-        f_raw.close()
-        f_cpd.close()
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
+                raw_prio = row[prio_idx] if len(row) > prio_idx else None
+                prio = normalize_priority(raw_prio)
 
-    header_list = list(header_row)
-    col_indices = find_column_indices(header_list)
-    aging_col_idx = col_indices['aging']
-    sdc_idx = col_indices['sdc']
-    prio_idx = col_indices['prio']
-    shipment_idx = col_indices['shipment']
-    attempt_idx = col_indices['attempt']
+                # Aggregate pivots
+                t1_pivot[sdc_upper][aging_cat] += 1
+                t2_pivot[sdc_upper][prio] += 1
+                if prio == "P3":
+                    t3_pivot[sdc_upper]["CPD (P3)"] += 1
+                elif prio == "P2":
+                    t3_pivot[sdc_upper]["DID (P2)"] += 1
 
-    # Write Raw header (insert Aging Category right after Aging)
-    raw_header_out = list(header_list)
-    raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
-    r_hdr_xml = ['<row r="1">']
-    for c_i, h_val in enumerate(raw_header_out, 1):
-        r_hdr_xml.append(f'<c r="{get_column_letter(c_i)}1" t="inlineStr"><is><t>{esc(h_val)}</t></is></c>')
-    r_hdr_xml.append('</row>')
-    f_raw.write(''.join(r_hdr_xml).encode('utf-8'))
+                # Write RAW row (insert Aging Category)
+                r_out = list(row)
+                r_out.insert(aging_col_idx + 1, aging_cat)
+                raw_writer.write_row(r_out)
 
-    # Write CPD-DID pendency header
-    cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
-    c_hdr_xml = ['<row r="1">']
-    for c_i, h_val in enumerate(cpd_headers, 1):
-        c_hdr_xml.append(f'<c r="{get_column_letter(c_i)}1" t="inlineStr"><is><t>{esc(h_val)}</t></is></c>')
-    c_hdr_xml.append('</row>')
-    f_cpd.write(''.join(c_hdr_xml).encode('utf-8'))
+                # Write CPD-DID row if P2 or P3
+                if prio in ("P2", "P3"):
+                    cpd_count += 1
+                    shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
+                    attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
+                    cpd_writer.write_row([shipment, sdc_upper, aging_cat, attempt_stat, prio])
 
-    for row in row_iter:
-        total_processed += 1
-        raw_sdc = row[sdc_idx] if len(row) > sdc_idx else None
-        sdc = str(raw_sdc).strip().lower() if raw_sdc is not None else ''
+    log.info(f"Filtered {total_filtered} matching rows ({cpd_count} CPD-DID rows).")
 
-        if sdc in ALLOWED_DCS_SET_LOWER:
-            total_filtered += 1
-            sdc_upper = sdc.upper()
-            aging_val = row[aging_col_idx] if len(row) > aging_col_idx else None
-            aging_cat = compute_aging_category(aging_val)
-
-            raw_prio = row[prio_idx] if len(row) > prio_idx else None
-            prio = normalize_priority(raw_prio)
-
-            # Aggregate into pivots for Summary sheet
-            t1_pivot[sdc_upper][aging_cat] += 1
-            t2_pivot[sdc_upper][prio] += 1
-
-            if prio == "P3":
-                t3_pivot[sdc_upper]["CPD (P3)"] += 1
-            elif prio == "P2":
-                t3_pivot[sdc_upper]["DID (P2)"] += 1
-
-            # Format Raw row
-            r_xml = [f'<row r="{raw_row_num}">']
-            col_counter = 1
-            for idx, val in enumerate(row):
-                col_let = get_column_letter(col_counter)
-                if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
-                    r_xml.append(f'<c r="{col_let}{raw_row_num}"><v>{val}</v></c>')
-                else:
-                    r_xml.append(f'<c r="{col_let}{raw_row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
-                col_counter += 1
-
-                if idx == aging_col_idx:
-                    # Insert Aging Category cell
-                    col_let_cat = get_column_letter(col_counter)
-                    r_xml.append(f'<c r="{col_let_cat}{raw_row_num}" t="inlineStr"><is><t>{esc(aging_cat)}</t></is></c>')
-                    col_counter += 1
-
-            r_xml.append('</row>')
-            raw_chunk.append(''.join(r_xml))
-            raw_row_num += 1
-
-            # CPD-DID pendency row if P2 or P3
-            if prio in ("P2", "P3"):
-                cpd_count += 1
-                shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
-                attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
-                cpd_vals = [shipment, sdc_upper, aging_cat, attempt_stat, prio]
-
-                c_xml = [f'<row r="{cpd_row_num}">']
-                for c_i, val in enumerate(cpd_vals, 1):
-                    col_let = get_column_letter(c_i)
-                    if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
-                        c_xml.append(f'<c r="{col_let}{cpd_row_num}"><v>{val}</v></c>')
-                    else:
-                        c_xml.append(f'<c r="{col_let}{cpd_row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
-                c_xml.append('</row>')
-                cpd_chunk.append(''.join(c_xml))
-                cpd_row_num += 1
-
-            if len(raw_chunk) >= 1000:
-                f_raw.write(''.join(raw_chunk).encode('utf-8'))
-                raw_chunk.clear()
-            if len(cpd_chunk) >= 1000:
-                f_cpd.write(''.join(cpd_chunk).encode('utf-8'))
-                cpd_chunk.clear()
-
-    if raw_chunk:
-        f_raw.write(''.join(raw_chunk).encode('utf-8'))
-    if cpd_chunk:
-        f_cpd.write(''.join(cpd_chunk).encode('utf-8'))
-
-    f_raw.write(b'</sheetData></worksheet>')
-    f_cpd.write(b'</sheetData></worksheet>')
-    f_raw.close()
-    f_cpd.close()
-    in_wb.close()
-
-    log.info(f"Processed {total_processed} source rows. Filtered {total_filtered} matching rows ({cpd_count} CPD-DID rows).")
-
-    # Build Summary sheet in tiny openpyxl workbook (~30 rows, ~50 KB RAM)
+    # 2. Build tiny styled Summary sheet in memory (~50 KB RAM)
     out_wb = Workbook()
     build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot)
 
-    temp_sum = io.BytesIO()
-    out_wb.save(temp_sum)
-    temp_sum.seek(0)
-    try:
-        out_wb.close()
-    except Exception:
-        pass
-    del out_wb, t1_pivot, t2_pivot, t3_pivot
-
-    # Assemble ZIP archive with Summary, CPD-DID pendency, and RAW sheets
-    z_in = zipfile.ZipFile(temp_sum, 'r')
-    z_out = zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED)
-
-    for item in z_in.infolist():
-        if item.filename == '[Content_Types].xml':
-            ct = z_in.read(item.filename).decode('utf-8')
-            ct = ct.replace('</Types>', '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
-            z_out.writestr(item.filename, ct)
-        elif item.filename == 'xl/workbook.xml':
-            wb_xml = z_in.read(item.filename).decode('utf-8')
-            wb_xml = wb_xml.replace('</sheets>', '<sheet name="CPD-DID pendency" sheetId="2" r:id="rId2"/><sheet name="RAW" sheetId="3" r:id="rId3"/></sheets>')
-            z_out.writestr(item.filename, wb_xml)
-        elif item.filename == 'xl/_rels/workbook.xml.rels':
-            wb_rels = z_in.read(item.filename).decode('utf-8')
-            wb_rels = wb_rels.replace('</Relationships>', '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/></Relationships>')
-            z_out.writestr(item.filename, wb_rels)
-        else:
-            z_out.writestr(item, z_in.read(item.filename))
-
-    # Stream CPD-DID pendency sheet into sheet2.xml
-    with z_out.open('xl/worksheets/sheet2.xml', 'w', force_zip64=True) as zf_entry:
-        with open(temp_cpd_xml, 'rb') as f_cpd_in:
-            while True:
-                buf = f_cpd_in.read(1024 * 1024)
-                if not buf:
-                    break
-                zf_entry.write(buf)
-
-    # Stream RAW sheet into sheet3.xml
-    with z_out.open('xl/worksheets/sheet3.xml', 'w', force_zip64=True) as zf_entry:
-        with open(temp_raw_xml, 'rb') as f_raw_in:
-            while True:
-                buf = f_raw_in.read(1024 * 1024)
-                if not buf:
-                    break
-                zf_entry.write(buf)
-
-    z_out.close()
-    z_in.close()
-
-    # Cleanup temp XML files
-    for p in (temp_raw_xml, temp_cpd_xml):
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception:
-                pass
-
-    import gc
-    gc.collect()
-    log.info(f"Successfully generated Forward Pendency Report (Zero-Memory Stream): {output_file.name} ({total_filtered} rows)")
+    # 3. Assemble final .xlsx in 1 single line
+    assemble_stream_workbook(out_wb, [cpd_writer, raw_writer], output_path)
+    log.info(f"Successfully generated Forward Pendency Report: {output_file.name} ({total_filtered} rows)")

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-SCM TAT 24Hrs Performance Report Generator Module for ei_report_server
+SCM TAT 24Hrs Performance Report Generator Module for ei_stream_server
 ======================================================================
 Reads 'Data' sheet from input Excel file, detects source DC and status columns,
 filters rows matching allowed DCs from dc_config, computes completed vs pending counts,
 and generates formatted output workbook:
   1. 'SCM tat performance summary' sheet
   2. 'SCM TAT raw data' sheet
+
+Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+- O(1) Memory Footprint (< 35MB RAM)
+- Direct XML disk streaming for massive datasets
 """
 
 import sys
@@ -14,72 +18,85 @@ import logging
 from pathlib import Path
 from collections import defaultdict
 import openpyxl
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# Ensure current directory is in sys.path for dc_config import
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+# Ensure server root is in sys.path
+SERVER_ROOT = Path(__file__).resolve().parent.parent
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
+
 try:
     from config.dc_config import ALLOWED_DCS_SET_LOWER
 except ImportError:
-    try:
-        from dc_config import ALLOWED_DCS_SET_LOWER
-    except ImportError:
-        ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
+    ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
 
-log = logging.getLogger("ei_server.tat_report")
+from core.stream_engine import (
+    XmlSheetWriter,
+    assemble_stream_workbook,
+    stream_sheet_rows,
+    get_sheet_names,
+    ColumnFinder
+)
 
-def detect_hub_col(headers):
-    priorities = ['source dc', 'source_dc', 'dc code', 'dc']
-    lower = [str(h).strip().lower() if h is not None else '' for h in headers]
-    for p in priorities:
-        if p in lower:
-            return lower.index(p)
-    return 28  # Default fallback
+log = logging.getLogger("ei_stream_server.tat_report")
 
-def detect_status_col(headers):
-    lower = [str(h).strip().lower() if h is not None else '' for h in headers]
-    if 'status_status' in lower:
-        return lower.index('status_status')
-    for idx, h in enumerate(lower):
-        if 'status' in h:
-            return idx
-    return 4  # Default fallback
 
 def generate_tat_report(input_file: Path, output_file: Path):
-    log.info(f"Loading input workbook for SCM TAT Report: {input_file}")
-    wb_in = openpyxl.load_workbook(str(input_file), data_only=True)
-    ws_data = wb_in['Data'] if 'Data' in wb_in.sheetnames else wb_in.active
+    input_path = Path(input_file)
+    output_path = Path(output_file)
+    log.info(f"Loading input workbook for SCM TAT Report: {input_path.name}")
 
-    headers = [cell.value for cell in ws_data[1]]
-    rows = []
-    for row in ws_data.iter_rows(min_row=2, values_only=True):
-        rows.append(list(row))
-    wb_in.close()
+    sheet_names = get_sheet_names(input_path)
+    sheet_map = {name.lower(): name for name in sheet_names}
+    target_sheet = None
+    for candidate in ['data', 'raw', 'raw_data', 'sheet1']:
+        if candidate in sheet_map:
+            target_sheet = sheet_map[candidate]
+            break
+    if not target_sheet and sheet_names:
+        target_sheet = sheet_names[0]
 
-    hub_idx = detect_hub_col(headers)
-    status_idx = detect_status_col(headers)
+    row_iter = stream_sheet_rows(input_path, sheet_name=target_sheet, start_row=1)
+    headers = next(row_iter, [])
+    if not headers:
+        raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
-    # Filter rows to allowed DCs
-    filtered_rows = [
-        r for r in rows
-        if len(r) > hub_idx and str(r[hub_idx] or '').strip().lower() in ALLOWED_DCS_SET_LOWER
-    ]
+    cf = ColumnFinder(headers, {
+        'hub': ['source dc', 'source_dc', 'dc code', 'dc', 'hub'],
+        'status': ['status_status', 'status', 'task_status']
+    })
+
+    hub_idx = cf.get('hub', 28)
+    status_idx = cf.get('status', 4)
 
     stats_map = defaultdict(lambda: {'complete': 0, 'not_complete': 0})
-    for row in filtered_rows:
-        if len(row) <= max(hub_idx, status_idx):
-            continue
-        hub = str(row[hub_idx] or '').strip()
-        status = str(row[status_idx] or '').strip().lower()
-        if not hub or hub.lower() not in ALLOWED_DCS_SET_LOWER:
-            continue
-        if status in ('closed', 'task resolved', 'resolved', 'complete', 'completed'):
-            stats_map[hub.upper()]['complete'] += 1
-        else:
-            stats_map[hub.upper()]['not_complete'] += 1
+    total_filtered = 0
+
+    raw_writer = XmlSheetWriter("SCM TAT raw data", headers)
+
+    with raw_writer:
+        for row in row_iter:
+            if not row or len(row) <= max(hub_idx, status_idx):
+                continue
+            raw_hub = row[hub_idx]
+            if raw_hub is None:
+                continue
+            hub_clean = str(raw_hub).strip().lower()
+
+            if hub_clean in ALLOWED_DCS_SET_LOWER:
+                total_filtered += 1
+                raw_writer.write_row(row)
+
+                status = str(row[status_idx] or '').strip().lower()
+                hub_upper = hub_clean.upper()
+                if status in ('closed', 'task resolved', 'resolved', 'complete', 'completed'):
+                    stats_map[hub_upper]['complete'] += 1
+                else:
+                    stats_map[hub_upper]['not_complete'] += 1
+
+    log.info(f"Filtered {total_filtered} matching rows.")
 
     sorted_hubs = sorted(stats_map.keys())
     summary_rows = []
@@ -124,7 +141,6 @@ def generate_tat_report(input_file: Path, output_file: Path):
     green_fill = PatternFill(start_color='FFdcfce7', end_color='FFdcfce7', fill_type='solid')
     yellow_fill = PatternFill(start_color='FFfef9c3', end_color='FFfef9c3', fill_type='solid')
     red_fill = PatternFill(start_color='FFfee2e2', end_color='FFfee2e2', fill_type='solid')
-    raw_header_fill = PatternFill(start_color='FF334155', end_color='FF334155', fill_type='solid')
 
     white_font = Font(bold=True, size=10, color='FFFFFFFF')
     green_font = Font(bold=True, size=9, color='FF166534')
@@ -132,30 +148,28 @@ def generate_tat_report(input_file: Path, output_file: Path):
     red_font = Font(bold=True, size=9, color='FF991b1b')
     normal_font = Font(size=9)
     header_font = Font(bold=True, size=10, color='FFFFFFFF')
-    raw_header_font = Font(bold=True, color='FFFFFFFF')
-
     center = Alignment(horizontal='center', vertical='center')
 
     wb_out = openpyxl.Workbook()
     ws_sum = wb_out.active
-    ws_sum.title = 'Summary'
+    ws_sum.title = 'SCM tat performance summary'
     ws_sum.sheet_view.showGridLines = False
 
-    for r in range(1, len(summary_rows) + 10):
-        for c in range(1, 8):
-            ws_sum.cell(row=r, column=c).fill = white_fill
-
-    date_str = 'SCM TAT 24Hrs Performance Report'
-    ws_sum.cell(row=1, column=1, value=date_str)
+    # Banner
+    ws_sum.cell(row=1, column=1, value='SCM TAT 24Hrs Performance Summary')
     ws_sum.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
-    banner_cell = ws_sum.cell(row=1, column=1)
-    banner_cell.fill = banner_fill
-    banner_cell.font = white_font
-    banner_cell.alignment = center
+    ws_sum.cell(row=1, column=1).fill = banner_fill
+    ws_sum.cell(row=1, column=1).font = white_font
+    ws_sum.cell(row=1, column=1).alignment = center
     ws_sum.row_dimensions[1].height = 22
 
-    sum_headers = ['DC', 'Completed', 'Pending', 'Total', 'Done %', 'Pending %']
-    for i, h in enumerate(sum_headers, 1):
+    for c in range(1, 7):
+        ws_sum.cell(row=1, column=c).fill = banner_fill
+        ws_sum.cell(row=1, column=c).border = purple_border
+
+    # Headers
+    headers_sum = ['DC Code', 'Task Completed Within TAT', 'Pending', 'Grand Total', 'Task Completed TAT %', 'Task Pending TAT %']
+    for i, h in enumerate(headers_sum, 1):
         cell = ws_sum.cell(row=3, column=i, value=h)
         cell.fill = header_fill
         cell.font = header_font
@@ -163,9 +177,10 @@ def generate_tat_report(input_file: Path, output_file: Path):
         cell.border = purple_border
     ws_sum.row_dimensions[3].height = 24
 
+    # Data rows
     for r_idx, srow in enumerate(summary_rows):
         row_num = 4 + r_idx
-        is_alt = r_idx % 2 == 1
+        is_alt = (r_idx % 2 == 1)
         fill = alt_fill if is_alt else white_fill
 
         for c_idx, val in enumerate(srow, 1):
@@ -181,61 +196,45 @@ def generate_tat_report(input_file: Path, output_file: Path):
         ws_sum.cell(row=row_num, column=5).number_format = '0.0%'
         ws_sum.cell(row=row_num, column=6).number_format = '0.0%'
 
-        complete_pct = srow[4]
-        pct_cell = ws_sum.cell(row=row_num, column=5)
-        pct_cell.font = Font(bold=True, size=9)
-        if complete_pct >= 0.90:
-            pct_cell.fill = green_fill
-            pct_cell.font = green_font
-        elif complete_pct >= 0.75:
-            pct_cell.fill = yellow_fill
-            pct_cell.font = yellow_font
+        comp_pct = srow[4]
+        c5 = ws_sum.cell(row=row_num, column=5)
+        c5.font = Font(bold=True, size=9)
+        if comp_pct > 0.85:
+            c5.fill = green_fill
+            c5.font = green_font
+        elif comp_pct >= 0.65:
+            c5.fill = yellow_fill
+            c5.font = yellow_font
         else:
-            pct_cell.fill = red_fill
-            pct_cell.font = red_font
+            c5.fill = red_fill
+            c5.font = red_font
 
         ws_sum.row_dimensions[row_num].height = 20
 
-    totals_row_num = 4 + len(summary_rows)
+    # Totals row
+    t_row_num = 4 + len(summary_rows)
     for c_idx, val in enumerate(totals_row, 1):
-        cell = ws_sum.cell(row=totals_row_num, column=c_idx, value=val)
+        cell = ws_sum.cell(row=t_row_num, column=c_idx, value=val)
         cell.alignment = center
         cell.border = purple_border
         cell.fill = header_fill
         cell.font = header_font
 
-    ws_sum.cell(row=totals_row_num, column=2).number_format = '#,##0'
-    ws_sum.cell(row=totals_row_num, column=3).number_format = '#,##0'
-    ws_sum.cell(row=totals_row_num, column=4).number_format = '#,##0'
-    ws_sum.cell(row=totals_row_num, column=5).number_format = '0.0%'
-    ws_sum.cell(row=totals_row_num, column=6).number_format = '0.0%'
+    for c in [2, 3, 4]:
+        ws_sum.cell(row=t_row_num, column=c).number_format = '#,##0'
+
+    ws_sum.cell(row=t_row_num, column=5).number_format = '0.0%'
+    ws_sum.cell(row=t_row_num, column=6).number_format = '0.0%'
+    ws_sum.row_dimensions[t_row_num].height = 22
 
     for col in range(1, 7):
-        max_len = len(str(sum_headers[col - 1]))
-        for r in range(4, totals_row_num + 1):
+        max_len = len(str(headers_sum[col - 1]))
+        for r in range(4, t_row_num + 1):
             val = ws_sum.cell(row=r, column=col).value
             if val is not None:
                 max_len = max(max_len, len(str(val)))
         ws_sum.column_dimensions[get_column_letter(col)].width = max_len + 4
 
-    ws_raw = wb_out.create_sheet('Raw')
-    for i, h in enumerate(headers, 1):
-        cell = ws_raw.cell(row=1, column=i, value=h)
-        cell.fill = raw_header_fill
-        cell.font = raw_header_font
-        cell.alignment = center
-
-    for r_idx, row in enumerate(filtered_rows, 2):
-        for c_idx, val in enumerate(row, 1):
-            ws_raw.cell(row=r_idx, column=c_idx, value=val)
-
-    for col in range(1, min(len(headers) + 1, 21)):
-        max_len = len(str(headers[col - 1])) if col - 1 < len(headers) else 10
-        for r in range(2, min(len(filtered_rows) + 1, 102)):
-            val = ws_raw.cell(row=r, column=col).value
-            if val is not None:
-                max_len = max(max_len, len(str(val)))
-        ws_raw.column_dimensions[get_column_letter(col)].width = min(max_len + 2, 30)
-
-    wb_out.save(str(output_file))
-    log.info(f"Successfully generated SCM TAT Report: {output_file}")
+    # Assemble Output
+    assemble_stream_workbook(wb_out, [raw_writer], output_path)
+    log.info(f"Successfully generated SCM TAT Report: {output_file.name}")

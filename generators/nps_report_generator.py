@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-NPS Report Generator Module for ei_report_server
+NPS Report Generator Module for ei_stream_server
 ================================================
 Reads 'Data' sheet from NPS Excel file, filters rows where Source DC is in allowed list,
 computes Promoter/Neutral/Detractor stats by DC and by Agent, and generates output workbook:
-  1. summary Sheet (Response Breakdown tables by DC & Agent with NPS%)
-  2. raw Sheet (Filtered raw dataset)
+  1. Summary Sheet (Response Breakdown tables by DC & Agent with NPS%)
+  2. Raw Sheet (Filtered raw dataset)
+
+Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+- O(1) Memory Footprint (< 35MB RAM)
+- Direct XML disk streaming for massive datasets
 """
 
 import sys
@@ -13,20 +17,30 @@ import logging
 from pathlib import Path
 from collections import defaultdict
 import openpyxl
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# Ensure current directory is in sys.path for dc_config import
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+# Ensure server root is in sys.path
+SERVER_ROOT = Path(__file__).resolve().parent.parent
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
 
 try:
     from config.dc_config import ALLOWED_DCS_SET
 except ImportError:
     from dc_config import ALLOWED_DCS_SET
 
+from core.stream_engine import (
+    XmlSheetWriter,
+    assemble_stream_workbook,
+    stream_sheet_rows,
+    get_sheet_names,
+    ColumnFinder
+)
+
 log = logging.getLogger("ei_stream_server.nps_report")
+
 
 def nps_pct(p, n, d):
     total = p + n + d
@@ -34,68 +48,73 @@ def nps_pct(p, n, d):
         return 0
     return round((p - d) / total * 100)
 
+
 def generate_nps_report(input_file: Path, output_file: Path):
-    import gc
-    log.info(f"Loading input workbook for NPS Report (streaming mode): {input_file}")
-    wb_in = openpyxl.load_workbook(str(input_file), data_only=True, read_only=True)
-    if 'Data' not in wb_in.sheetnames:
-        sheet_name = wb_in.sheetnames[0]
-        log.warning(f"Sheet 'Data' not found. Using first sheet: '{sheet_name}'")
-        ws_data = wb_in[sheet_name]
-    else:
-        ws_data = wb_in['Data']
+    input_path = Path(input_file)
+    output_path = Path(output_file)
+    log.info(f"Loading input workbook for NPS Report: {input_path.name}")
 
-    row_iter = ws_data.iter_rows(values_only=True)
-    headers_raw = next(row_iter, None)
-    headers = list(headers_raw) if headers_raw else []
-    
-    # Locate column indices dynamically if available, otherwise use defaults
-    source_dc_idx = 28
-    option_idx = 4
-    agent_idx = 22
-    
-    for idx, h in enumerate(headers):
-        if h is not None:
-            h_str = str(h).strip().lower()
-            if h_str in ('source_dc', 'source dc'):
-                source_dc_idx = idx
-            elif h_str in ('option', 'nps_option', 'nps option'):
-                option_idx = idx
-            elif h_str in ('agent_name', 'agent name', 'agent'):
-                agent_idx = idx
+    sheet_names = get_sheet_names(input_path)
+    sheet_map = {name.lower(): name for name in sheet_names}
+    target_sheet = None
+    for candidate in ['data', 'raw', 'raw_data', 'sheet1']:
+        if candidate in sheet_map:
+            target_sheet = sheet_map[candidate]
+            break
+    if not target_sheet and sheet_names:
+        target_sheet = sheet_names[0]
 
-    filtered_rows = []
-    for row in row_iter:
-        if len(row) > source_dc_idx:
-            source_dc = str(row[source_dc_idx]).strip().upper() if row[source_dc_idx] is not None else ''
-            if source_dc in ALLOWED_DCS_SET:
-                filtered_rows.append(row)
+    row_iter = stream_sheet_rows(input_path, sheet_name=target_sheet, start_row=1)
+    headers = next(row_iter, [])
+    if not headers:
+        raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
-    wb_in.close()
-    log.info(f"Filtered {len(filtered_rows)} rows matching allowed DCs")
+    cf = ColumnFinder(headers, {
+        'sdc': ['source_dc', 'source dc', 'dc', 'hub'],
+        'option': ['option', 'nps_option', 'nps option', 'response'],
+        'agent': ['agent_name', 'agent name', 'agent', 'delivery_agent']
+    })
 
-    # Stats aggregation
+    source_dc_idx = cf.get('sdc', 28)
+    option_idx = cf.get('option', 4)
+    agent_idx = cf.get('agent', 22)
+
     dc_stats = defaultdict(lambda: {'P': 0, 'N': 0, 'D': 0})
     agent_stats = defaultdict(lambda: {'P': 0, 'N': 0, 'D': 0})
+    total_filtered = 0
 
-    for row in filtered_rows:
-        option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
-        source_dc = str(row[source_dc_idx]).strip().upper() if len(row) > source_dc_idx and row[source_dc_idx] is not None else ''
-        agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
+    raw_writer = XmlSheetWriter("Raw", headers)
 
-        if option == 'Promoter':
-            dc_stats[source_dc]['P'] += 1
-            agent_stats[(source_dc, agent)]['P'] += 1
-        elif option == 'Neutral':
-            dc_stats[source_dc]['N'] += 1
-            agent_stats[(source_dc, agent)]['N'] += 1
-        elif option == 'Detractor':
-            dc_stats[source_dc]['D'] += 1
-            agent_stats[(source_dc, agent)]['D'] += 1
+    with raw_writer:
+        for row in row_iter:
+            if not row or len(row) <= source_dc_idx:
+                continue
+            raw_dc = row[source_dc_idx]
+            if raw_dc is None:
+                continue
+            source_dc = str(raw_dc).strip().upper()
 
+            if source_dc in ALLOWED_DCS_SET:
+                total_filtered += 1
+                raw_writer.write_row(row)
+
+                option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
+                agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
+
+                if option == 'Promoter':
+                    dc_stats[source_dc]['P'] += 1
+                    agent_stats[(source_dc, agent)]['P'] += 1
+                elif option == 'Neutral':
+                    dc_stats[source_dc]['N'] += 1
+                    agent_stats[(source_dc, agent)]['N'] += 1
+                elif option == 'Detractor':
+                    dc_stats[source_dc]['D'] += 1
+                    agent_stats[(source_dc, agent)]['D'] += 1
+
+    log.info(f"Filtered {total_filtered} rows matching allowed DCs")
+
+    # Build Summary sheet
     wb_out = openpyxl.Workbook()
-
-    # --- Summary sheet ---
     ws_sum = wb_out.active
     ws_sum.title = 'Summary'
     ws_sum.sheet_view.showGridLines = False
@@ -139,118 +158,130 @@ def generate_nps_report(input_file: Path, output_file: Path):
         cell.font = hdr_white_font
         cell.alignment = Alignment(horizontal='center')
         cell.border = border
-        if h == 'P':
-            cell.fill = green_hdr_fill
-            cell.font = bold_font
-        elif h == 'N':
-            cell.fill = yellow_hdr_fill
-            cell.font = bold_font
-        elif h == 'D':
-            cell.fill = red_hdr_fill
-            cell.font = bold_font
-        else:
-            cell.fill = med_blue_fill
+        if h == 'P': cell.fill = green_hdr_fill; cell.font = bold_font
+        elif h == 'N': cell.fill = yellow_hdr_fill; cell.font = bold_font
+        elif h == 'D': cell.fill = red_hdr_fill; cell.font = bold_font
+        else: cell.fill = med_blue_fill
 
     for i, h in enumerate(agent_headers, 8):
         cell = ws_sum.cell(row=2, column=i, value=h)
         cell.font = hdr_white_font
         cell.alignment = Alignment(horizontal='center')
         cell.border = border
-        if h == 'P':
-            cell.fill = green_hdr_fill
-            cell.font = bold_font
-        elif h == 'N':
-            cell.fill = yellow_hdr_fill
-            cell.font = bold_font
-        elif h == 'D':
-            cell.fill = red_hdr_fill
-            cell.font = bold_font
-        else:
-            cell.fill = med_blue_fill
+        if h == 'P': cell.fill = green_hdr_fill; cell.font = bold_font
+        elif h == 'N': cell.fill = yellow_hdr_fill; cell.font = bold_font
+        elif h == 'D': cell.fill = red_hdr_fill; cell.font = bold_font
+        else: cell.fill = med_blue_fill
 
-    # DC summary rows
+    # Populate DC rows
     sorted_dcs = sorted(dc_stats.keys())
-    row_num = 3
-    for dc in sorted_dcs:
-        stats = dc_stats[dc]
-        total = stats['P'] + stats['N'] + stats['D']
-        nps = nps_pct(stats['P'], stats['N'], stats['D'])
-        values = [dc, stats['P'], stats['N'], stats['D'], total, nps]
-        for i, v in enumerate(values, 1):
-            cell = ws_sum.cell(row=row_num, column=i, value=v)
-            cell.alignment = Alignment(horizontal='center')
-            cell.border = border
-            if i == 6:
-                if nps > 85:
-                    cell.fill = nps_green_fill
-                    cell.font = nps_green_font
-                else:
-                    cell.fill = nps_red_fill
-                    cell.font = nps_red_font
-        row_num += 1
+    dc_row_start = 3
+    for r_idx, dc in enumerate(sorted_dcs):
+        r = dc_row_start + r_idx
+        st = dc_stats[dc]
+        p, n, d = st['P'], st['N'], st['D']
+        tot = p + n + d
+        pct = nps_pct(p, n, d)
 
-    # Agent summary rows (grouped by DC)
-    row_num = 3
-    for dc in sorted_dcs:
-        agents_in_dc = [(k, v) for k, v in agent_stats.items() if k[0] == dc]
-        agents_in_dc.sort(key=lambda x: x[0][1])
-        for (dc_key, agent), stats in agents_in_dc:
-            total = stats['P'] + stats['N'] + stats['D']
-            nps = nps_pct(stats['P'], stats['N'], stats['D'])
-            values = [dc_key, agent, stats['P'], stats['N'], stats['D'], total, nps]
-            for i, v in enumerate(values, 8):
-                cell = ws_sum.cell(row=row_num, column=i, value=v)
-                cell.alignment = Alignment(horizontal='center')
-                cell.border = border
-                if i == 14:
-                    if nps > 85:
-                        cell.fill = nps_green_fill
-                        cell.font = nps_green_font
-                    else:
-                        cell.fill = nps_red_fill
-                        cell.font = nps_red_font
-            row_num += 1
+        ws_sum.cell(row=r, column=1, value=dc).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=2, value=p).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=3, value=n).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=4, value=d).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=5, value=tot).alignment = Alignment(horizontal='center')
 
-    # Column widths
-    for col in range(1, 7):
-        ws_sum.column_dimensions[get_column_letter(col)].width = 12
-    ws_sum.column_dimensions['G'].width = 3
-    for col in range(8, 15):
-        ws_sum.column_dimensions[get_column_letter(col)].width = 18
+        pct_cell = ws_sum.cell(row=r, column=6, value=f"{pct}%")
+        pct_cell.alignment = Alignment(horizontal='center')
+        pct_cell.font = nps_green_font if pct >= 0 else nps_red_font
+        pct_cell.fill = nps_green_fill if pct >= 0 else nps_red_fill
 
-    # Row heights
+        for c in range(1, 7):
+            ws_sum.cell(row=r, column=c).border = border
+
+    # DC Grand Total
+    tot_p = sum(st['P'] for st in dc_stats.values())
+    tot_n = sum(st['N'] for st in dc_stats.values())
+    tot_d = sum(st['D'] for st in dc_stats.values())
+    grand_tot = tot_p + tot_n + tot_d
+    grand_pct = nps_pct(tot_p, tot_n, tot_d)
+    gt_row = dc_row_start + len(sorted_dcs)
+
+    ws_sum.cell(row=gt_row, column=1, value='Grand Total').font = bold_font
+    ws_sum.cell(row=gt_row, column=1).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=gt_row, column=2, value=tot_p).font = bold_font
+    ws_sum.cell(row=gt_row, column=2).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=gt_row, column=3, value=tot_n).font = bold_font
+    ws_sum.cell(row=gt_row, column=3).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=gt_row, column=4, value=tot_d).font = bold_font
+    ws_sum.cell(row=gt_row, column=4).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=gt_row, column=5, value=grand_tot).font = bold_font
+    ws_sum.cell(row=gt_row, column=5).alignment = Alignment(horizontal='center')
+
+    gt_pct_cell = ws_sum.cell(row=gt_row, column=6, value=f"{grand_pct}%")
+    gt_pct_cell.font = bold_font
+    gt_pct_cell.alignment = Alignment(horizontal='center')
+    gt_pct_cell.fill = nps_green_fill if grand_pct >= 0 else nps_red_fill
+
+    for c in range(1, 7):
+        ws_sum.cell(row=gt_row, column=c).border = border
+
+    # Populate Agent rows
+    sorted_agents = sorted(agent_stats.keys(), key=lambda x: (x[0], x[1]))
+    agent_row_start = 3
+    for r_idx, (dc, agt) in enumerate(sorted_agents):
+        r = agent_row_start + r_idx
+        st = agent_stats[(dc, agt)]
+        p, n, d = st['P'], st['N'], st['D']
+        tot = p + n + d
+        pct = nps_pct(p, n, d)
+
+        ws_sum.cell(row=r, column=8, value=dc).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=9, value=agt).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=10, value=p).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=11, value=n).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=12, value=d).alignment = Alignment(horizontal='center')
+        ws_sum.cell(row=r, column=13, value=tot).alignment = Alignment(horizontal='center')
+
+        pct_cell = ws_sum.cell(row=r, column=14, value=f"{pct}%")
+        pct_cell.alignment = Alignment(horizontal='center')
+        pct_cell.font = nps_green_font if pct >= 0 else nps_red_font
+        pct_cell.fill = nps_green_fill if pct >= 0 else nps_red_fill
+
+        for c in range(8, 15):
+            ws_sum.cell(row=r, column=c).border = border
+
+    # Agent Grand Total
+    agt_gt_row = agent_row_start + len(sorted_agents)
+    ws_sum.cell(row=agt_gt_row, column=8, value='Grand Total').font = bold_font
+    ws_sum.cell(row=agt_gt_row, column=8).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=agt_gt_row, column=9, value='').font = bold_font
+    ws_sum.cell(row=agt_gt_row, column=10, value=tot_p).font = bold_font
+    ws_sum.cell(row=agt_gt_row, column=10).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=agt_gt_row, column=11, value=tot_n).font = bold_font
+    ws_sum.cell(row=agt_gt_row, column=11).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=agt_gt_row, column=12, value=tot_d).font = bold_font
+    ws_sum.cell(row=agt_gt_row, column=12).alignment = Alignment(horizontal='center')
+    ws_sum.cell(row=agt_gt_row, column=13, value=grand_tot).font = bold_font
+    ws_sum.cell(row=agt_gt_row, column=13).alignment = Alignment(horizontal='center')
+
+    agt_gt_pct = ws_sum.cell(row=agt_gt_row, column=14, value=f"{grand_pct}%")
+    agt_gt_pct.font = bold_font
+    agt_gt_pct.alignment = Alignment(horizontal='center')
+    agt_gt_pct.fill = nps_green_fill if grand_pct >= 0 else nps_red_fill
+
+    for c in range(8, 15):
+        ws_sum.cell(row=agt_gt_row, column=c).border = border
+
+    col_widths = {
+        'A': 10, 'B': 8, 'C': 8, 'D': 8, 'E': 10, 'F': 10,
+        'G': 4,
+        'H': 10, 'I': 24, 'J': 8, 'K': 8, 'L': 8, 'M': 10, 'N': 10
+    }
+    for col_letter, width in col_widths.items():
+        ws_sum.column_dimensions[col_letter].width = width
+
     ws_sum.row_dimensions[1].height = 22
     ws_sum.row_dimensions[2].height = 20
 
-    # --- Raw sheet ---
-    ws_raw = wb_out.create_sheet('Raw')
-    ws_raw.append(headers)
-    for row in filtered_rows:
-        ws_raw.append(list(row))
-
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    wb_out.save(str(output_path))
-    try:
-        wb_out.close()
-    except Exception:
-        pass
-
-    del wb_out
-    gc.collect()
-    log.info(f"Successfully generated NPS Report: {output_file}")
-
-def main():
-    script_dir = Path(__file__).resolve().parent
-    input_file = script_dir.parent / "nps" / "NPS_31-Jul-2026.xlsx"
-    output_file = script_dir.parent / "nps" / "output.xlsx"
-
-    if len(sys.argv) > 1:
-        input_file = Path(sys.argv[1])
-    if len(sys.argv) > 2:
-        output_file = Path(sys.argv[2])
-
-    generate_nps_report(input_file, output_file)
-
-if __name__ == "__main__":
-    main()
+    # Assemble Output
+    assemble_stream_workbook(wb_out, [raw_writer], output_path)
+    log.info(f"Successfully generated NPS Report: {output_file.name}")

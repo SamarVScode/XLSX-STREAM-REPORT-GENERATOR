@@ -7,16 +7,12 @@ computes summary stats by Source DC, and generates output workbook:
   1. Summary Sheet (VMS Adherence Summary Table with % and color highlights)
   2. Raw Sheet (Full filtered dataset)
 
-Uses Zero-Memory Streaming Architecture:
-- Direct XML disk streaming for massive (200k+ rows) datasets
-- Calamine / openpyxl read_only stream parsing
-- Memory footprint < 35MB RAM under full load (Prevents Render OOM Crashes)
+Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+- O(1) Memory Footprint (< 35MB RAM)
+- Fast Rust / openpyxl stream reader + direct disk XML streaming
 """
 
-import io
-import math
-import zipfile
-import tempfile
+import sys
 import logging
 from pathlib import Path
 from collections import defaultdict
@@ -25,10 +21,22 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# Ensure server root is in sys.path
+SERVER_ROOT = Path(__file__).resolve().parent.parent
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
+
 try:
     from config.dc_config import ALLOWED_DCS_SET_LOWER
 except ImportError:
     from dc_config import ALLOWED_DCS_SET_LOWER
+
+from core.stream_engine import (
+    XmlSheetWriter,
+    assemble_stream_workbook,
+    stream_sheet_rows,
+    inspect_spreadsheet_headers
+)
 
 log = logging.getLogger("ei_stream_server.vms_adherence_report")
 
@@ -41,114 +49,59 @@ def find_col(headers, names):
     raise Exception(f'Column not found: {names}')
 
 
-def esc(val):
-    if val is None:
-        return ""
-    s = str(val)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
-
 def generate_vms_adherence_report(input_file: Path, output_file: Path):
     input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Loading input workbook for VMS Adherence Report (Zero-Memory Stream Mode): {input_path}")
+    log.info(f"Loading input workbook for VMS Adherence Report (Stream Mode): {input_path}")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_raw_xml = Path(tempfile.gettempdir()) / f"temp_vms_raw_{output_path.stem}.xml"
-    f_raw = open(temp_raw_xml, 'wb')
-    f_raw.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+    # Inspect headers
+    headers = inspect_spreadsheet_headers(input_path)
+    if not headers:
+        # Fallback via first row iterator
+        row_iter = stream_sheet_rows(input_path, start_row=1)
+        headers = next(row_iter, [])
 
-    stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
-    total_processed = 0
-    total_filtered = 0
-    raw_row_num = 2
-    raw_chunk = []
+    if not headers:
+        raise ValueError(f"Input file is empty: {input_path}")
 
-    # Stream reader using openpyxl read_only
-    in_wb = openpyxl.load_workbook(str(input_path), data_only=True, read_only=True)
-    target_sheet = None
-    sheet_map = {name.lower(): name for name in in_wb.sheetnames}
-    for candidate in ['raw', 'raw_data', 'data', 'vms', 'sheet1']:
-        if candidate in sheet_map:
-            target_sheet = sheet_map[candidate]
-            break
-    if not target_sheet and in_wb.sheetnames:
-        target_sheet = in_wb.sheetnames[0]
-
-    in_ws = in_wb[target_sheet]
-    row_iter = in_ws.iter_rows(values_only=True)
-    header_row = next(row_iter, None)
-    if not header_row:
-        in_wb.close()
-        f_raw.close()
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    headers = list(header_row)
     source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
     vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
 
-    # Write Raw header XML
-    r_hdr_xml = ['<row r="1">']
-    for c_i, h_val in enumerate(headers, 1):
-        r_hdr_xml.append(f'<c r="{get_column_letter(c_i)}1" t="inlineStr"><is><t>{esc(h_val)}</t></is></c>')
-    r_hdr_xml.append('</row>')
-    f_raw.write(''.join(r_hdr_xml).encode('utf-8'))
+    stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
+    total_filtered = 0
 
-    for row in row_iter:
-        total_processed += 1
-        if len(row) <= source_dc_idx:
-            continue
-        raw_dc = row[source_dc_idx]
-        if raw_dc is None:
-            continue
-        dc_clean = str(raw_dc).strip().lower()
+    # 1. Stream Raw data directly to disk XML (0 MB RAM)
+    raw_writer = XmlSheetWriter("Raw", headers)
+    with raw_writer:
+        for row in stream_sheet_rows(input_path, start_row=2):
+            if not row or len(row) <= source_dc_idx:
+                continue
+            raw_dc = row[source_dc_idx]
+            if raw_dc is None:
+                continue
+            dc_clean = str(raw_dc).strip().lower()
 
-        if dc_clean in ALLOWED_DCS_SET_LOWER:
-            total_filtered += 1
-            
-            # Aggregate stats
-            status = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
-            if status == 'done':
-                stats[dc_clean]['done'] += 1
-            else:
-                stats[dc_clean]['not_done'] += 1
-
-            # Format Raw XML row
-            r_xml = [f'<row r="{raw_row_num}">']
-            for idx, val in enumerate(row):
-                col_let = get_column_letter(idx + 1)
-                if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
-                    r_xml.append(f'<c r="{col_let}{raw_row_num}"><v>{val}</v></c>')
+            if dc_clean in ALLOWED_DCS_SET_LOWER:
+                total_filtered += 1
+                status = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
+                if status == 'done':
+                    stats[dc_clean]['done'] += 1
                 else:
-                    r_xml.append(f'<c r="{col_let}{raw_row_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
-            r_xml.append('</row>')
-            raw_chunk.append(''.join(r_xml))
-            raw_row_num += 1
+                    stats[dc_clean]['not_done'] += 1
 
-            if len(raw_chunk) >= 1000:
-                f_raw.write(''.join(raw_chunk).encode('utf-8'))
-                raw_chunk.clear()
+                raw_writer.write_row(row)
 
-    if raw_chunk:
-        f_raw.write(''.join(raw_chunk).encode('utf-8'))
+    log.info(f"Filtered {total_filtered} matching rows.")
 
-    f_raw.write(b'</sheetData></worksheet>')
-    f_raw.close()
-    in_wb.close()
-
-    log.info(f"Processed {total_processed} source rows. Filtered {total_filtered} matching rows.")
-
-    # Compute summary per Source_DC
+    # 2. Build styled Summary sheet in memory (~40 KB RAM)
     sorted_dcs = sorted(stats.keys())
     summary_rows = []
-
     for dc in sorted_dcs:
         d = stats[dc]
         total = d['done'] + d['not_done']
         done_pct = d['done'] / total if total > 0 else 0
         summary_rows.append([dc.upper(), total, d['done'], d['not_done'], done_pct])
 
-    # Build tiny openpyxl Summary sheet (~30 rows, ~40 KB RAM)
     wb_out = Workbook()
     ws_sum = wb_out.active
     ws_sum.title = 'Summary'
@@ -184,15 +137,14 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
     red_font = Font(bold=True, size=9, color='FF991b1b')
     normal_font = Font(size=9)
     header_font = Font(bold=True, size=10, color='FFFFFFFF')
-
     center = Alignment(horizontal='center', vertical='center')
 
-    # Fill cells white
+    # Fill white background
     for r in range(1, len(summary_rows) + 10):
         for c in range(1, 8):
             ws_sum.cell(row=r, column=c).fill = white_fill
 
-    # Row 1: Banner
+    # Banner
     ws_sum.cell(row=1, column=1, value='VMS Adherence Summary')
     ws_sum.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
     banner_cell = ws_sum.cell(row=1, column=1)
@@ -201,7 +153,7 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
     banner_cell.alignment = center
     ws_sum.row_dimensions[1].height = 22
 
-    # Row 3: Headers
+    # Headers
     sum_headers = ['Source DC', 'Total', 'VMS Done', 'VMS Not Done', 'Done %']
     for i, h in enumerate(sum_headers, 1):
         cell = ws_sum.cell(row=3, column=i, value=h)
@@ -214,7 +166,7 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
     # Data rows
     for r_idx, srow in enumerate(summary_rows):
         row_num = 4 + r_idx
-        is_alt = r_idx % 2 == 1
+        is_alt = (r_idx % 2 == 1)
         fill = alt_fill if is_alt else white_fill
 
         for c_idx, val in enumerate(srow, 1):
@@ -254,51 +206,6 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
                 max_len = max(max_len, len(str(val)))
         ws_sum.column_dimensions[get_column_letter(col)].width = max_len + 4
 
-    # Save summary workbook to in-memory bytes
-    temp_sum = io.BytesIO()
-    wb_out.save(temp_sum)
-    temp_sum.seek(0)
-    wb_out.close()
-
-    # Stream assemble final output ZIP (.xlsx)
-    z_in = zipfile.ZipFile(temp_sum, 'r')
-    z_out = zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED)
-
-    for item in z_in.infolist():
-        if item.filename == '[Content_Types].xml':
-            ct = z_in.read(item.filename).decode('utf-8')
-            ct = ct.replace('</Types>', '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
-            z_out.writestr(item.filename, ct)
-        elif item.filename == 'xl/workbook.xml':
-            wb_xml = z_in.read(item.filename).decode('utf-8')
-            wb_xml = wb_xml.replace('</sheets>', '<sheet name="Raw" sheetId="2" r:id="rId2"/></sheets>')
-            z_out.writestr(item.filename, wb_xml)
-        elif item.filename == 'xl/_rels/workbook.xml.rels':
-            wb_rels = z_in.read(item.filename).decode('utf-8')
-            wb_rels = wb_rels.replace('</Relationships>', '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>')
-            z_out.writestr(item.filename, wb_rels)
-        else:
-            z_out.writestr(item, z_in.read(item.filename))
-
-    # Stream Raw sheet from disk directly into sheet2.xml
-    with z_out.open('xl/worksheets/sheet2.xml', 'w', force_zip64=True) as zf_entry:
-        with open(temp_raw_xml, 'rb') as f_raw_in:
-            while True:
-                buf = f_raw_in.read(1024 * 1024)
-                if not buf:
-                    break
-                zf_entry.write(buf)
-
-    z_out.close()
-    z_in.close()
-
-    # Clean up temp raw XML file
-    if temp_raw_xml.exists():
-        try:
-            temp_raw_xml.unlink()
-        except Exception:
-            pass
-
-    import gc
-    gc.collect()
-    log.info(f"Successfully generated VMS Adherence Report (Zero-Memory Stream): {output_file.name} ({total_filtered} rows)")
+    # 3. Assemble final .xlsx in 1 line
+    assemble_stream_workbook(wb_out, [raw_writer], output_path)
+    log.info(f"Successfully generated VMS Adherence Report: {output_file.name} ({total_filtered} rows)")
