@@ -359,4 +359,8 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         out_wb.close()
     except Exception:
         pass
+
+    del out_wb
+    import gc
+    gc.collect()
     log.info(f"Successfully generated Forward Pendency Report: {output_file}")

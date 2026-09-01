@@ -282,5 +282,9 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
         wb.close()
     except Exception:
         pass
+
+    del wb
+    import gc
+    gc.collect()
     log.info(f"Successfully generated Untraceable Report: {output_path}")
     return output_path

@@ -346,15 +346,15 @@ def generate_eob_report(input_file: Path, output_file: Path):
     ws_raw = wb.create_sheet(title="Raw")
     ws_raw.views.sheetView[0].showGridLines = True
 
-    for c_idx, h in enumerate(raw_export_df.columns, start=1):
-        cell = ws_raw.cell(row=1, column=c_idx, value=h)
+    ws_raw.append(list(raw_export_df.columns))
+    for c_idx in range(1, len(raw_export_df.columns) + 1):
+        cell = ws_raw.cell(row=1, column=c_idx)
         cell.font = font_header
         cell.fill = fill_header
         cell.alignment = align_center
 
-    for r_idx, row in enumerate(raw_export_df.itertuples(index=False), start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws_raw.cell(row=r_idx, column=c_idx, value=val)
+    for row in raw_export_df.itertuples(index=False):
+        ws_raw.append(list(row))
 
     # Save Output
     wb.save(output_path)
@@ -362,4 +362,8 @@ def generate_eob_report(input_file: Path, output_file: Path):
         wb.close()
     except Exception:
         pass
+
+    del wb, raw_export_df
+    import gc
+    gc.collect()
     log.info(f"Successfully generated EOB Report: {output_path.name}")

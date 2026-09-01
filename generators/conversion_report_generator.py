@@ -320,4 +320,7 @@ def generate_conversion_report(input_file: Path, output_file: Path, sub_type: st
             style_sheet(ws)
     wb.save(output_file)
     wb.close()
+    del wb, dc_df, agent_df
+    import gc
+    gc.collect()
     log.info(f"Successfully generated Conversion Report [{label}]: {output_file}")

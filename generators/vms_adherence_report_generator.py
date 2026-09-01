@@ -38,45 +38,66 @@ def find_col(headers, names):
 
 
 def generate_vms_adherence_report(input_file: Path, output_file: Path):
-    log.info(f"Loading input workbook for VMS Adherence Report: {input_file}")
+    import gc
+    log.info(f"Loading input workbook for VMS Adherence Report (streaming mode): {input_file}")
+
+    wb_out = openpyxl.Workbook()
+    wb_out.remove(wb_out.active)
+    ws_raw_out = wb_out.create_sheet('Raw')
+
+    headers = []
+    source_dc_idx = 0
+    vms_status_idx = 1
+    stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
+    total_streamed = 0
+
     try:
         from python_calamine import CalamineWorkbook
         calamine_wb = CalamineWorkbook.from_path(str(input_file))
         ws_raw = calamine_wb.get_sheet_by_name('Raw') if 'Raw' in calamine_wb.sheet_names else calamine_wb.get_sheet_by_index(0)
-        raw_python_rows = ws_raw.to_python()
-        headers = raw_python_rows[0] if raw_python_rows else []
-        rows = raw_python_rows[1:] if len(raw_python_rows) > 1 else []
+        row_iter = iter(ws_raw.iter_rows())
+        headers_raw = next(row_iter, None)
+        if headers_raw:
+            headers = list(headers_raw)
+            source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
+            vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
+            ws_raw_out.append(headers)
+
+            for row in row_iter:
+                if len(row) > source_dc_idx and str(row[source_dc_idx] or '').strip().lower() in ALLOWED_DCS_SET_LOWER:
+                    ws_raw_out.append(list(row))
+                    total_streamed += 1
+                    status = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
+                    dc_key = str(row[source_dc_idx] or '').strip().lower()
+                    if status == 'done':
+                        stats[dc_key]['done'] += 1
+                    else:
+                        stats[dc_key]['not_done'] += 1
     except Exception as e:
-        log.warning(f"Calamine read failed: {e}. Falling back to openpyxl.")
-        wb_in = openpyxl.load_workbook(str(input_file), data_only=True)
+        log.warning(f"Calamine stream failed: {e}. Falling back to openpyxl.")
+        wb_in = openpyxl.load_workbook(str(input_file), data_only=True, read_only=True)
         ws_raw = wb_in['Raw'] if 'Raw' in wb_in.sheetnames else wb_in.active
-        headers = [cell.value for cell in ws_raw[1]]
-        rows = [list(row) for row in ws_raw.iter_rows(min_row=2, values_only=True)]
+        row_iter = ws_raw.iter_rows(values_only=True)
+        headers_raw = next(row_iter, None)
+        if headers_raw:
+            headers = list(headers_raw)
+            source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
+            vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
+            ws_raw_out.append(headers)
+
+            for row in row_iter:
+                if len(row) > source_dc_idx and str(row[source_dc_idx] or '').strip().lower() in ALLOWED_DCS_SET_LOWER:
+                    ws_raw_out.append(list(row))
+                    total_streamed += 1
+                    status = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
+                    dc_key = str(row[source_dc_idx] or '').strip().lower()
+                    if status == 'done':
+                        stats[dc_key]['done'] += 1
+                    else:
+                        stats[dc_key]['not_done'] += 1
         wb_in.close()
 
-    source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
-    vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
-
-    # Filter rows to allowed DCs using dc_config
-    filtered_rows = [
-        r for r in rows
-        if len(r) > source_dc_idx and str(r[source_dc_idx] or '').strip().lower() in ALLOWED_DCS_SET_LOWER
-    ]
-
-    log.info(f"Filtered {len(filtered_rows)} rows matching allowed DCs")
-
-    # Compute summary per Source_DC
-    stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
-
-    for row in filtered_rows:
-        if len(row) <= vms_status_idx:
-            continue
-        status = str(row[vms_status_idx] or '').strip().lower()
-        dc_key = str(row[source_dc_idx] or '').strip().lower()
-        if status == 'done':
-            stats[dc_key]['done'] += 1
-        else:
-            stats[dc_key]['not_done'] += 1
+    log.info(f"Streamed {total_streamed} rows matching allowed DCs into Raw tab")
 
     sorted_dcs = sorted(stats.keys())
     summary_rows = []
@@ -119,39 +140,39 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
     red_fill = PatternFill(start_color='FFfee2e2', end_color='FFfee2e2', fill_type='solid')
     raw_header_fill = PatternFill(start_color='FF334155', end_color='FF334155', fill_type='solid')
 
-    white_font = Font(bold=True, size=10, color='FFFFFFFF')
-    green_font = Font(bold=True, size=9, color='FF166534')
-    yellow_font = Font(bold=True, size=9, color='FF854d0e')
-    red_font = Font(bold=True, size=9, color='FF991b1b')
-    normal_font = Font(size=9)
-    header_font = Font(bold=True, size=10, color='FFFFFFFF')
-    raw_header_font = Font(bold=True, color='FFFFFFFF')
+    banner_font = Font(name='Calibri', size=13, bold=True, color='FFFFFFFF')
+    header_font = Font(name='Calibri', size=10, bold=True, color='FFFFFFFF')
+    data_font = Font(name='Calibri', size=10, color='FF1e1b4b')
+    total_font = Font(name='Calibri', size=10, bold=True, color='FF1e1b4b')
+    green_font = Font(name='Calibri', size=10, bold=True, color='FF15803d')
+    yellow_font = Font(name='Calibri', size=10, bold=True, color='FFa16207')
+    red_font = Font(name='Calibri', size=10, bold=True, color='FFb91c1c')
+    raw_header_font = Font(name='Calibri', size=10, bold=True, color='FFFFFFFF')
 
     center = Alignment(horizontal='center', vertical='center')
-
-    wb_out = openpyxl.Workbook()
+    align_left = Alignment(horizontal='left', vertical='center')
+    align_right = Alignment(horizontal='right', vertical='center')
 
     # ===== Summary sheet =====
-    ws_sum = wb_out.active
-    ws_sum.title = 'Summary'
-    ws_sum.sheet_view.showGridLines = False
+    ws_sum = wb_out.create_sheet('Summary', 0)
+    ws_sum.sheet_view.showGridLines = True
 
-    # Fill cells white
-    for r in range(1, len(summary_rows) + 10):
-        for c in range(1, 8):
-            ws_sum.cell(row=r, column=c).fill = white_fill
+    ws_sum.merge_cells('A1:E1')
+    b_cell = ws_sum['A1']
+    b_cell.value = 'VMS ADHERENCE SUMMARY'
+    b_cell.font = banner_font
+    b_cell.fill = banner_fill
+    b_cell.alignment = center
+    ws_sum.row_dimensions[1].height = 30
 
-    # Row 1: Banner
-    ws_sum.cell(row=1, column=1, value='VMS Adherence Summary')
-    ws_sum.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
-    banner_cell = ws_sum.cell(row=1, column=1)
-    banner_cell.fill = banner_fill
-    banner_cell.font = white_font
-    banner_cell.alignment = center
-    ws_sum.row_dimensions[1].height = 22
+    for col in range(1, 6):
+        cell = ws_sum.cell(row=1, column=col)
+        cell.fill = banner_fill
+        cell.border = purple_border
 
-    # Row 3: Headers
-    sum_headers = ['Source DC', 'Total', 'VMS Done', 'VMS Not Done', 'Done %']
+    ws_sum.row_dimensions[2].height = 8
+
+    sum_headers = ['Source DC', 'Grand Total', 'Done', 'Not Done', 'Done %']
     for i, h in enumerate(sum_headers, 1):
         cell = ws_sum.cell(row=3, column=i, value=h)
         cell.fill = header_fill
@@ -160,25 +181,24 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
         cell.border = purple_border
     ws_sum.row_dimensions[3].height = 24
 
-    # Data rows
-    for r_idx, srow in enumerate(summary_rows):
-        row_num = 4 + r_idx
-        is_alt = r_idx % 2 == 1
-        fill = alt_fill if is_alt else white_fill
+    for idx, srow in enumerate(summary_rows):
+        row_num = idx + 4
+        fill = white_fill if idx % 2 == 0 else alt_fill
 
         for c_idx, val in enumerate(srow, 1):
             cell = ws_sum.cell(row=row_num, column=c_idx, value=val)
-            cell.alignment = center
-            cell.border = data_border
+            cell.font = data_font
             cell.fill = fill
-            cell.font = normal_font
+            cell.border = data_border
+            if c_idx == 1:
+                cell.alignment = align_left
+            elif c_idx == 5:
+                cell.number_format = '0.0%'
+                cell.alignment = center
+            else:
+                cell.number_format = '#,##0'
+                cell.alignment = align_right
 
-        for c in [2, 3, 4]:
-            ws_sum.cell(row=row_num, column=c).number_format = '#,##0'
-
-        ws_sum.cell(row=row_num, column=5).number_format = '0.0%'
-
-        # Done % color
         done_pct = srow[4]
         pct_cell = ws_sum.cell(row=row_num, column=5)
         pct_cell.font = Font(bold=True, size=9)
@@ -194,41 +214,43 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
 
         ws_sum.row_dimensions[row_num].height = 20
 
-    # Auto-fit columns
+    tot_row = len(summary_rows) + 4
+    tot_vals = ['Total', grand_total, grand_done, grand_not_done, grand_done_pct]
+    for c_idx, val in enumerate(tot_vals, 1):
+        cell = ws_sum.cell(row=tot_row, column=c_idx, value=val)
+        cell.font = total_font
+        cell.fill = alt_fill
+        cell.border = purple_border
+        if c_idx == 1:
+            cell.alignment = align_left
+        elif c_idx == 5:
+            cell.number_format = '0.0%'
+            cell.alignment = center
+        else:
+            cell.number_format = '#,##0'
+            cell.alignment = align_right
+    ws_sum.row_dimensions[tot_row].height = 22
+
     for col in range(1, 6):
-        max_len = len(str(sum_headers[col - 1]))
-        for r in range(4, 4 + len(summary_rows)):
-            val = ws_sum.cell(row=r, column=col).value
-            if val is not None:
-                max_len = max(max_len, len(str(val)))
-        ws_sum.column_dimensions[get_column_letter(col)].width = max_len + 4
+        ws_sum.column_dimensions[get_column_letter(col)].width = 16
 
-    # ===== Raw Data sheet =====
-    ws_raw_out = wb_out.create_sheet('Raw')
-
-    for i, h in enumerate(headers, 1):
-        cell = ws_raw_out.cell(row=1, column=i, value=h)
+    # Style Raw header
+    for i in range(1, len(headers) + 1):
+        cell = ws_raw_out.cell(row=1, column=i)
         cell.fill = raw_header_fill
         cell.font = raw_header_font
         cell.alignment = center
 
-    for r_idx, row in enumerate(filtered_rows, 2):
-        for c_idx, val in enumerate(row, 1):
-            ws_raw_out.cell(row=r_idx, column=c_idx, value=val)
-
-    for col in range(1, min(len(headers) + 1, 21)):
-        max_len = len(str(headers[col - 1])) if col - 1 < len(headers) else 10
-        for r in range(2, min(len(filtered_rows) + 1, 102)):
-            val = ws_raw_out.cell(row=r, column=col).value
-            if val is not None:
-                max_len = max(max_len, len(str(val)))
-        ws_raw_out.column_dimensions[get_column_letter(col)].width = min(max_len + 2, 30)
-
-    wb_out.save(str(output_file))
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb_out.save(str(output_path))
     try:
         wb_out.close()
     except Exception:
         pass
+
+    del wb_out
+    gc.collect()
     log.info(f"Successfully generated VMS Adherence Report: {output_file}")
 
 

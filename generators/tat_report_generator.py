@@ -38,64 +38,96 @@ def detect_status_col(headers):
     return 1
 
 def generate_tat_report(input_file: Path, output_file: Path):
+    import gc
     path = Path(input_file)
-    log.info(f"Loading input workbook for SCM TAT Report: {path}")
+    log.info(f"Loading input workbook for SCM TAT Report (streaming mode): {path}")
 
+    wb_out = openpyxl.Workbook()
+    wb_out.remove(wb_out.active)
+
+    ws_raw = wb_out.create_sheet('SCM TAT raw data')
+    hub_stats = defaultdict(lambda: {'Delivered': 0, 'OFD': 0, 'Undelivered': 0, 'Others': 0, 'Total': 0})
     headers = []
-    rows = []
+    hub_idx = 0
+    status_idx = 1
+    total_streamed = 0
 
     if HAS_CALAMINE:
         try:
             cal = CalamineWorkbook.from_path(str(path))
             sheet_map = {s.lower(): s for s in cal.sheet_names}
             target_sheet = sheet_map.get('data', cal.sheet_names[0])
-            raw_python_rows = cal.get_sheet_by_name(target_sheet).to_python()
-            if raw_python_rows:
-                headers = raw_python_rows[0]
-                rows = raw_python_rows[1:]
-        except Exception:
-            rows = []
+            cal_sheet = cal.get_sheet_by_name(target_sheet)
+            row_iter = iter(cal_sheet.iter_rows())
+            headers_raw = next(row_iter, None)
+            if headers_raw:
+                headers = list(headers_raw)
+                hub_idx = detect_hub_col(headers)
+                status_idx = detect_status_col(headers)
+                ws_raw.append(headers)
 
-    if not rows:
+                for r in row_iter:
+                    hub_val = str(r[hub_idx]).strip().lower() if (len(r) > hub_idx and r[hub_idx] is not None) else ''
+                    if hub_val in ALLOWED_DCS_SET_LOWER or 'all' in ALLOWED_DCS_SET_LOWER:
+                        ws_raw.append(list(r))
+                        total_streamed += 1
+
+                        hub = str(r[hub_idx]).strip().upper() if (len(r) > hub_idx and r[hub_idx] is not None) else 'UNKNOWN'
+                        raw_status = str(r[status_idx]).strip() if (len(r) > status_idx and r[status_idx] is not None) else ''
+                        status_clean = raw_status.upper()
+
+                        if 'DELIVERED' in status_clean and 'UNDELIVERED' not in status_clean:
+                            cat = 'Delivered'
+                        elif 'OFD' in status_clean or 'OUT FOR DELIVERY' in status_clean:
+                            cat = 'OFD'
+                        elif 'UNDELIVERED' in status_clean:
+                            cat = 'Undelivered'
+                        else:
+                            cat = 'Others'
+
+                        hub_stats[hub][cat] += 1
+                        hub_stats[hub]['Total'] += 1
+        except Exception as ex:
+            log.warning(f"Calamine stream failed: {ex}. Falling back to openpyxl.")
+            headers = []
+
+    if not headers:
         wb_in = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
         ws_data = wb_in['Data'] if 'Data' in wb_in.sheetnames else wb_in.active
-        all_r = [list(r) for r in ws_data.iter_rows(values_only=True)]
-        if all_r:
-            headers = all_r[0]
-            rows = all_r[1:]
+        row_iter = ws_data.iter_rows(values_only=True)
+        headers_raw = next(row_iter, None)
+        if headers_raw:
+            headers = list(headers_raw)
+            hub_idx = detect_hub_col(headers)
+            status_idx = detect_status_col(headers)
+            ws_raw.append(headers)
+
+            for r in row_iter:
+                hub_val = str(r[hub_idx]).strip().lower() if (len(r) > hub_idx and r[hub_idx] is not None) else ''
+                if hub_val in ALLOWED_DCS_SET_LOWER or 'all' in ALLOWED_DCS_SET_LOWER:
+                    ws_raw.append(list(r))
+                    total_streamed += 1
+
+                    hub = str(r[hub_idx]).strip().upper() if (len(r) > hub_idx and r[hub_idx] is not None) else 'UNKNOWN'
+                    raw_status = str(r[status_idx]).strip() if (len(r) > status_idx and r[status_idx] is not None) else ''
+                    status_clean = raw_status.upper()
+
+                    if 'DELIVERED' in status_clean and 'UNDELIVERED' not in status_clean:
+                        cat = 'Delivered'
+                    elif 'OFD' in status_clean or 'OUT FOR DELIVERY' in status_clean:
+                        cat = 'OFD'
+                    elif 'UNDELIVERED' in status_clean:
+                        cat = 'Undelivered'
+                    else:
+                        cat = 'Others'
+
+                    hub_stats[hub][cat] += 1
+                    hub_stats[hub]['Total'] += 1
         wb_in.close()
 
-    hub_idx = detect_hub_col(headers)
-    status_idx = detect_status_col(headers)
+    log.info(f"Streamed {total_streamed} matching rows into SCM TAT raw data tab.")
 
-    filtered_rows = []
-    for r in rows:
-        hub_val = str(r[hub_idx]).strip().lower() if (len(r) > hub_idx and r[hub_idx] is not None) else ''
-        if hub_val in ALLOWED_DCS_SET_LOWER or 'all' in ALLOWED_DCS_SET_LOWER:
-            filtered_rows.append(r)
-
-    hub_stats = defaultdict(lambda: {'Delivered': 0, 'OFD': 0, 'Undelivered': 0, 'Others': 0, 'Total': 0})
-    for r in filtered_rows:
-        hub = str(r[hub_idx]).strip().upper() if (len(r) > hub_idx and r[hub_idx] is not None) else 'UNKNOWN'
-        raw_status = str(r[status_idx]).strip() if (len(r) > status_idx and r[status_idx] is not None) else ''
-        status_clean = raw_status.upper()
-
-        if 'DELIVERED' in status_clean and 'UNDELIVERED' not in status_clean:
-            cat = 'Delivered'
-        elif 'OFD' in status_clean or 'OUT FOR DELIVERY' in status_clean:
-            cat = 'OFD'
-        elif 'UNDELIVERED' in status_clean:
-            cat = 'Undelivered'
-        else:
-            cat = 'Others'
-
-        hub_stats[hub][cat] += 1
-        hub_stats[hub]['Total'] += 1
-
-    wb_out = openpyxl.Workbook()
-    wb_out.remove(wb_out.active)
-
-    ws_sum = wb_out.create_sheet('SCM tat performance summary')
+    ws_sum = wb_out.create_sheet('SCM tat performance summary', 0)
     ws_sum.sheet_view.showGridLines = True
 
     f_title = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
@@ -185,14 +217,14 @@ def generate_tat_report(input_file: Path, output_file: Path):
     for i, w in enumerate(widths, 1):
         ws_sum.column_dimensions[get_column_letter(i)].width = w
 
-    ws_raw = wb_out.create_sheet('SCM TAT raw data')
-    ws_raw.append(headers)
-    for r in filtered_rows:
-        ws_raw.append(r)
-
-    wb_out.save(str(output_file))
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb_out.save(str(output_path))
     try:
         wb_out.close()
     except Exception:
         pass
+
+    del wb_out
+    gc.collect()
     log.info(f"Successfully generated SCM TAT Report: {output_file}")

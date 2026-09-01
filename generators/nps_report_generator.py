@@ -35,8 +35,9 @@ def nps_pct(p, n, d):
     return round((p - d) / total * 100)
 
 def generate_nps_report(input_file: Path, output_file: Path):
-    log.info(f"Loading input workbook for NPS Report: {input_file}")
-    wb_in = openpyxl.load_workbook(str(input_file), data_only=True)
+    import gc
+    log.info(f"Loading input workbook for NPS Report (streaming mode): {input_file}")
+    wb_in = openpyxl.load_workbook(str(input_file), data_only=True, read_only=True)
     if 'Data' not in wb_in.sheetnames:
         sheet_name = wb_in.sheetnames[0]
         log.warning(f"Sheet 'Data' not found. Using first sheet: '{sheet_name}'")
@@ -44,7 +45,9 @@ def generate_nps_report(input_file: Path, output_file: Path):
     else:
         ws_data = wb_in['Data']
 
-    headers = [cell.value for cell in ws_data[1]]
+    row_iter = ws_data.iter_rows(values_only=True)
+    headers_raw = next(row_iter, None)
+    headers = list(headers_raw) if headers_raw else []
     
     # Locate column indices dynamically if available, otherwise use defaults
     source_dc_idx = 28
@@ -62,7 +65,7 @@ def generate_nps_report(input_file: Path, output_file: Path):
                 agent_idx = idx
 
     filtered_rows = []
-    for row in ws_data.iter_rows(min_row=2, values_only=True):
+    for row in row_iter:
         if len(row) > source_dc_idx:
             source_dc = str(row[source_dc_idx]).strip().upper() if row[source_dc_idx] is not None else ''
             if source_dc in ALLOWED_DCS_SET:
@@ -221,21 +224,20 @@ def generate_nps_report(input_file: Path, output_file: Path):
 
     # --- Raw sheet ---
     ws_raw = wb_out.create_sheet('Raw')
-    for i, h in enumerate(headers, 1):
-        cell = ws_raw.cell(row=1, column=i, value=h)
-        cell.font = hdr_white_font
-        cell.fill = med_blue_fill
-        cell.alignment = Alignment(horizontal='center')
+    ws_raw.append(headers)
+    for row in filtered_rows:
+        ws_raw.append(list(row))
 
-    for r_idx, row in enumerate(filtered_rows, 2):
-        for c_idx, val in enumerate(row, 1):
-            ws_raw.cell(row=r_idx, column=c_idx, value=val)
-
-    wb_out.save(str(output_file))
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb_out.save(str(output_path))
     try:
         wb_out.close()
     except Exception:
         pass
+
+    del wb_out
+    gc.collect()
     log.info(f"Successfully generated NPS Report: {output_file}")
 
 def main():
