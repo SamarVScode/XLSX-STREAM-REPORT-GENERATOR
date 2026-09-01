@@ -458,9 +458,18 @@ def write_agent_summary_tab(wb, filt_data_rows, track_idx, fwd_agt_idx, rev_agt_
         for col_idx, val in enumerate(row_data, start=1):
             ws.cell(row=row_idx, column=col_idx, value=val)
 
-    for r in range(1, len(output) + 1):
-        for c in [1, 2, 3, 5, 6, 7, 9, 10, 11]:
-            ws.cell(r, c).alignment = _center()
+    left_align = Alignment(horizontal="left", vertical="center")
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    for r in range(3, len(output) + 1):
+        # DC and Counts center aligned
+        for c in [1, 3, 5, 7, 9, 11]:
+            ws.cell(r, c).alignment = center_align
+            if c in [3, 7, 11] and ws.cell(r, c).value:
+                ws.cell(r, c).number_format = '#,##0'
+        # Agent names left aligned
+        for c in [2, 6, 10]:
+            ws.cell(r, c).alignment = left_align
 
     C_WARN_TITLE = "7C2D12"
     C_WARN_HDR   = "9A3412"
@@ -470,14 +479,14 @@ def write_agent_summary_tab(wb, filt_data_rows, track_idx, fwd_agt_idx, rev_agt_
         cell = ws.cell(r, c1)
         cell.fill = _fill(bg)
         cell.font = _font(C_HDR_FONT, bold=True, size=11)
-        cell.alignment = _center()
+        cell.alignment = center_align
 
     def _subhdr(r, c1, c2, bg):
         for c in range(c1, c2 + 1):
             cell = ws.cell(r, c)
             cell.fill = _fill(bg)
             cell.font = _font(C_HDR_FONT, bold=True)
-            cell.alignment = _center()
+            cell.alignment = center_align
 
     _title(1, 1, 3, C_FWD_TITLE)
     _title(1, 5, 7, C_REV_TITLE)
@@ -487,12 +496,20 @@ def write_agent_summary_tab(wb, filt_data_rows, track_idx, fwd_agt_idx, rev_agt_
     _subhdr(2, 9, 11, C_WARN_HDR)
 
     bd = _border(C_BORDER)
-    data_rows = len(output)
-    for r in range(1, data_rows + 1):
-        for c in [1,2,3, 5,6,7, 9,10,11]:
+    # Apply borders cleanly strictly to existing table rows
+    for r in range(1, len(fwd_items) + 3):
+        for c in [1, 2, 3]:
             ws.cell(r, c).border = bd
 
-    for c, w in [(1,10),(2,28),(3,8),(4,3),(5,10),(6,28),(7,8),(8,3),(9,10),(10,28),(11,8)]:
+    for r in range(1, len(rev_items) + 3):
+        for c in [5, 6, 7]:
+            ws.cell(r, c).border = bd
+
+    for r in range(1, len(warn_items) + 3):
+        for c in [9, 10, 11]:
+            ws.cell(r, c).border = bd
+
+    for c, w in [(1,12),(2,30),(3,10),(4,4),(5,12),(6,30),(7,10),(8,4),(9,12),(10,30),(11,10)]:
         ws.column_dimensions[get_column_letter(c)].width = w
 
 def generate_ei_report(source_file_path: str, output_file_path: str) -> str:
