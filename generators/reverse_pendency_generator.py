@@ -205,19 +205,20 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     import gc
 
     log.info(f"Reading workbook for Reverse Pendency (Zero-Memory Stream Mode): {input_file}")
-    wb = CalamineWorkbook.from_path(str(input_file))
+    wb = openpyxl.load_workbook(str(input_file), read_only=True, data_only=True)
 
-    target_sheet = wb.sheet_names[0]
+    target_sheet = wb.sheetnames[0]
     for cand in ['raw', 'raw_data', 'data']:
-        for s in wb.sheet_names:
+        for s in wb.sheetnames:
             if s.lower() == cand:
                 target_sheet = s
                 break
 
-    sheet = wb.get_sheet_by_name(target_sheet)
-    row_iter = sheet.iter_rows()
+    ws = wb[target_sheet]
+    row_iter = ws.iter_rows(values_only=True)
     header = next(row_iter, None)
     if not header:
+        wb.close()
         raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
     col_map = {str(h).strip().lower(): idx for idx, h in enumerate(header) if h is not None}
@@ -354,6 +355,7 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     f_p0.write(b'</sheetData></worksheet>')
     f_raw.close()
     f_p0.close()
+    wb.close()
 
     # Build Summary sheet in tiny openpyxl workbook (~70 rows, ~50 KB RAM)
     out_wb = Workbook()
