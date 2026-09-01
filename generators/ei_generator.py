@@ -408,82 +408,86 @@ def write_rev_ei_tab(wb, headers, filt_data_rows, track_idx):
         cell.alignment = _center()
         ws.column_dimensions[get_column_letter(col_idx)].width = 16
 
-def write_agent_summary_tab(wb, filt_data_rows, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx):
-    ws = wb.create_sheet('Agent Summary')
+C_WARN_TITLE = "991B1B"
+C_WARN_HDR   = "B91C1C"
+
+def write_agent_summary_tab(wb, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx):
+    ws = wb.create_sheet("Agent Summary")
     ws.sheet_view.showGridLines = False
 
-    fwd_counts = defaultdict(lambda: defaultdict(int))
-    rev_counts = defaultdict(lambda: defaultdict(int))
-    warn_counts = defaultdict(lambda: defaultdict(int))
+    counts = {}
+    for row in filt_rows:
+        dc  = str(row[dc_idx] or '').strip()
+        if not dc:
+            continue
+        tno = str(row[track_idx] or '').strip().upper()
+        if tno.startswith(('MYSC', 'MYSD', 'MYSP')):
+            agent = str(row[fwd_agt_idx] or '').strip() if fwd_agt_idx is not None and len(row) > fwd_agt_idx else ''
+        elif tno.startswith('MYSR'):
+            agent = str(row[rev_agt_idx] or '').strip() if rev_agt_idx is not None and len(row) > rev_agt_idx else ''
+        else:
+            agent = ''
+        if not agent:
+            agent = '#N/A'
+        counts.setdefault(dc, {})
+        counts[dc][agent] = counts[dc].get(agent, 0) + 1
 
-    for r in filt_data_rows:
-        dc = str(r[dc_idx] or '').strip()
-        tn = str(r[track_idx] or '')
-        fwd_agt = str(r[fwd_agt_idx] or '').strip() if fwd_agt_idx is not None and len(r) > fwd_agt_idx else ''
-        rev_agt = str(r[rev_agt_idx] or '').strip() if rev_agt_idx is not None and len(r) > rev_agt_idx else ''
+    dc_order = ALLOWED_SOURCE_DC
+    agent_rows      = []
+    counselled_rows = []
+    warned_rows     = []
 
-        if tn.startswith(('MYSC', 'MYSD')):
-            if fwd_agt: fwd_counts[dc][fwd_agt] += 1
-            if rev_agt: warn_counts[dc][rev_agt] += 1
-        elif tn.startswith(('MYSR', 'MYSP')):
-            if rev_agt: rev_counts[dc][rev_agt] += 1
-            if fwd_agt: warn_counts[dc][fwd_agt] += 1
+    for dc in dc_order:
+        if dc not in counts:
+            continue
+        for agent in sorted(counts[dc]):
+            cnt = counts[dc][agent]
+            la  = agent.lower()
+            agent_rows.append([dc, agent, cnt])
+            if cnt > 2 and la not in ('#n/a', 'n/a'):
+                counselled_rows.append([dc, agent, cnt])
+            if cnt > 5 and la not in ('#n/a', 'n/a'):
+                warned_rows.append([dc, agent, cnt])
 
-    def _sorted_items(counts_dict):
-        items = []
-        for dc in sorted(counts_dict.keys()):
-            for agt, cnt in sorted(counts_dict[dc].items(), key=lambda x: x[1], reverse=True):
-                items.append((dc, agt, cnt))
-        return items
+    counselled_rows.sort(key=lambda x: x[2], reverse=True)
+    warned_rows.sort(key=lambda x: x[2], reverse=True)
 
-    fwd_items  = _sorted_items(fwd_counts)
-    rev_items  = _sorted_items(rev_counts)
-    warn_items = _sorted_items(warn_counts)
-    max_len = max(len(fwd_items), len(rev_items), len(warn_items))
+    max_rows = max(len(agent_rows), len(counselled_rows), len(warned_rows), 1)
 
-    output = [
-        ['Forward Agent Summary', '', '', '', 'Reverse Agent Summary', '', '', '', 'Agent Warning Summary', '', ''],
-        ['Source_DC', 'Agent Name', 'Count', '', 'Source_DC', 'Agent Name', 'Count', '', 'Source_DC', 'Agent Name', 'Count']
-    ]
+    output = []
+    output.append(['Agent Summary', '', '', '', 'Agent to be counselled', '', '', '', 'Agents to be Warned', '', ''])
+    output.append(['Source_DC', 'Agent Name', 'Count', '', 'Source_DC', 'Agent Name', 'Count', '', 'Source_DC', 'Agent Name', 'Count'])
+    for i in range(max_rows):
+        r1 = agent_rows[i]      if i < len(agent_rows)      else ['', '', '']
+        r2 = counselled_rows[i] if i < len(counselled_rows) else ['', '', '']
+        r3 = warned_rows[i]     if i < len(warned_rows)     else ['', '', '']
+        output.append(r1 + [''] + r2 + [''] + r3)
 
-    for i in range(max_len):
-        f = fwd_items[i]  if i < len(fwd_items)  else ('', '', '')
-        r = rev_items[i]  if i < len(rev_items)  else ('', '', '')
-        w = warn_items[i] if i < len(warn_items) else ('', '', '')
-        output.append([f[0], f[1], f[2] if f[2] else '', '',
-                       r[0], r[1], r[2] if r[2] else '', '',
-                       w[0], w[1], w[2] if w[2] else ''])
-
-    for row_idx, row_data in enumerate(output, start=1):
-        for col_idx, val in enumerate(row_data, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=val)
+    for r_idx, row in enumerate(output, start=1):
+        for c_idx, val in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=val)
 
     left_align = Alignment(horizontal="left", vertical="center")
     center_align = Alignment(horizontal="center", vertical="center")
 
     for r in range(3, len(output) + 1):
-        # DC and Counts center aligned
         for c in [1, 3, 5, 7, 9, 11]:
             ws.cell(r, c).alignment = center_align
-            if c in [3, 7, 11] and ws.cell(r, c).value:
+            if c in [3, 7, 11] and ws.cell(r, c).value != '':
                 ws.cell(r, c).number_format = '#,##0'
-        # Agent names left aligned
         for c in [2, 6, 10]:
             ws.cell(r, c).alignment = left_align
 
-    C_WARN_TITLE = "7C2D12"
-    C_WARN_HDR   = "9A3412"
-
-    def _title(r, c1, c2, bg):
-        ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
-        cell = ws.cell(r, c1)
+    def _title(row, c1, c2, bg):
+        ws.merge_cells(start_row=row, start_column=c1, end_row=row, end_column=c2)
+        cell = ws.cell(row, c1)
         cell.fill = _fill(bg)
         cell.font = _font(C_HDR_FONT, bold=True, size=11)
         cell.alignment = center_align
 
-    def _subhdr(r, c1, c2, bg):
+    def _subhdr(row, c1, c2, bg):
         for c in range(c1, c2 + 1):
-            cell = ws.cell(r, c)
+            cell = ws.cell(row, c)
             cell.fill = _fill(bg)
             cell.font = _font(C_HDR_FONT, bold=True)
             cell.alignment = center_align
@@ -496,16 +500,15 @@ def write_agent_summary_tab(wb, filt_data_rows, track_idx, fwd_agt_idx, rev_agt_
     _subhdr(2, 9, 11, C_WARN_HDR)
 
     bd = _border(C_BORDER)
-    # Apply borders cleanly strictly to existing table rows
-    for r in range(1, len(fwd_items) + 3):
+    for r in range(1, len(agent_rows) + 3):
         for c in [1, 2, 3]:
             ws.cell(r, c).border = bd
 
-    for r in range(1, len(rev_items) + 3):
+    for r in range(1, len(counselled_rows) + 3):
         for c in [5, 6, 7]:
             ws.cell(r, c).border = bd
 
-    for r in range(1, len(warn_items) + 3):
+    for r in range(1, len(warned_rows) + 3):
         for c in [9, 10, 11]:
             ws.cell(r, c).border = bd
 
