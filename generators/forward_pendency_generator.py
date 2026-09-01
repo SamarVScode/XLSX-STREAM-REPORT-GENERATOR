@@ -2,12 +2,11 @@
 """
 Forward Pendency Report Generator Module for ei_stream_server
 =============================================================
-Reads 'raw_data_North' from input Excel file, filters rows where Source_DC is in
-{'alg', 'ayp', 'deo', 'jhs', 'jnp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr'},
+Reads 'raw_data_North' from input Excel file, filters rows where Source_DC is in allowed list,
 computes the 'Aging Category' column right beside 'Aging', and generates output workbook:
   1. Summary Sheet (3 Sidewise Tables with Red/Green highlights)
-  2. CPD-DID Sheet (P2 & P3 actual row details)
-  3. Raw Sheet (Full filtered rows dataset)
+  2. CPD-DID pendency Sheet (P2 & P3 actual row details)
+  3. RAW Sheet (Full filtered rows dataset with Aging Category)
 
 Uses Zero-Memory Streaming Architecture:
 - Direct XML disk streaming for massive (200k+ rows) datasets
@@ -16,6 +15,7 @@ Uses Zero-Memory Streaming Architecture:
 """
 
 import io
+import re
 import math
 import zipfile
 import tempfile
@@ -38,9 +38,19 @@ try:
 except ImportError:
     from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
 
+# Core 11 North Hubs for Forward Pendency
+PRIMARY_NORTH_DCS = ['ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR']
+
 AGING_CATEGORIES = ['0-2 days', '3-5 days', '5-10 days', '>10 days']
 
 log = logging.getLogger("ei_stream_server.forward_pendency")
+
+
+def _clean_key(name) -> str:
+    """Normalize string by removing all whitespace, underscores, dashes and lowercasing."""
+    if name is None:
+        return ""
+    return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
 
 def compute_aging_category(val) -> str:
@@ -59,6 +69,40 @@ def compute_aging_category(val) -> str:
             return ">10 days"
     except (ValueError, TypeError):
         return "0-2 days"
+
+
+def normalize_priority(val) -> str:
+    """
+    Normalizes priority values to P1, P2, P3, P4, or Unknown.
+    Handles integers (2, 3, 4), floats (2.0, 3.0), strings ('P2', 'p2', 'Priority 2', etc.).
+    """
+    if val is None:
+        return "Unknown"
+    s = str(val).strip().upper()
+    if not s:
+        return "Unknown"
+    
+    # Direct mappings
+    if s in ("P2", "2", "2.0", "P-2", "P 2", "PRIORITY 2", "PRIORITY-2", "PRIORITY_2"):
+        return "P2"
+    if s in ("P3", "3", "3.0", "P-3", "P 3", "PRIORITY 3", "PRIORITY-3", "PRIORITY_3"):
+        return "P3"
+    if s in ("P4", "4", "4.0", "P-4", "P 4", "PRIORITY 4", "PRIORITY-4", "PRIORITY_4"):
+        return "P4"
+    if s in ("P1", "1", "1.0", "P-1", "P 1", "PRIORITY 1", "PRIORITY-1", "PRIORITY_1"):
+        return "P1"
+    
+    # Substring detection
+    if "P2" in s or "DID" in s:
+        return "P2"
+    if "P3" in s or "CPD" in s:
+        return "P3"
+    if "P4" in s:
+        return "P4"
+    if "P1" in s:
+        return "P1"
+        
+    return s
 
 
 def write_side_table(ws, start_col: int, start_row: int, title: str, headers: list, data_matrix: list):
@@ -152,11 +196,19 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     ws.title = "Summary"
     ws.sheet_view.showGridLines = False
 
+    # Determine list of DCs for summary: Start with Primary 11 North Hubs, plus any others with data
+    dc_list = list(PRIMARY_NORTH_DCS)
+    for dc in ALLOWED_SOURCE_DCS:
+        if dc.upper() != 'ALL' and dc.upper() not in dc_list:
+            # Only add if it has active data
+            if any(t1_pivot[dc.upper()].values()) or any(t2_pivot[dc.upper()].values()):
+                dc_list.append(dc.upper())
+
     table1_headers = ["Source DC"] + AGING_CATEGORIES + ["Total Pendency"]
     table1_data = []
     tot_cats_t1 = defaultdict(int)
 
-    for dc in ALLOWED_SOURCE_DCS:
+    for dc in dc_list:
         row_vals = [dc]
         row_tot = 0
         for cat in AGING_CATEGORIES:
@@ -175,7 +227,7 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     table2_data = []
     tot_prios_t2 = defaultdict(int)
 
-    for dc in ALLOWED_SOURCE_DCS:
+    for dc in dc_list:
         row_vals = [dc]
         row_tot = 0
         for p in prio_keys:
@@ -194,7 +246,7 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     tot_cpd = 0
     tot_did = 0
 
-    for dc in ALLOWED_SOURCE_DCS:
+    for dc in dc_list:
         cpd_cnt = t3_pivot[dc]["CPD (P3)"]
         did_cnt = t3_pivot[dc]["DID (P2)"]
         row_tot = cpd_cnt + did_cnt
@@ -229,6 +281,102 @@ def esc(val):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def find_column_indices(header_list: list) -> dict:
+    """
+    Robust column detection with regex stripping and fallback heuristics.
+    """
+    clean_map = {_clean_key(h): idx for idx, h in enumerate(header_list) if h is not None}
+    raw_map = {str(h).strip().lower(): idx for idx, h in enumerate(header_list) if h is not None}
+
+    # 1. Aging Column
+    aging_idx = None
+    for c in ['aging', 'agingbucket', 'agebucket', 'ageing', 'age', 'agingdays', 'ageingdays', 'ageingbucket']:
+        if c in clean_map:
+            aging_idx = clean_map[c]
+            break
+    if aging_idx is None:
+        for k, v in clean_map.items():
+            if 'aging' in k or 'ageing' in k:
+                aging_idx = v
+                break
+    if aging_idx is None:
+        aging_idx = 20
+
+    # 2. Source DC Column
+    sdc_idx = None
+    for c in ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'hub', 'origin', 'origindc']:
+        if c in clean_map:
+            sdc_idx = clean_map[c]
+            break
+    if sdc_idx is None:
+        for k, v in clean_map.items():
+            if 'sourcedc' in k or 'source' in k:
+                sdc_idx = v
+                break
+    if sdc_idx is None:
+        sdc_idx = 15
+
+    # 3. Priority Column (CustomerPriorityV2, CustomerPriority, Priority, Prio)
+    prio_idx = None
+    for c in ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'custpriority', 'priority', 'prio', 'customerprio', 'orderpriority']:
+        if c in clean_map:
+            prio_idx = clean_map[c]
+            break
+    if prio_idx is None:
+        for k, v in clean_map.items():
+            if 'priority' in k or 'prio' in k:
+                prio_idx = v
+                break
+    if prio_idx is None:
+        prio_idx = 13
+
+    # 4. Shipment / Waybill Column
+    shipment_idx = None
+    for c in ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'trackingnumber', 'awb', 'shipmentno', 'orderid']:
+        if c in clean_map:
+            shipment_idx = clean_map[c]
+            break
+    if shipment_idx is None:
+        for k, v in clean_map.items():
+            if 'tracking' in k or 'shipment' in k or 'waybill' in k or 'awb' in k:
+                shipment_idx = v
+                break
+    if shipment_idx is None:
+        shipment_idx = 1
+
+    # 5. Attempt Status Column
+    attempt_idx = None
+    for c in ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'attemptstat', 'deliveryattempt']:
+        if c in clean_map:
+            attempt_idx = clean_map[c]
+            break
+    if attempt_idx is None:
+        for k, v in clean_map.items():
+            if 'attempt' in k:
+                attempt_idx = v
+                break
+    if attempt_idx is None:
+        # Fallback to status only if attempt is not found
+        if 'status' in clean_map:
+            attempt_idx = clean_map['status']
+        else:
+            attempt_idx = 23
+
+    log.info(f"Resolved column indices: Aging={aging_idx} ('{header_list[aging_idx] if len(header_list) > aging_idx else 'N/A'}'), "
+             f"Source_DC={sdc_idx} ('{header_list[sdc_idx] if len(header_list) > sdc_idx else 'N/A'}'), "
+             f"Priority={prio_idx} ('{header_list[prio_idx] if len(header_list) > prio_idx else 'N/A'}'), "
+             f"Shipment={shipment_idx} ('{header_list[shipment_idx] if len(header_list) > shipment_idx else 'N/A'}'), "
+             f"Attempt={attempt_idx} ('{header_list[attempt_idx] if len(header_list) > attempt_idx else 'N/A'}')")
+
+    return {
+        'aging': aging_idx,
+        'sdc': sdc_idx,
+        'prio': prio_idx,
+        'shipment': shipment_idx,
+        'attempt': attempt_idx
+    }
+
+
 def generate_forward_pendency_report(input_file: Path, output_file: Path):
     """
     Main generator pipeline for Forward Pendency Report using Zero-Memory Streaming Architecture.
@@ -260,12 +408,6 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     total_filtered = 0
     cpd_count = 0
 
-    aging_col_idx = 20
-    sdc_idx = 15
-    prio_idx = 13
-    shipment_idx = 1
-    attempt_idx = 23
-
     raw_row_num = 2
     cpd_row_num = 2
     raw_chunk = []
@@ -294,27 +436,12 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
     header_list = list(header_row)
-    col_map = {str(h).strip().lower(): idx for idx, h in enumerate(header_list) if h is not None}
-    for c in ['aging', 'aging bucket', 'age_bucket', 'ageing', 'age']:
-        if c in col_map:
-            aging_col_idx = col_map[c]
-            break
-    for c in ['source_dc', 'source dc', 'dc', 'sourcedc']:
-        if c in col_map:
-            sdc_idx = col_map[c]
-            break
-    for c in ['customerpriorityv2', 'priority', 'prio', 'customer_priority']:
-        if c in col_map:
-            prio_idx = col_map[c]
-            break
-    for c in ['pendingshipments', 'tracking_no', 'waybill', 'tracking_id', 'shipment', 'tracking_number']:
-        if c in col_map:
-            shipment_idx = col_map[c]
-            break
-    for c in ['attempt_status', 'status', 'attempt']:
-        if c in col_map:
-            attempt_idx = col_map[c]
-            break
+    col_indices = find_column_indices(header_list)
+    aging_col_idx = col_indices['aging']
+    sdc_idx = col_indices['sdc']
+    prio_idx = col_indices['prio']
+    shipment_idx = col_indices['shipment']
+    attempt_idx = col_indices['attempt']
 
     # Write Raw header (insert Aging Category right after Aging)
     raw_header_out = list(header_list)
@@ -325,7 +452,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     r_hdr_xml.append('</row>')
     f_raw.write(''.join(r_hdr_xml).encode('utf-8'))
 
-    # Write CPD-DID header
+    # Write CPD-DID pendency header
     cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
     c_hdr_xml = ['<row r="1">']
     for c_i, h_val in enumerate(cpd_headers, 1):
@@ -345,7 +472,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
             aging_cat = compute_aging_category(aging_val)
 
             raw_prio = row[prio_idx] if len(row) > prio_idx else None
-            prio = str(raw_prio).strip().upper() if raw_prio is not None and str(raw_prio).strip() else "Unknown"
+            prio = normalize_priority(raw_prio)
 
             # Aggregate into pivots for Summary sheet
             t1_pivot[sdc_upper][aging_cat] += 1
@@ -377,7 +504,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
             raw_chunk.append(''.join(r_xml))
             raw_row_num += 1
 
-            # CPD-DID row if P2 or P3
+            # CPD-DID pendency row if P2 or P3
             if prio in ("P2", "P3"):
                 cpd_count += 1
                 shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
@@ -428,7 +555,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         pass
     del out_wb, t1_pivot, t2_pivot, t3_pivot
 
-    # Assemble ZIP archive with Summary, CPD-DID, and Raw sheets
+    # Assemble ZIP archive with Summary, CPD-DID pendency, and RAW sheets
     z_in = zipfile.ZipFile(temp_sum, 'r')
     z_out = zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED)
 
@@ -439,7 +566,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
             z_out.writestr(item.filename, ct)
         elif item.filename == 'xl/workbook.xml':
             wb_xml = z_in.read(item.filename).decode('utf-8')
-            wb_xml = wb_xml.replace('</sheets>', '<sheet name="CPD-DID" sheetId="2" r:id="rId2"/><sheet name="Raw" sheetId="3" r:id="rId3"/></sheets>')
+            wb_xml = wb_xml.replace('</sheets>', '<sheet name="CPD-DID pendency" sheetId="2" r:id="rId2"/><sheet name="RAW" sheetId="3" r:id="rId3"/></sheets>')
             z_out.writestr(item.filename, wb_xml)
         elif item.filename == 'xl/_rels/workbook.xml.rels':
             wb_rels = z_in.read(item.filename).decode('utf-8')
@@ -448,7 +575,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         else:
             z_out.writestr(item, z_in.read(item.filename))
 
-    # Stream CPD-DID sheet into sheet2.xml
+    # Stream CPD-DID pendency sheet into sheet2.xml
     with z_out.open('xl/worksheets/sheet2.xml', 'w', force_zip64=True) as zf_entry:
         with open(temp_cpd_xml, 'rb') as f_cpd_in:
             while True:
@@ -457,7 +584,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
                     break
                 zf_entry.write(buf)
 
-    # Stream Raw sheet into sheet3.xml
+    # Stream RAW sheet into sheet3.xml
     with z_out.open('xl/worksheets/sheet3.xml', 'w', force_zip64=True) as zf_entry:
         with open(temp_raw_xml, 'rb') as f_raw_in:
             while True:
