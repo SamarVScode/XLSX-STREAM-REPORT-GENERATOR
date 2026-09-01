@@ -290,8 +290,14 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     p0_row_num = 3
     raw_chunk = []
     p0_chunk = []
+    processed_count = 0
 
     for row in row_iter:
+        processed_count += 1
+        if processed_count % 1000 == 0:
+            import time
+            time.sleep(0.002)
+
         region = str(row[region_idx]).strip() if (region_idx is not None and len(row) > region_idx and row[region_idx]) else 'North'
         src_dc = str(row[src_dc_idx]).strip().upper() if (len(row) > src_dc_idx and row[src_dc_idx]) else ''
         if (region == 'North' or region_idx is None) and src_dc in ALLOWED_DCS_SET:

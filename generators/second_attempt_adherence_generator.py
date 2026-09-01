@@ -422,7 +422,12 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                         chunk.clear()
 
         # Raw (Combined)
+        processed_raw_c = 0
         for row in raw_rows_iter:
+            processed_raw_c += 1
+            if processed_raw_c % 1000 == 0:
+                import time
+                time.sleep(0.002)
             if len(row) > dc_idx and row[dc_idx] is not None:
                 if str(row[dc_idx]).strip().upper() in TARGET_DCS:
                     r_xml = [f'<row r="{row_num}">']
