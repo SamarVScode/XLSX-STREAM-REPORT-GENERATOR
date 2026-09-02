@@ -2,7 +2,7 @@
 High-Speed Streaming Engine for ei_stream_server
 ================================================
 Universal Zero-Memory Streaming Engine for reading and writing spreadsheets:
-1. Reading: Streams rows one-by-one with constant O(1) memory (~25-35MB RAM).
+1. Reading (open_stream_reader): Single-pass stream reader supporting explicit or auto-detected header rows (Row 1, 2, or 3) with O(1) memory.
 2. Writing (XmlSheetWriter): Streams massive datasets directly to disk XML chunks with zero cell DOM overhead.
 3. Assembly (assemble_stream_workbook): Stitches styled OpenPyXL Summary workbooks with disk-streamed XML data sheets.
 4. Header Detection (ColumnFinder): Robust regex-based column detector resilient to spaces, casing, and underscores.
@@ -10,6 +10,7 @@ Universal Zero-Memory Streaming Engine for reading and writing spreadsheets:
 
 import os
 import io
+import gc
 import re
 import csv
 import math
@@ -17,7 +18,8 @@ import tempfile
 import zipfile
 import logging
 from pathlib import Path
-from typing import Iterator, List, Dict, Any, Optional, Union
+from typing import Iterator, List, Dict, Any, Optional, Union, Tuple
+from contextlib import contextmanager
 import xml.etree.ElementTree as ET
 from openpyxl.utils import get_column_letter
 
@@ -163,7 +165,6 @@ class XmlSheetWriter:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-        # Temp file is left for assemble_stream_workbook to read, will be cleaned in assemble_stream_workbook or cleanup
 
 
 def assemble_stream_workbook(
@@ -178,7 +179,6 @@ def assemble_stream_workbook(
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Make sure all stream writers are closed
     for s_writer in stream_sheets:
         s_writer.close()
 
@@ -191,7 +191,6 @@ def assemble_stream_workbook(
     except Exception:
         pass
 
-    # Read base zip archive and write final zip archive
     z_in = zipfile.ZipFile(temp_sum, 'r')
     z_out = zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED)
 
@@ -226,7 +225,6 @@ def assemble_stream_workbook(
         else:
             z_out.writestr(item, z_in.read(item.filename))
 
-    # Stream each XML data sheet from disk directly into the ZIP entry
     for idx, s_writer in enumerate(stream_sheets, start=num_summary_sheets + 1):
         with z_out.open(f'xl/worksheets/sheet{idx}.xml', 'w', force_zip64=True) as zf_entry:
             if s_writer.temp_file and s_writer.temp_file.exists():
@@ -240,15 +238,18 @@ def assemble_stream_workbook(
     z_out.close()
     z_in.close()
 
-    # Clean up all temp XML files
     for s_writer in stream_sheets:
         s_writer.cleanup()
+
+    # Free memory
+    del temp_sum
+    gc.collect()
 
     log.info(f"Successfully assembled streaming workbook: {out_path.name} with {len(stream_sheets)} streamed sheet(s)")
 
 
 # =========================================================================
-# READING FUNCTIONS
+# SINGLE-PASS ZERO-MEMORY READING ENGINE
 # =========================================================================
 
 def get_sheet_names(file_path: Union[str, Path]) -> List[str]:
@@ -259,7 +260,9 @@ def get_sheet_names(file_path: Union[str, Path]) -> List[str]:
     if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
         try:
             wb = CalamineWorkbook.from_path(str(path))
-            return wb.sheet_names
+            names = wb.sheet_names
+            del wb
+            return names
         except Exception as e:
             log.warning(f"Calamine get_sheet_names failed ({e}); falling back...")
 
@@ -291,119 +294,137 @@ def get_sheet_names(file_path: Union[str, Path]) -> List[str]:
         return ["Sheet1"]
 
 
-def stream_sheet_rows(
+def _extract_headers_and_iterator(raw_iterator, header_row: Optional[int] = None) -> Tuple[List[str], Iterator[List[Any]]]:
+    """
+    Extracts headers based on explicit header_row index (1-based) or auto-detects
+    the first valid multi-column header row, yielding remaining rows.
+    """
+    headers: List[str] = []
+    current_idx = 0
+
+    if header_row is not None:
+        # Advance until explicit header_row is reached
+        for row in raw_iterator:
+            current_idx += 1
+            if current_idx == header_row:
+                headers = [str(c).strip() if c is not None else "" for c in row] if row else []
+                break
+    else:
+        # Auto-detect: Skip empty rows or single-cell banners (e.g. title rows)
+        for row in raw_iterator:
+            current_idx += 1
+            if not row:
+                continue
+            non_empty = [str(c).strip() for c in row if c is not None and str(c).strip() != '']
+            if len(non_empty) >= 2 or (len(non_empty) == 1 and current_idx > 3):
+                headers = [str(c).strip() if c is not None else "" for c in row]
+                break
+
+    def _row_gc_wrapper():
+        row_count = 0
+        for row in raw_iterator:
+            row_count += 1
+            yield list(row) if row else []
+            if row_count % 15000 == 0:
+                gc.collect()
+
+    return headers, _row_gc_wrapper()
+
+
+@contextmanager
+def open_stream_reader(
     file_path: Union[str, Path],
     sheet_name: Optional[str] = None,
-    start_row: int = 1
-) -> Iterator[List[Any]]:
+    header_row: Optional[int] = None
+) -> Iterator[Tuple[List[str], Iterator[List[Any]]]]:
     """
-    Stream rows one-by-one from a spreadsheet.
-    Yields list of cell values for each row without loading the entire sheet into memory.
+    Single-Pass Zero-Memory Stream Reader.
+    Opens the spreadsheet EXACTLY ONCE.
+    Supports explicit header_row (1, 2, 3...) or automatic header row detection.
+    Yields (headers: List[str], row_iterator: Iterator[List[Any]]).
+    Automatically frees memory, closes native handles, and triggers GC on exit.
     """
     path = Path(file_path)
     ext = path.suffix.lower()
 
-    # 1. Primary: High-speed Rust Calamine (Supports .xlsx, .xlsb, .ods, .xls, .xlsm)
-    if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
-        try:
-            wb = CalamineWorkbook.from_path(str(path))
-            target_sheet = sheet_name or (wb.sheet_names[0] if wb.sheet_names else "Sheet1")
-            
-            if target_sheet not in wb.sheet_names:
-                target_clean = str(target_sheet).lower().replace(' ', '_').replace('-', '_')
-                found = False
-                for s in wb.sheet_names:
-                    s_clean = s.lower().replace(' ', '_').replace('-', '_')
-                    if s_clean == target_clean or target_clean in s_clean:
-                        target_sheet = s
-                        found = True
-                        break
-                if not found and wb.sheet_names:
-                    target_sheet = wb.sheet_names[0]
+    wb = None
+    openpyxl_wb = None
 
-            sheet = wb.get_sheet_by_name(target_sheet)
-            current_row = 1
-            for row in sheet.iter_rows():
-                if current_row >= start_row:
-                    yield list(row)
-                current_row += 1
-            return
-        except Exception as e:
-            log.warning(f"Calamine stream failed for {path.name} ({e}). Falling back to openpyxl...")
-
-    # 2. Fallback for CSV / TSV / Text files
-    if ext in ('.csv', '.tsv', '.txt'):
-        for sep in [',', '\t', ';', '|']:
-            for enc in ['utf-8-sig', 'utf-8', 'latin1', 'cp1252']:
-                try:
-                    with open(path, 'r', encoding=enc, errors='replace') as f:
-                        reader = csv.reader(f, delimiter=sep)
-                        current_row = 1
-                        for row in reader:
-                            if current_row >= start_row:
-                                yield row
-                            current_row += 1
-                        return
-                except Exception:
-                    continue
-
-    # 3. Fallback: openpyxl read_only stream
     try:
+        # 1. Calamine High-Speed Rust Reader
+        if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
+            try:
+                wb = CalamineWorkbook.from_path(str(path))
+                target_sheet = sheet_name or (wb.sheet_names[0] if wb.sheet_names else "Sheet1")
+                
+                if target_sheet not in wb.sheet_names:
+                    target_clean = str(target_sheet).lower().replace(' ', '_').replace('-', '_')
+                    found = False
+                    for s in wb.sheet_names:
+                        s_clean = s.lower().replace(' ', '_').replace('-', '_')
+                        if s_clean == target_clean or target_clean in s_clean:
+                            target_sheet = s
+                            found = True
+                            break
+                    if not found and wb.sheet_names:
+                        target_sheet = wb.sheet_names[0]
+
+                sheet = wb.get_sheet_by_name(target_sheet)
+                raw_iter = sheet.iter_rows()
+                headers, wrapped_iter = _extract_headers_and_iterator(raw_iter, header_row=header_row)
+
+                yield headers, wrapped_iter
+                return
+            except Exception as e:
+                log.warning(f"Calamine stream failed for {path.name} ({e}). Falling back to openpyxl...")
+                wb = None
+
+        # 2. openpyxl read_only stream fallback
         import openpyxl
-        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-        target_sheet = sheet_name or wb.sheetnames[0]
-        if target_sheet not in wb.sheetnames:
+        openpyxl_wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        target_sheet = sheet_name or openpyxl_wb.sheetnames[0]
+        if target_sheet not in openpyxl_wb.sheetnames:
             target_clean = str(target_sheet).lower().replace(' ', '_').replace('-', '_')
             found = False
-            for s in wb.sheetnames:
+            for s in openpyxl_wb.sheetnames:
                 s_clean = s.lower().replace(' ', '_').replace('-', '_')
                 if s_clean == target_clean or target_clean in s_clean:
                     target_sheet = s
                     found = True
                     break
-            if not found and wb.sheetnames:
-                target_sheet = wb.sheetnames[0]
+            if not found and openpyxl_wb.sheetnames:
+                target_sheet = openpyxl_wb.sheetnames[0]
 
-        ws = wb[target_sheet]
-        current_row = 1
-        for row in ws.iter_rows(values_only=True):
-            if current_row >= start_row:
-                yield list(row) if row else []
-            current_row += 1
-        wb.close()
-    except Exception as e:
-        log.error(f"Failed to stream rows from {path.name}: {e}")
-        raise
+        ws = openpyxl_wb[target_sheet]
+        raw_iter = ws.iter_rows(values_only=True)
+        headers, wrapped_iter = _extract_headers_and_iterator(raw_iter, header_row=header_row)
+
+        yield headers, wrapped_iter
+
+    finally:
+        if openpyxl_wb:
+            try:
+                openpyxl_wb.close()
+            except Exception:
+                pass
+        del wb, openpyxl_wb
+        gc.collect()
 
 
-def stream_sheet_dicts(
+def stream_sheet_rows(
     file_path: Union[str, Path],
     sheet_name: Optional[str] = None,
-    header_row: int = 1
-) -> Iterator[Dict[str, Any]]:
-    """Yields dictionary for each row mapped to the header names defined in header_row."""
-    row_iter = stream_sheet_rows(file_path, sheet_name=sheet_name, start_row=header_row)
-    try:
-        raw_headers = next(row_iter)
-    except StopIteration:
-        return
-
-    headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(raw_headers)]
-
-    for row in row_iter:
-        if not row or all(v is None or str(v).strip() == "" for v in row):
-            continue
-        row_dict = {}
-        for i, val in enumerate(row):
-            col_name = headers[i] if i < len(headers) else f"col_{i}"
-            row_dict[col_name] = val
-        yield row_dict
+    start_row: int = 1
+) -> Iterator[List[Any]]:
+    """Legacy helper wrapping open_stream_reader."""
+    with open_stream_reader(file_path, sheet_name=sheet_name, header_row=1) as (headers, row_iter):
+        if start_row <= 1:
+            yield headers
+        for row in row_iter:
+            yield row
 
 
-def inspect_spreadsheet_headers(file_path: Union[str, Path], sheet_name: Optional[str] = None) -> List[str]:
-    """Inspect first non-empty row of a sheet to detect column headers without loading the file."""
-    rows_iter = stream_sheet_rows(file_path, sheet_name=sheet_name, start_row=1)
-    for row in rows_iter:
-        if row and any(cell is not None and str(cell).strip() != "" for cell in row):
-            return [str(c).strip() if c is not None else "" for c in row]
-    return []
+def inspect_spreadsheet_headers(file_path: Union[str, Path], sheet_name: Optional[str] = None, header_row: Optional[int] = None) -> List[str]:
+    """Inspect first valid header row of a sheet."""
+    with open_stream_reader(file_path, sheet_name=sheet_name, header_row=header_row) as (headers, _):
+        return headers

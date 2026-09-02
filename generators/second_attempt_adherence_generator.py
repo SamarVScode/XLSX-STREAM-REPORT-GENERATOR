@@ -11,7 +11,7 @@ Generates a 2-tab Excel output:
        - > 95%: Green
   2. 'Raw': Combined & filtered raw records from FWD and REV sheets matching Source_DC.
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -43,7 +43,7 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
+    open_stream_reader,
     get_sheet_names,
     ColumnFinder
 )
@@ -91,7 +91,7 @@ def get_adherence_color_styles(pct: float) -> Tuple[PatternFill, Font]:
 def generate_second_attempt_adherence_report(input_path: Union[str, Path], output_path: Union[str, Path]) -> Path:
     input_path = Path(input_path)
     output_path = Path(output_path)
-    log.info(f"Processing Second Attempt Adherence report (streaming mode) for: {input_path.name}")
+    log.info(f"Processing Second Attempt Adherence report (single-pass stream): {input_path.name}")
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -100,38 +100,41 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     fwd_dict = {}
     rev_dict = {}
 
-    summary_rows = list(stream_sheet_rows(input_path, sheet_name="summary", start_row=1))
+    with open_stream_reader(input_path, sheet_name="summary") as (summary_headers, summary_iter):
+        row_num = 1
+        for r in summary_iter:
+            row_num += 1
+            if row_num <= 2:
+                continue
+            # FWD (Cols 0-4)
+            if len(r) >= 5 and r[0] is not None:
+                dc = str(r[0]).strip().upper()
+                if dc in TARGET_DCS:
+                    non_adh = safe_int(r[1])
+                    adh = safe_int(r[2])
+                    total = safe_int(r[3]) if r[3] is not None else (non_adh + adh)
+                    pct = safe_float(r[4]) if (r[4] is not None and not math.isnan(safe_float(r[4]))) else (adh / total if total > 0 else 0.0)
+                    fwd_dict[dc] = {
+                        "non_adherence": non_adh,
+                        "adherence": adh,
+                        "grand_total": total,
+                        "adherence_pct": pct
+                    }
 
-    for r in summary_rows[2:]:
-        # FWD (Cols 0-4)
-        if len(r) >= 5 and r[0] is not None:
-            dc = str(r[0]).strip().upper()
-            if dc in TARGET_DCS:
-                non_adh = safe_int(r[1])
-                adh = safe_int(r[2])
-                total = safe_int(r[3]) if r[3] is not None else (non_adh + adh)
-                pct = safe_float(r[4]) if (r[4] is not None and not math.isnan(safe_float(r[4]))) else (adh / total if total > 0 else 0.0)
-                fwd_dict[dc] = {
-                    "non_adherence": non_adh,
-                    "adherence": adh,
-                    "grand_total": total,
-                    "adherence_pct": pct
-                }
-
-        # REV (Cols 6-10)
-        if len(r) >= 11 and r[6] is not None:
-            dc = str(r[6]).strip().upper()
-            if dc in TARGET_DCS:
-                non_adh = safe_int(r[7])
-                adh = safe_int(r[8])
-                total = safe_int(r[9]) if r[9] is not None else (non_adh + adh)
-                pct = safe_float(r[10]) if (r[10] is not None and not math.isnan(safe_float(r[10]))) else (adh / total if total > 0 else 0.0)
-                rev_dict[dc] = {
-                    "non_adherence": non_adh,
-                    "adherence": adh,
-                    "grand_total": total,
-                    "adherence_pct": pct
-                }
+            # REV (Cols 6-10)
+            if len(r) >= 11 and r[6] is not None:
+                dc = str(r[6]).strip().upper()
+                if dc in TARGET_DCS:
+                    non_adh = safe_int(r[7])
+                    adh = safe_int(r[8])
+                    total = safe_int(r[9]) if r[9] is not None else (non_adh + adh)
+                    pct = safe_float(r[10]) if (r[10] is not None and not math.isnan(safe_float(r[10]))) else (adh / total if total > 0 else 0.0)
+                    rev_dict[dc] = {
+                        "non_adherence": non_adh,
+                        "adherence": adh,
+                        "grand_total": total,
+                        "adherence_pct": pct
+                    }
 
     sorted_dcs = sorted(list(set(fwd_dict.keys()) | set(rev_dict.keys())))
 
@@ -141,7 +144,6 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     ws_sum.title = "Summary"
     ws_sum.views.sheetView[0].showGridLines = True
 
-    # Styling definitions
     font_top_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_fwd_sub = Font(name="Calibri", size=9, bold=True, color="1F497D")
     font_rev_sub = Font(name="Calibri", size=9, bold=True, color="375623")
@@ -202,7 +204,6 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
         fwd_data = fwd_dict.get(dc, {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0})
         rev_data = rev_dict.get(dc, {"non_adherence": 0, "adherence": 0, "grand_total": 0, "adherence_pct": 0.0})
 
-        # FWD Cells
         ws_sum.cell(row=current_row, column=1, value=dc).alignment = Alignment(horizontal="left")
         ws_sum.cell(row=current_row, column=2, value=fwd_data["non_adherence"]).number_format = "#,##0"
         ws_sum.cell(row=current_row, column=3, value=fwd_data["adherence"]).number_format = "#,##0"
@@ -220,7 +221,6 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
             cell.border = border_thin
             if c > 1: cell.alignment = Alignment(horizontal="right")
 
-        # REV Cells
         ws_sum.cell(row=current_row, column=7, value=dc).alignment = Alignment(horizontal="left")
         ws_sum.cell(row=current_row, column=8, value=rev_data["non_adherence"]).number_format = "#,##0"
         ws_sum.cell(row=current_row, column=9, value=rev_data["adherence"]).number_format = "#,##0"
@@ -294,62 +294,57 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
     sheet_map = {s.lower(): s for s in all_sheets}
 
     raw_headers = []
-    has_flow_type = False
-    
-    # Check if FWD or REV tabs exist
-    if "fwd" in sheet_map:
-        fwd_iter = stream_sheet_rows(input_path, sheet_name=sheet_map["fwd"], start_row=1)
-        h_fwd = next(fwd_iter, [])
-        if h_fwd:
-            raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_fwd]
-            has_flow_type = True
-    elif "rev" in sheet_map:
-        rev_iter = stream_sheet_rows(input_path, sheet_name=sheet_map["rev"], start_row=1)
-        h_rev = next(rev_iter, [])
-        if h_rev:
-            raw_headers = ["Flow_Type"] + [str(h).strip() if h is not None else "" for h in h_rev]
-            has_flow_type = True
-    else:
-        for cand in ["raw", "raw_data", "data", "sheet1"]:
-            if cand in sheet_map:
-                raw_iter = stream_sheet_rows(input_path, sheet_name=sheet_map[cand], start_row=1)
-                h_raw = next(raw_iter, [])
-                if h_raw:
-                    raw_headers = [str(h).strip() if h is not None else "" for h in h_raw]
-                break
+    has_fwd = "fwd" in sheet_map
+    has_rev = "rev" in sheet_map
 
-    cf_dc = ColumnFinder(raw_headers[1:] if has_flow_type else raw_headers, {
-        'dc': ["source_dc", "source dc", "dc", "sourcedc", "hub", "hubname"]
-    })
-    dc_idx = cf_dc['dc']
-
-    raw_writer = XmlSheetWriter("Raw", raw_headers)
+    raw_writer = None
     raw_record_count = 0
 
-    with raw_writer:
-        if "fwd" in sheet_map:
-            for row in stream_sheet_rows(input_path, sheet_name=sheet_map["fwd"], start_row=2):
-                if len(row) > dc_idx and row[dc_idx] is not None:
-                    if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                        raw_writer.write_row(["FWD"] + list(row))
-                        raw_record_count += 1
+    if has_fwd or has_rev:
+        target_tab = sheet_map["fwd"] if has_fwd else sheet_map["rev"]
+        with open_stream_reader(input_path, sheet_name=target_tab) as (h_tab, _):
+            raw_headers = ["Flow_Type"] + h_tab
 
-        if "rev" in sheet_map:
-            for row in stream_sheet_rows(input_path, sheet_name=sheet_map["rev"], start_row=2):
-                if len(row) > dc_idx and row[dc_idx] is not None:
-                    if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                        raw_writer.write_row(["REV"] + list(row))
-                        raw_record_count += 1
+        cf_dc = ColumnFinder(raw_headers[1:], {'dc': ["source_dc", "source dc", "dc", "sourcedc", "hub", "hubname"]})
+        dc_idx = cf_dc['dc']
 
-        if "fwd" not in sheet_map and "rev" not in sheet_map:
-            for cand in ["raw", "raw_data", "data", "sheet1"]:
-                if cand in sheet_map:
-                    for row in stream_sheet_rows(input_path, sheet_name=sheet_map[cand], start_row=2):
+        raw_writer = XmlSheetWriter("Raw", raw_headers)
+        with raw_writer:
+            if has_fwd:
+                with open_stream_reader(input_path, sheet_name=sheet_map["fwd"]) as (_, fwd_iter):
+                    for row in fwd_iter:
                         if len(row) > dc_idx and row[dc_idx] is not None:
                             if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                                raw_writer.write_row(row)
+                                raw_writer.write_row(["FWD"] + list(row))
                                 raw_record_count += 1
-                    break
+            if has_rev:
+                with open_stream_reader(input_path, sheet_name=sheet_map["rev"]) as (_, rev_iter):
+                    for row in rev_iter:
+                        if len(row) > dc_idx and row[dc_idx] is not None:
+                            if str(row[dc_idx]).strip().upper() in TARGET_DCS:
+                                raw_writer.write_row(["REV"] + list(row))
+                                raw_record_count += 1
+    else:
+        raw_tab = None
+        for cand in ["raw", "raw_data", "data", "sheet1"]:
+            if cand in sheet_map:
+                raw_tab = sheet_map[cand]
+                break
+        if not raw_tab and all_sheets:
+            raw_tab = all_sheets[0]
+
+        with open_stream_reader(input_path, sheet_name=raw_tab) as (h_raw, raw_iter):
+            raw_headers = list(h_raw)
+            cf_dc = ColumnFinder(raw_headers, {'dc': ["source_dc", "source dc", "dc", "sourcedc", "hub", "hubname"]})
+            dc_idx = cf_dc['dc']
+
+            raw_writer = XmlSheetWriter("Raw", raw_headers)
+            with raw_writer:
+                for row in raw_iter:
+                    if len(row) > dc_idx and row[dc_idx] is not None:
+                        if str(row[dc_idx]).strip().upper() in TARGET_DCS:
+                            raw_writer.write_row(row)
+                            raw_record_count += 1
 
     log.info(f"Summary DC Items: FWD={len(fwd_dict)}, REV={len(rev_dict)}")
     log.info(f"Total Streamed Raw Records: {raw_record_count}")

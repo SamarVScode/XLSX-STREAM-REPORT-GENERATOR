@@ -13,7 +13,7 @@ allowed North DCs, and generates an output workbook with:
   2. Raw Sheet:
      - Full filtered dataset containing all original columns for target Source DCs.
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -39,7 +39,7 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
+    open_stream_reader,
     get_sheet_names,
     ColumnFinder
 )
@@ -82,9 +82,8 @@ def generate_eob_report(input_file: Path, output_file: Path):
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    log.info(f"Generating EOB Priority & Status Report for: {input_path.name}")
+    log.info(f"Generating EOB Priority & Status Report (Single-Pass Stream) for: {input_path.name}")
 
-    # Determine sheet name
     sheet_names = get_sheet_names(input_path)
     sheet_map = {name.lower(): name for name in sheet_names}
     target_sheet = None
@@ -95,54 +94,52 @@ def generate_eob_report(input_file: Path, output_file: Path):
     if not target_sheet and sheet_names:
         target_sheet = sheet_names[0]
 
-    # Read rows
-    row_iter = stream_sheet_rows(input_path, sheet_name=target_sheet, start_row=1)
-    raw_headers = next(row_iter, [])
-    if not raw_headers:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    cf = ColumnFinder(raw_headers, {
-        'tracking': ['tracking no', 'tracking_no', 'waybill', 'awb', 'shipment'],
-        'sdc': ['source_dc', 'sourcedc', 'source dc', 'dc', 'hub'],
-        'prio': ['fpt decision', 'decision', 'priority'],
-        'aging': ['aging bucket', 'ageing bucket', 'aging_bucket', 'aging'],
-        'status': ['latest status', 'latest_status', 'status']
-    })
-
-    t_idx = cf['tracking']
-    sdc_idx = cf['sdc']
-    prio_idx = cf['prio']
-    aging_idx = cf['aging']
-    status_idx = cf['status']
-
-    # Filter rows and write Raw sheet via XmlSheetWriter
     filtered_records = []
-    raw_writer = XmlSheetWriter("Raw", raw_headers)
 
-    with raw_writer:
-        for row in row_iter:
-            if not row or len(row) <= sdc_idx:
-                continue
-            raw_dc = row[sdc_idx]
-            if raw_dc is None:
-                continue
-            dc_clean = str(raw_dc).strip().upper()
+    with open_stream_reader(input_path, sheet_name=target_sheet) as (raw_headers, row_iter):
+        if not raw_headers:
+            raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
-            if dc_clean in TARGET_SOURCE_DCS:
-                raw_writer.write_row(row)
+        cf = ColumnFinder(raw_headers, {
+            'tracking': ['tracking no', 'tracking_no', 'waybill', 'awb', 'shipment'],
+            'sdc': ['source_dc', 'sourcedc', 'source dc', 'dc', 'hub'],
+            'prio': ['fpt decision', 'decision', 'priority'],
+            'aging': ['aging bucket', 'ageing bucket', 'aging_bucket', 'aging'],
+            'status': ['latest status', 'latest_status', 'status']
+        })
 
-                t_no = str(row[t_idx]).strip() if len(row) > t_idx and row[t_idx] is not None else ""
-                prio = str(row[prio_idx]).strip() if len(row) > prio_idx and row[prio_idx] is not None else ""
-                aging = str(row[aging_idx]).strip() if len(row) > aging_idx and row[aging_idx] is not None else ""
-                status = str(row[status_idx]).strip() if len(row) > status_idx and row[status_idx] is not None else ""
+        t_idx = cf['tracking']
+        sdc_idx = cf['sdc']
+        prio_idx = cf['prio']
+        aging_idx = cf['aging']
+        status_idx = cf['status']
 
-                filtered_records.append({
-                    'Tracking No': t_no,
-                    'Source_DC': dc_clean,
-                    'FPT Decision': prio,
-                    'Aging Bucket': aging,
-                    'Latest Status': status
-                })
+        raw_writer = XmlSheetWriter("Raw", raw_headers)
+
+        with raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= sdc_idx:
+                    continue
+                raw_dc = row[sdc_idx]
+                if raw_dc is None:
+                    continue
+                dc_clean = str(raw_dc).strip().upper()
+
+                if dc_clean in TARGET_SOURCE_DCS:
+                    raw_writer.write_row(row)
+
+                    t_no = str(row[t_idx]).strip() if len(row) > t_idx and row[t_idx] is not None else ""
+                    prio = str(row[prio_idx]).strip() if len(row) > prio_idx and row[prio_idx] is not None else ""
+                    aging = str(row[aging_idx]).strip() if len(row) > aging_idx and row[aging_idx] is not None else ""
+                    status = str(row[status_idx]).strip() if len(row) > status_idx and row[status_idx] is not None else ""
+
+                    filtered_records.append({
+                        'Tracking No': t_no,
+                        'Source_DC': dc_clean,
+                        'FPT Decision': prio,
+                        'Aging Bucket': aging,
+                        'Latest Status': status
+                    })
 
     log.info(f"Filtered {len(filtered_records)} total records for Source DCs.")
 
@@ -151,7 +148,6 @@ def generate_eob_report(input_file: Path, output_file: Path):
     else:
         df_f = pd.DataFrame(filtered_records)
 
-    # 1. Prepare Table 1 (Aging Bucket x Priority)
     df_prio = df_f[df_f['FPT Decision'].str.strip().str.upper() == 'PRIORITY'].copy()
 
     if not df_prio.empty:
@@ -180,7 +176,6 @@ def generate_eob_report(input_file: Path, output_file: Path):
     t1_total_row.index = ['Grand Total']
     t1_df = pd.concat([t1_df, t1_total_row])
 
-    # 2. Prepare Table 2 (Latest Status)
     if not df_f.empty:
         df_f['Short_Status'] = df_f['Latest Status'].apply(get_short_status)
         t2_pivot = pd.pivot_table(
@@ -202,13 +197,11 @@ def generate_eob_report(input_file: Path, output_file: Path):
     t2_total_row.index = ['Grand Total']
     t2_df = pd.concat([t2_df, t2_total_row])
 
-    # Build OpenPyXL Summary Worksheet
     wb_out = openpyxl.Workbook()
     ws_summary = wb_out.active
     ws_summary.title = "Summary"
     ws_summary.views.sheetView[0].showGridLines = False
 
-    # Styling definitions
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_total = Font(name="Calibri", size=11, bold=True, color="000000")
     font_data = Font(name="Calibri", size=11, color="000000")
@@ -230,9 +223,8 @@ def generate_eob_report(input_file: Path, output_file: Path):
     align_right = Alignment(horizontal='right', vertical='center')
 
     start_r = 1
-    start_c1 = 1  # Column A
+    start_c1 = 1
 
-    # WRITE TABLE 1
     headers_t1 = ['Source DC'] + list(t1_df.columns)
     for c_idx, h in enumerate(headers_t1, start=start_c1):
         cell = ws_summary.cell(row=start_r, column=c_idx, value=h)
@@ -268,8 +260,7 @@ def generate_eob_report(input_file: Path, output_file: Path):
                     if r_offset % 2 == 0:
                         cell.fill = fill_zebra
 
-    # WRITE TABLE 2 (Side-by-Side)
-    start_c2 = start_c1 + len(headers_t1) + 1  # 1 empty column gap
+    start_c2 = start_c1 + len(headers_t1) + 1
     headers_t2 = ['Source DC'] + list(t2_df.columns)
 
     for c_idx, h in enumerate(headers_t2, start=start_c2):
@@ -302,7 +293,6 @@ def generate_eob_report(input_file: Path, output_file: Path):
                 if r_offset % 2 == 0:
                     cell.fill = fill_zebra
 
-    # Column Widths
     gap_col_idx = start_c1 + len(headers_t1)
     gap_col_letter = get_column_letter(gap_col_idx)
 
@@ -318,6 +308,5 @@ def generate_eob_report(input_file: Path, output_file: Path):
                 max_len = max(max_len, len(str(cell.value)))
         ws_summary.column_dimensions[col_letter].width = max(max_len + 3, 11)
 
-    # Assemble Final Output via Stream Engine
     assemble_stream_workbook(wb_out, [raw_writer], output_path)
     log.info(f"Successfully generated EOB Report: {output_path.name}")

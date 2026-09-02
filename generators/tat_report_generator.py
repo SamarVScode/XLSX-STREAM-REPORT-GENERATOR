@@ -8,7 +8,7 @@ and generates formatted output workbook:
   1. 'SCM tat performance summary' sheet
   2. 'SCM TAT raw data' sheet
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -35,7 +35,7 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
+    open_stream_reader,
     get_sheet_names,
     ColumnFinder
 )
@@ -46,7 +46,7 @@ log = logging.getLogger("ei_stream_server.tat_report")
 def generate_tat_report(input_file: Path, output_file: Path):
     input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Loading input workbook for SCM TAT Report: {input_path.name}")
+    log.info(f"Loading input workbook for SCM TAT Report (Single-Pass Stream): {input_path.name}")
 
     sheet_names = get_sheet_names(input_path)
     sheet_map = {name.lower(): name for name in sheet_names}
@@ -58,43 +58,42 @@ def generate_tat_report(input_file: Path, output_file: Path):
     if not target_sheet and sheet_names:
         target_sheet = sheet_names[0]
 
-    row_iter = stream_sheet_rows(input_path, sheet_name=target_sheet, start_row=1)
-    headers = next(row_iter, [])
-    if not headers:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    cf = ColumnFinder(headers, {
-        'hub': ['source dc', 'source_dc', 'dc code', 'dc', 'hub'],
-        'status': ['status_status', 'status', 'task_status']
-    })
-
-    hub_idx = cf.get('hub', 28)
-    status_idx = cf.get('status', 4)
-
     stats_map = defaultdict(lambda: {'complete': 0, 'not_complete': 0})
     total_filtered = 0
 
-    raw_writer = XmlSheetWriter("SCM TAT raw data", headers)
+    with open_stream_reader(input_path, sheet_name=target_sheet) as (headers, row_iter):
+        if not headers:
+            raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
-    with raw_writer:
-        for row in row_iter:
-            if not row or len(row) <= max(hub_idx, status_idx):
-                continue
-            raw_hub = row[hub_idx]
-            if raw_hub is None:
-                continue
-            hub_clean = str(raw_hub).strip().lower()
+        cf = ColumnFinder(headers, {
+            'hub': ['source dc', 'source_dc', 'dc code', 'dc', 'hub'],
+            'status': ['status_status', 'status', 'task_status']
+        })
 
-            if hub_clean in ALLOWED_DCS_SET_LOWER:
-                total_filtered += 1
-                raw_writer.write_row(row)
+        hub_idx = cf.get('hub', 28)
+        status_idx = cf.get('status', 4)
 
-                status = str(row[status_idx] or '').strip().lower()
-                hub_upper = hub_clean.upper()
-                if status in ('closed', 'task resolved', 'resolved', 'complete', 'completed'):
-                    stats_map[hub_upper]['complete'] += 1
-                else:
-                    stats_map[hub_upper]['not_complete'] += 1
+        raw_writer = XmlSheetWriter("SCM TAT raw data", headers)
+
+        with raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= max(hub_idx, status_idx):
+                    continue
+                raw_hub = row[hub_idx]
+                if raw_hub is None:
+                    continue
+                hub_clean = str(raw_hub).strip().lower()
+
+                if hub_clean in ALLOWED_DCS_SET_LOWER:
+                    total_filtered += 1
+                    raw_writer.write_row(row)
+
+                    status = str(row[status_idx] or '').strip().lower()
+                    hub_upper = hub_clean.upper()
+                    if status in ('closed', 'task resolved', 'resolved', 'complete', 'completed'):
+                        stats_map[hub_upper]['complete'] += 1
+                    else:
+                        stats_map[hub_upper]['not_complete'] += 1
 
     log.info(f"Filtered {total_filtered} matching rows.")
 
@@ -155,7 +154,6 @@ def generate_tat_report(input_file: Path, output_file: Path):
     ws_sum.title = 'SCM tat performance summary'
     ws_sum.sheet_view.showGridLines = False
 
-    # Banner
     ws_sum.cell(row=1, column=1, value='SCM TAT 24Hrs Performance Summary')
     ws_sum.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
     ws_sum.cell(row=1, column=1).fill = banner_fill
@@ -167,7 +165,6 @@ def generate_tat_report(input_file: Path, output_file: Path):
         ws_sum.cell(row=1, column=c).fill = banner_fill
         ws_sum.cell(row=1, column=c).border = purple_border
 
-    # Headers
     headers_sum = ['DC Code', 'Task Completed Within TAT', 'Pending', 'Grand Total', 'Task Completed TAT %', 'Task Pending TAT %']
     for i, h in enumerate(headers_sum, 1):
         cell = ws_sum.cell(row=3, column=i, value=h)
@@ -177,7 +174,6 @@ def generate_tat_report(input_file: Path, output_file: Path):
         cell.border = purple_border
     ws_sum.row_dimensions[3].height = 24
 
-    # Data rows
     for r_idx, srow in enumerate(summary_rows):
         row_num = 4 + r_idx
         is_alt = (r_idx % 2 == 1)
@@ -211,7 +207,6 @@ def generate_tat_report(input_file: Path, output_file: Path):
 
         ws_sum.row_dimensions[row_num].height = 20
 
-    # Totals row
     t_row_num = 4 + len(summary_rows)
     for c_idx, val in enumerate(totals_row, 1):
         cell = ws_sum.cell(row=t_row_num, column=c_idx, value=val)
@@ -235,6 +230,5 @@ def generate_tat_report(input_file: Path, output_file: Path):
                 max_len = max(max_len, len(str(val)))
         ws_sum.column_dimensions[get_column_letter(col)].width = max_len + 4
 
-    # Assemble Output
     assemble_stream_workbook(wb_out, [raw_writer], output_path)
     log.info(f"Successfully generated SCM TAT Report: {output_file.name}")

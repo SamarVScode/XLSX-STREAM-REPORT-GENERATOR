@@ -8,7 +8,7 @@ and Source DC is in allowed list, computes Age_Bucket, and generates output work
   2. Critical P0 Sheet (Aging >= 2 tracking details)
   3. Raw Sheet (Full filtered dataset with Age_Bucket)
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -35,8 +35,7 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
-    inspect_spreadsheet_headers,
+    open_stream_reader,
     ColumnFinder
 )
 
@@ -141,69 +140,64 @@ def build_summary_sheet(out_wb, pivot):
 def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Reading workbook for Reverse Pendency: {input_path}")
-
-    headers = inspect_spreadsheet_headers(input_path, sheet_name='Raw')
-    if not headers:
-        row_iter = stream_sheet_rows(input_path, sheet_name='Raw', start_row=1)
-        headers = next(row_iter, [])
-
-    if not headers:
-        raise ValueError("Sheet 'Raw' is empty or not found.")
-
-    cf = ColumnFinder(headers, {
-        'region': ['region', 'reg', 'zone'],
-        'src_dc': ['source dc', 'source_dc', 'dc', 'hub', 'origin'],
-        'aging': ['aging', 'age', 'agingdays'],
-        'tracking': ['tracking_number', 'tracking_no', 'tracking_id', 'tracking id', 'waybill', 'awb', 'shipment'],
-        'attempt': ['attempt_status', 'attempt', 'status', 'laststatus']
-    })
-
-    region_idx = cf['region']
-    src_dc_idx = cf['src_dc']
-    aging_idx = cf['aging']
-    tn_idx = cf['tracking']
-    attempt_idx = cf['attempt']
-
-    raw_headers_out = list(headers) + ['Age_Bucket']
-    p0_headers = ['tracking_number', 'Source DC', 'Aging', 'Age_Bucket', 'Attempt_Status']
+    log.info(f"Reading workbook for Reverse Pendency (Single-Pass Stream): {input_path}")
 
     pivot = defaultdict(lambda: defaultdict(int))
     total_filtered = 0
     p0_count = 0
 
-    p0_writer = XmlSheetWriter("Critical P0", p0_headers)
-    raw_writer = XmlSheetWriter("Raw", raw_headers_out)
+    with open_stream_reader(input_path, sheet_name='Raw') as (headers, row_iter):
+        if not headers:
+            raise ValueError("Sheet 'Raw' is empty or not found.")
 
-    with p0_writer, raw_writer:
-        for row in stream_sheet_rows(input_path, sheet_name='Raw', start_row=2):
-            if not row or len(row) <= src_dc_idx:
-                continue
+        cf = ColumnFinder(headers, {
+            'region': ['region', 'reg', 'zone'],
+            'src_dc': ['source dc', 'source_dc', 'dc', 'hub', 'origin'],
+            'aging': ['aging', 'age', 'agingdays'],
+            'tracking': ['tracking_number', 'tracking_no', 'tracking_id', 'tracking id', 'waybill', 'awb', 'shipment'],
+            'attempt': ['attempt_status', 'attempt', 'status', 'laststatus']
+        })
 
-            region = str(row[region_idx] or '').strip().lower() if len(row) > region_idx else ''
-            dc = str(row[src_dc_idx] or '').strip().upper()
+        region_idx = cf['region']
+        src_dc_idx = cf['src_dc']
+        aging_idx = cf['aging']
+        tn_idx = cf['tracking']
+        attempt_idx = cf['attempt']
 
-            if region == 'north' and dc in ALLOWED_DCS_SET:
-                total_filtered += 1
-                aging_val = row[aging_idx] if len(row) > aging_idx else None
-                age_bucket = compute_age_bucket(aging_val)
-                pivot[dc][age_bucket] += 1
+        raw_headers_out = list(headers) + ['Age_Bucket']
+        p0_headers = ['tracking_number', 'Source DC', 'Aging', 'Age_Bucket', 'Attempt_Status']
 
-                # Write Raw row with Age_Bucket
-                r_out = list(row) + [age_bucket]
-                raw_writer.write_row(r_out)
+        p0_writer = XmlSheetWriter("Critical P0", p0_headers)
+        raw_writer = XmlSheetWriter("Raw", raw_headers_out)
 
-                # Check P0 condition (aging >= 2)
-                try:
-                    aging_num = float(aging_val) if aging_val is not None and str(aging_val).strip() != '' else 0.0
-                except (ValueError, TypeError):
-                    aging_num = 0.0
+        with p0_writer, raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= src_dc_idx:
+                    continue
 
-                if aging_num >= 2.0:
-                    p0_count += 1
-                    tno = row[tn_idx] if len(row) > tn_idx and row[tn_idx] is not None else ""
-                    att = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
-                    p0_writer.write_row([tno, dc, aging_val, age_bucket, att])
+                region = str(row[region_idx] or '').strip().lower() if len(row) > region_idx else ''
+                dc = str(row[src_dc_idx] or '').strip().upper()
+
+                if region == 'north' and dc in ALLOWED_DCS_SET:
+                    total_filtered += 1
+                    aging_val = row[aging_idx] if len(row) > aging_idx else None
+                    age_bucket = compute_age_bucket(aging_val)
+                    pivot[dc][age_bucket] += 1
+
+                    # Write Raw row with Age_Bucket
+                    raw_writer.write_row(list(row) + [age_bucket])
+
+                    # Check P0 condition (aging >= 2)
+                    try:
+                        aging_num = float(aging_val) if aging_val is not None and str(aging_val).strip() != '' else 0.0
+                    except (ValueError, TypeError):
+                        aging_num = 0.0
+
+                    if aging_num >= 2.0:
+                        p0_count += 1
+                        tno = row[tn_idx] if len(row) > tn_idx and row[tn_idx] is not None else ""
+                        att = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
+                        p0_writer.write_row([tno, dc, aging_val, age_bucket, att])
 
     log.info(f"Filtered {total_filtered} matching rows ({p0_count} P0 rows).")
 

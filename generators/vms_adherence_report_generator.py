@@ -7,7 +7,7 @@ computes summary stats by Source DC, and generates output workbook:
   1. Summary Sheet (VMS Adherence Summary Table with % and color highlights)
   2. Raw Sheet (Full filtered dataset)
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Fast Rust / openpyxl stream reader + direct disk XML streaming
 """
@@ -34,8 +34,8 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
-    inspect_spreadsheet_headers
+    open_stream_reader,
+    ColumnFinder
 )
 
 log = logging.getLogger("ei_stream_server.vms_adherence_report")
@@ -52,48 +52,40 @@ def find_col(headers, names):
 def generate_vms_adherence_report(input_file: Path, output_file: Path):
     input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Loading input workbook for VMS Adherence Report (Stream Mode): {input_path}")
-
-    # Inspect headers
-    headers = inspect_spreadsheet_headers(input_path)
-    if not headers:
-        # Fallback via first row iterator
-        row_iter = stream_sheet_rows(input_path, start_row=1)
-        headers = next(row_iter, [])
-
-    if not headers:
-        raise ValueError(f"Input file is empty: {input_path}")
-
-    source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
-    vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
+    log.info(f"Loading input workbook for VMS Adherence Report (Single-Pass Stream Mode): {input_path}")
 
     stats = defaultdict(lambda: {'done': 0, 'not_done': 0})
     total_filtered = 0
 
-    # 1. Stream Raw data directly to disk XML (0 MB RAM)
-    raw_writer = XmlSheetWriter("Raw", headers)
-    with raw_writer:
-        for row in stream_sheet_rows(input_path, start_row=2):
-            if not row or len(row) <= source_dc_idx:
-                continue
-            raw_dc = row[source_dc_idx]
-            if raw_dc is None:
-                continue
-            dc_clean = str(raw_dc).strip().lower()
+    with open_stream_reader(input_path, sheet_name='Raw') as (headers, row_iter):
+        if not headers:
+            raise ValueError(f"Input file is empty or 'Raw' sheet not found: {input_path}")
 
-            if dc_clean in ALLOWED_DCS_SET_LOWER:
-                total_filtered += 1
-                status = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
-                if status == 'done':
-                    stats[dc_clean]['done'] += 1
-                else:
-                    stats[dc_clean]['not_done'] += 1
+        source_dc_idx = find_col(headers, ['source_dc', 'source dc', 'sourcedc', 'dc'])
+        vms_status_idx = find_col(headers, ['vms status', 'vms_status', 'vmsstatus', 'status'])
 
-                raw_writer.write_row(row)
+        raw_writer = XmlSheetWriter("Raw", headers)
+        with raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= source_dc_idx:
+                    continue
+                raw_dc = row[source_dc_idx]
+                if raw_dc is None:
+                    continue
+                dc_clean = str(raw_dc).strip().lower()
+
+                if dc_clean in ALLOWED_DCS_SET_LOWER:
+                    total_filtered += 1
+                    status = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
+                    if status == 'done':
+                        stats[dc_clean]['done'] += 1
+                    else:
+                        stats[dc_clean]['not_done'] += 1
+
+                    raw_writer.write_row(row)
 
     log.info(f"Filtered {total_filtered} matching rows.")
 
-    # 2. Build styled Summary sheet in memory (~40 KB RAM)
     sorted_dcs = sorted(stats.keys())
     summary_rows = []
     for dc in sorted_dcs:
@@ -139,12 +131,10 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
     header_font = Font(bold=True, size=10, color='FFFFFFFF')
     center = Alignment(horizontal='center', vertical='center')
 
-    # Fill white background
     for r in range(1, len(summary_rows) + 10):
         for c in range(1, 8):
             ws_sum.cell(row=r, column=c).fill = white_fill
 
-    # Banner
     ws_sum.cell(row=1, column=1, value='VMS Adherence Summary')
     ws_sum.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
     banner_cell = ws_sum.cell(row=1, column=1)
@@ -153,7 +143,6 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
     banner_cell.alignment = center
     ws_sum.row_dimensions[1].height = 22
 
-    # Headers
     sum_headers = ['Source DC', 'Total', 'VMS Done', 'VMS Not Done', 'Done %']
     for i, h in enumerate(sum_headers, 1):
         cell = ws_sum.cell(row=3, column=i, value=h)
@@ -163,7 +152,6 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
         cell.border = purple_border
     ws_sum.row_dimensions[3].height = 24
 
-    # Data rows
     for r_idx, srow in enumerate(summary_rows):
         row_num = 4 + r_idx
         is_alt = (r_idx % 2 == 1)
@@ -181,7 +169,6 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
 
         ws_sum.cell(row=row_num, column=5).number_format = '0.0%'
 
-        # Done % color
         done_pct = srow[4]
         pct_cell = ws_sum.cell(row=row_num, column=5)
         pct_cell.font = Font(bold=True, size=9)
@@ -197,7 +184,6 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
 
         ws_sum.row_dimensions[row_num].height = 20
 
-    # Auto-fit columns
     for col in range(1, 6):
         max_len = len(str(sum_headers[col - 1]))
         for r in range(4, 4 + len(summary_rows)):
@@ -206,6 +192,5 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path):
                 max_len = max(max_len, len(str(val)))
         ws_sum.column_dimensions[get_column_letter(col)].width = max_len + 4
 
-    # 3. Assemble final .xlsx in 1 line
     assemble_stream_workbook(wb_out, [raw_writer], output_path)
     log.info(f"Successfully generated VMS Adherence Report: {output_file.name} ({total_filtered} rows)")

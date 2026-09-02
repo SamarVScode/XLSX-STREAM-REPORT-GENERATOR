@@ -7,7 +7,7 @@ computes Promoter/Neutral/Detractor stats by DC and by Agent, and generates outp
   1. Summary Sheet (Response Breakdown tables by DC & Agent with NPS%)
   2. Raw Sheet (Filtered raw dataset)
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -34,7 +34,7 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
+    open_stream_reader,
     get_sheet_names,
     ColumnFinder
 )
@@ -52,7 +52,7 @@ def nps_pct(p, n, d):
 def generate_nps_report(input_file: Path, output_file: Path):
     input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Loading input workbook for NPS Report: {input_path.name}")
+    log.info(f"Loading input workbook for NPS Report (Single-Pass Stream): {input_path.name}")
 
     sheet_names = get_sheet_names(input_path)
     sheet_map = {name.lower(): name for name in sheet_names}
@@ -64,52 +64,51 @@ def generate_nps_report(input_file: Path, output_file: Path):
     if not target_sheet and sheet_names:
         target_sheet = sheet_names[0]
 
-    row_iter = stream_sheet_rows(input_path, sheet_name=target_sheet, start_row=1)
-    headers = next(row_iter, [])
-    if not headers:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    cf = ColumnFinder(headers, {
-        'sdc': ['source_dc', 'source dc', 'dc', 'hub'],
-        'option': ['option', 'nps_option', 'nps option', 'response'],
-        'agent': ['agent_name', 'agent name', 'agent', 'delivery_agent']
-    })
-
-    source_dc_idx = cf.get('sdc', 28)
-    option_idx = cf.get('option', 4)
-    agent_idx = cf.get('agent', 22)
-
     dc_stats = defaultdict(lambda: {'P': 0, 'N': 0, 'D': 0})
     agent_stats = defaultdict(lambda: {'P': 0, 'N': 0, 'D': 0})
     total_filtered = 0
 
-    raw_writer = XmlSheetWriter("Raw", headers)
+    with open_stream_reader(input_path, sheet_name=target_sheet) as (headers, row_iter):
+        if not headers:
+            raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
-    with raw_writer:
-        for row in row_iter:
-            if not row or len(row) <= source_dc_idx:
-                continue
-            raw_dc = row[source_dc_idx]
-            if raw_dc is None:
-                continue
-            source_dc = str(raw_dc).strip().upper()
+        cf = ColumnFinder(headers, {
+            'sdc': ['source_dc', 'source dc', 'dc', 'hub'],
+            'option': ['option', 'nps_option', 'nps option', 'response'],
+            'agent': ['agent_name', 'agent name', 'agent', 'delivery_agent']
+        })
 
-            if source_dc in ALLOWED_DCS_SET:
-                total_filtered += 1
-                raw_writer.write_row(row)
+        source_dc_idx = cf.get('sdc', 28)
+        option_idx = cf.get('option', 4)
+        agent_idx = cf.get('agent', 22)
 
-                option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
-                agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
+        raw_writer = XmlSheetWriter("Raw", headers)
 
-                if option == 'Promoter':
-                    dc_stats[source_dc]['P'] += 1
-                    agent_stats[(source_dc, agent)]['P'] += 1
-                elif option == 'Neutral':
-                    dc_stats[source_dc]['N'] += 1
-                    agent_stats[(source_dc, agent)]['N'] += 1
-                elif option == 'Detractor':
-                    dc_stats[source_dc]['D'] += 1
-                    agent_stats[(source_dc, agent)]['D'] += 1
+        with raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= source_dc_idx:
+                    continue
+                raw_dc = row[source_dc_idx]
+                if raw_dc is None:
+                    continue
+                source_dc = str(raw_dc).strip().upper()
+
+                if source_dc in ALLOWED_DCS_SET:
+                    total_filtered += 1
+                    raw_writer.write_row(row)
+
+                    option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
+                    agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
+
+                    if option == 'Promoter':
+                        dc_stats[source_dc]['P'] += 1
+                        agent_stats[(source_dc, agent)]['P'] += 1
+                    elif option == 'Neutral':
+                        dc_stats[source_dc]['N'] += 1
+                        agent_stats[(source_dc, agent)]['N'] += 1
+                    elif option == 'Detractor':
+                        dc_stats[source_dc]['D'] += 1
+                        agent_stats[(source_dc, agent)]['D'] += 1
 
     log.info(f"Filtered {total_filtered} rows matching allowed DCs")
 

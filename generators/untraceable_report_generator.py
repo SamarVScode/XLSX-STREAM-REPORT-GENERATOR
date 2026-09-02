@@ -7,7 +7,7 @@ computes shipment count pivot by Source DC and Age Bucket, and generates output 
   1. Summary Sheet (Merged 'Age Bucket' super-header, 0-value DCs & 0-cells omitted, soft red highlight for >= 6-10 days)
   2. Raw Sheet (Filtered raw records for allowed DC Config hubs)
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -34,7 +34,7 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
+    open_stream_reader,
     get_sheet_names,
     ColumnFinder
 )
@@ -51,7 +51,7 @@ HIGHLIGHT_AGING_BUCKETS = {'6-10 Days', '11-20 Days', '21-30 Days', '>30 Days', 
 def generate_untraceable_report(input_file: Path, output_file: Path):
     input_path = Path(input_file)
     output_path = Path(output_file)
-    log.info(f"Loading input workbook for Untraceable Report: {input_path.name}")
+    log.info(f"Loading input workbook for Untraceable Report (Single-Pass Stream): {input_path.name}")
 
     sheet_names = get_sheet_names(input_path)
     sheet_map = {name.lower(): name for name in sheet_names}
@@ -63,51 +63,51 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
     if not target_sheet and sheet_names:
         target_sheet = sheet_names[0]
 
-    row_iter = stream_sheet_rows(input_path, sheet_name=target_sheet, start_row=1)
-    raw_headers = next(row_iter, [])
-    if not raw_headers:
-        raise ValueError(f"Sheet '{target_sheet}' is empty.")
-
-    cf = ColumnFinder(raw_headers, {
-        'sdc': ['source dc', 'sourcedc', 'source_dc', 'dc', 'hub'],
-        'age': ['age bucket', 'age_bucket', 'aging bucket', 'ageing bucket', 'age'],
-        'amt': ['amount', 'shipmentamount', 'value']
-    })
-
-    source_dc_idx = cf.get('sdc', 0)
-    age_bucket_idx = cf.get('age', 1)
-    amt_idx = cf.get('amt', 2)
-
     filtered_records = []
-    raw_writer = XmlSheetWriter("Raw", raw_headers)
 
-    with raw_writer:
-        for row in row_iter:
-            if not row or len(row) <= source_dc_idx:
-                continue
-            raw_dc = row[source_dc_idx]
-            if raw_dc is None:
-                continue
-            dc_clean = str(raw_dc).strip().lower()
+    with open_stream_reader(input_path, sheet_name=target_sheet) as (raw_headers, row_iter):
+        if not raw_headers:
+            raise ValueError(f"Sheet '{target_sheet}' is empty.")
 
-            if dc_clean in ALLOWED_DCS_SET_LOWER:
-                raw_writer.write_row(row)
+        cf = ColumnFinder(raw_headers, {
+            'sdc': ['source dc', 'sourcedc', 'source_dc', 'dc', 'hub'],
+            'age': ['age bucket', 'age_bucket', 'aging bucket', 'ageing bucket', 'age'],
+            'amt': ['amount', 'shipmentamount', 'value']
+        })
 
-                dc_name = str(raw_dc).strip().upper()
-                age_val = str(row[age_bucket_idx]).strip() if len(row) > age_bucket_idx and row[age_bucket_idx] is not None else '0-2 Days'
-                
-                amt_val = 0.0
-                if len(row) > amt_idx and row[amt_idx] is not None:
-                    try:
-                        amt_val = float(row[amt_idx])
-                    except (ValueError, TypeError):
-                        amt_val = 0.0
+        source_dc_idx = cf.get('sdc', 0)
+        age_bucket_idx = cf.get('age', 1)
+        amt_idx = cf.get('amt', 2)
 
-                filtered_records.append({
-                    'Source_DC': dc_name,
-                    'Age_Bucket': age_val,
-                    'Amount': amt_val
-                })
+        raw_writer = XmlSheetWriter("Raw", raw_headers)
+
+        with raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= source_dc_idx:
+                    continue
+                raw_dc = row[source_dc_idx]
+                if raw_dc is None:
+                    continue
+                dc_clean = str(raw_dc).strip().lower()
+
+                if dc_clean in ALLOWED_DCS_SET_LOWER:
+                    raw_writer.write_row(row)
+
+                    dc_name = str(raw_dc).strip().upper()
+                    age_val = str(row[age_bucket_idx]).strip() if len(row) > age_bucket_idx and row[age_bucket_idx] is not None else '0-2 Days'
+                    
+                    amt_val = 0.0
+                    if len(row) > amt_idx and row[amt_idx] is not None:
+                        try:
+                            amt_val = float(row[amt_idx])
+                        except (ValueError, TypeError):
+                            amt_val = 0.0
+
+                    filtered_records.append({
+                        'Source_DC': dc_name,
+                        'Age_Bucket': age_val,
+                        'Amount': amt_val
+                    })
 
     log.info(f"Filtered {len(filtered_records)} records based on dc_config.")
 
@@ -116,7 +116,6 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
     else:
         df_filtered = pd.DataFrame(filtered_records)
 
-    # Determine age bucket order
     raw_buckets = df_filtered['Age_Bucket'].dropna().unique().tolist()
     present_buckets = [b for b in STANDARD_AGE_BUCKETS if b in raw_buckets]
     other_buckets = [b for b in raw_buckets if b not in STANDARD_AGE_BUCKETS]
@@ -124,7 +123,6 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
     if not all_buckets:
         all_buckets = STANDARD_AGE_BUCKETS
 
-    # Pivot: Source DC x Age Buckets
     if not df_filtered.empty:
         p_cnt = df_filtered.groupby(['Source_DC', 'Age_Bucket']).size().unstack(fill_value=0)
         p_cnt = p_cnt.reindex(columns=all_buckets, fill_value=0)

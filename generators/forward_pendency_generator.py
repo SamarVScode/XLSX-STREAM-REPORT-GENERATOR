@@ -8,7 +8,7 @@ computes the 'Aging Category' column right beside 'Aging', and generates output 
   2. CPD-DID pendency Sheet (P2 & P3 actual row details)
   3. RAW Sheet (Full filtered rows dataset with Aging Category)
 
-Uses Centralized Zero-Memory Streaming Engine (core.stream_engine):
+Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
 - Direct XML disk streaming for massive datasets
 """
@@ -35,12 +35,10 @@ except ImportError:
 from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
-    stream_sheet_rows,
-    inspect_spreadsheet_headers,
+    open_stream_reader,
     ColumnFinder
 )
 
-# Core 11 North Hubs for Forward Pendency
 PRIMARY_NORTH_DCS = ['ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR']
 AGING_CATEGORIES = ['0-2 days', '3-5 days', '5-10 days', '>10 days']
 
@@ -48,7 +46,6 @@ log = logging.getLogger("ei_stream_server.forward_pendency")
 
 
 def compute_aging_category(val) -> str:
-    """Calculates the Aging Category bucket string. Empty/None defaults to '0-2 days'."""
     if val is None or str(val).strip() == "":
         return "0-2 days"
     try:
@@ -66,10 +63,6 @@ def compute_aging_category(val) -> str:
 
 
 def normalize_priority(val) -> str:
-    """
-    Normalizes priority values to P1, P2, P3, P4, or Unknown.
-    Handles integers (2, 3, 4), floats (2.0, 3.0), strings ('P2', 'Priority 2', etc.).
-    """
     if val is None:
         return "Unknown"
     s = str(val).strip().upper()
@@ -95,7 +88,6 @@ def normalize_priority(val) -> str:
 
 
 def write_side_table(ws, start_col: int, start_row: int, title: str, headers: list, data_matrix: list):
-    """Writes a side-by-side formatted summary table with spanned title and red/green highlights."""
     end_col = start_col + len(headers) - 1
 
     title_fill = PatternFill("solid", fgColor="1E1B4B")
@@ -180,7 +172,6 @@ def write_side_table(ws, start_col: int, start_row: int, title: str, headers: li
 
 
 def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
-    """Generates the Summary tab with Table 1, Table 2, and Table 3 placed SIDEWISE."""
     ws = out_wb.active
     ws.title = "Summary"
     ws.sheet_view.showGridLines = False
@@ -262,45 +253,13 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
 
 
 def generate_forward_pendency_report(input_file: Path, output_file: Path):
-    """
-    Main generator pipeline for Forward Pendency Report using unified stream_engine.
-    """
     input_path = Path(input_file)
     output_path = Path(output_file)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    log.info(f"Loading input workbook for Forward Pendency Report: {input_path}")
+    log.info(f"Loading input workbook for Forward Pendency Report (Single-Pass Stream): {input_path}")
 
-    headers = inspect_spreadsheet_headers(input_path, sheet_name='raw_data_North')
-    if not headers:
-        row_iter = stream_sheet_rows(input_path, sheet_name='raw_data_North', start_row=1)
-        headers = next(row_iter, [])
-
-    if not headers:
-        raise ValueError("Sheet 'raw_data_North' is empty or not found.")
-
-    # Column resolution via ColumnFinder
-    cf = ColumnFinder(headers, {
-        'aging': ['aging', 'agingbucket', 'agebucket', 'ageing', 'agingdays'],
-        'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc'],
-        'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio'],
-        'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb'],
-        'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt']
-    })
-
-    aging_col_idx = cf['aging']
-    sdc_idx = cf['sdc']
-    prio_idx = cf['prio']
-    shipment_idx = cf['shipment']
-    attempt_idx = cf['attempt']
-
-    # Prepared headers for RAW and CPD-DID
-    raw_header_out = list(headers)
-    raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
-    cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
-
-    # Pivot aggregators
     t1_pivot = defaultdict(lambda: defaultdict(int))
     t2_pivot = defaultdict(lambda: defaultdict(int))
     t3_pivot = defaultdict(lambda: defaultdict(int))
@@ -308,54 +267,75 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     total_filtered = 0
     cpd_count = 0
 
-    # 1. Stream both CPD-DID and RAW directly to disk XML (0 MB RAM)
-    cpd_writer = XmlSheetWriter("CPD-DID pendency", cpd_headers)
-    raw_writer = XmlSheetWriter("RAW", raw_header_out)
+    with open_stream_reader(input_path, sheet_name='raw_data_North') as (headers, row_iter):
+        if not headers:
+            raise ValueError("Sheet 'raw_data_North' is empty or not found.")
 
-    with cpd_writer, raw_writer:
-        for row in stream_sheet_rows(input_path, sheet_name='raw_data_North', start_row=2):
-            if not row or len(row) <= sdc_idx:
-                continue
-            raw_sdc = row[sdc_idx]
-            if raw_sdc is None:
-                continue
-            sdc = str(raw_sdc).strip().lower()
+        cf = ColumnFinder(headers, {
+            'aging': ['aging', 'agingbucket', 'agebucket', 'ageing', 'agingdays'],
+            'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc'],
+            'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio'],
+            'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb'],
+            'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt']
+        })
 
-            if sdc in ALLOWED_DCS_SET_LOWER:
-                total_filtered += 1
-                sdc_upper = sdc.upper()
-                aging_val = row[aging_col_idx] if len(row) > aging_col_idx else None
-                aging_cat = compute_aging_category(aging_val)
+        aging_col_idx = cf['aging']
+        sdc_idx = cf['sdc']
+        prio_idx = cf['prio']
+        shipment_idx = cf['shipment']
+        attempt_idx = cf['attempt']
 
-                raw_prio = row[prio_idx] if len(row) > prio_idx else None
-                prio = normalize_priority(raw_prio)
+        raw_header_out = list(headers)
+        raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
+        cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
 
-                # Aggregate pivots
-                t1_pivot[sdc_upper][aging_cat] += 1
-                t2_pivot[sdc_upper][prio] += 1
-                if prio == "P3":
-                    t3_pivot[sdc_upper]["CPD (P3)"] += 1
-                elif prio == "P2":
-                    t3_pivot[sdc_upper]["DID (P2)"] += 1
+        cpd_writer = XmlSheetWriter("CPD-DID pendency", cpd_headers)
+        raw_writer = XmlSheetWriter("RAW", raw_header_out)
 
-                # Write RAW row (insert Aging Category)
-                r_out = list(row)
-                r_out.insert(aging_col_idx + 1, aging_cat)
-                raw_writer.write_row(r_out)
+        with cpd_writer, raw_writer:
+            for row in row_iter:
+                if not row or len(row) <= sdc_idx:
+                    continue
+                raw_sdc = row[sdc_idx]
+                if raw_sdc is None:
+                    continue
+                sdc = str(raw_sdc).strip().lower()
 
-                # Write CPD-DID row if P2 or P3
-                if prio in ("P2", "P3"):
-                    cpd_count += 1
-                    shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
-                    attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
-                    cpd_writer.write_row([shipment, sdc_upper, aging_cat, attempt_stat, prio])
+                if sdc in ALLOWED_DCS_SET_LOWER:
+                    total_filtered += 1
+                    sdc_upper = sdc.upper()
+                    aging_val = row[aging_col_idx] if len(row) > aging_col_idx else None
+                    aging_cat = compute_aging_category(aging_val)
+
+                    raw_prio = row[prio_idx] if len(row) > prio_idx else None
+                    prio = normalize_priority(raw_prio)
+
+                    # Aggregate pivots
+                    t1_pivot[sdc_upper][aging_cat] += 1
+                    t2_pivot[sdc_upper][prio] += 1
+                    if prio == "P3":
+                        t3_pivot[sdc_upper]["CPD (P3)"] += 1
+                    elif prio == "P2":
+                        t3_pivot[sdc_upper]["DID (P2)"] += 1
+
+                    # Write RAW row (insert Aging Category)
+                    r_out = list(row)
+                    r_out.insert(aging_col_idx + 1, aging_cat)
+                    raw_writer.write_row(r_out)
+
+                    # Write CPD-DID row if P2 or P3
+                    if prio in ("P2", "P3"):
+                        cpd_count += 1
+                        shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
+                        attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
+                        cpd_writer.write_row([shipment, sdc_upper, aging_cat, attempt_stat, prio])
 
     log.info(f"Filtered {total_filtered} matching rows ({cpd_count} CPD-DID rows).")
 
-    # 2. Build tiny styled Summary sheet in memory (~50 KB RAM)
+    # Build Summary sheet
     out_wb = Workbook()
     build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot)
 
-    # 3. Assemble final .xlsx in 1 single line
+    # Assemble final .xlsx
     assemble_stream_workbook(out_wb, [cpd_writer, raw_writer], output_path)
     log.info(f"Successfully generated Forward Pendency Report: {output_file.name} ({total_filtered} rows)")
