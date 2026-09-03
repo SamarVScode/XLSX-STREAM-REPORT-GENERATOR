@@ -118,7 +118,7 @@ def test_conversion_stream():
             num_fmt = ws_dc.cell(row=2, column=col_idx).number_format
             if header in ('Picked-up', 'OFP'):
                 assert isinstance(cell_val, int)
-                assert num_fmt == '#,##0'
+                assert num_fmt == '0'
             elif header and '%' in str(header):
                 assert num_fmt == '0.0%'
 

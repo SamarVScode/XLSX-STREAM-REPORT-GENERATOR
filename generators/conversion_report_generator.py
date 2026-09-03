@@ -235,11 +235,11 @@ def style_sheet(ws, pct_cols=None):
                 if isinstance(cell.value, (int, float)):
                     if isinstance(cell.value, float) and abs(cell.value - round(cell.value)) < 1e-9:
                         cell.value = int(round(cell.value))
-                        cell.number_format = '#,##0'
+                        cell.number_format = '0'
                     elif isinstance(cell.value, int):
-                        cell.number_format = '#,##0'
+                        cell.number_format = '0'
                     elif isinstance(cell.value, float):
-                        cell.number_format = '#,##0.00'
+                        cell.number_format = '0.00'
 
     ws.auto_filter.ref = ws.dimensions
 
