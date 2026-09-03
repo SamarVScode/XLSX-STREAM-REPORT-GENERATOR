@@ -263,29 +263,69 @@ def test_ei_stream():
         tmp_path = Path(tmpdir)
         src_xlsx = tmp_path / "ei_src.xlsx"
         out_xlsx = tmp_path / "ei_out.xlsx"
-        
+
         wb = Workbook()
         ws_task = wb.active
         ws_task.title = "Task_per_1k"
-        
-        today = datetime.now().date()
-        yday = datetime.combine(today - timedelta(days=1), datetime.min.time())
-        
-        row1 = ["Source_DC", "Region", "City", yday, "", "", "", "", "", "WTD", "", "", "", "", ""]
-        ws_task.append(row1)
-        row2 = ["", "", "", "OFD", "Forward_Task", "Fwd_Task_per_1k", "OFP", "Reverse_Task", "Rev_Task_per_1k",
-                "OFD", "Forward_Task", "Fwd_Task_per_1k", "OFP", "Reverse_Task", "Rev_Task_per_1k"]
-        ws_task.append(row2)
-        row3 = ["ALG", "North", "Aligarh", 100, 5, 50.0, 50, 2, 40.0, 500, 20, 40.0, 200, 10, 50.0]
-        ws_task.append(row3)
-        
+
+        yesterday = datetime.now() - timedelta(days=1)
+        ws_task.cell(1, 1, "DC")
+        ws_task.cell(1, 2, "Region")
+        ws_task.cell(1, 3, "City")
+        ws_task.cell(1, 4, yesterday)
+        ws_task.cell(1, 10, "WTD")
+
+        ws_task.cell(3, 1, "ALG")
+        ws_task.cell(3, 2, "North")
+        ws_task.cell(3, 3, "Aligarh")
+        # daily
+        ws_task.cell(3, 4, 100) # OFD
+        ws_task.cell(3, 5, 2)   # FWD Task
+        ws_task.cell(3, 6, 20)  # FWD 1k
+        ws_task.cell(3, 7, 50)  # OFP
+        ws_task.cell(3, 8, 1)   # REV Task
+        ws_task.cell(3, 9, 20)  # REV 1k
+        # WTD
+        ws_task.cell(3, 10, 500) # OFD
+        ws_task.cell(3, 11, 10)  # FWD Task
+        ws_task.cell(3, 12, 20)  # FWD 1k
+        ws_task.cell(3, 13, 250) # OFP
+        ws_task.cell(3, 14, 5)   # REV Task
+        ws_task.cell(3, 15, 20)  # REV 1k
+
         ws_raw = wb.create_sheet("Raw")
-        raw_headers = ["source_dc", "tracking_no", "agent_name"]
-        ws_raw.append(raw_headers)
-        ws_raw.append(["ALG", "MYSC12345", "Agent 1"])
-        ws_raw.append(["ALG", "MYSR12345", "Agent 2"])
-        
+        ws_raw.append(["Source_DC", "Final_tracking_no", "fwd_agent name", "rev_agent name"])
+        ws_raw.append(["ALG", "MYSC12345", "Agent A", ""])
+        ws_raw.append(["ALG", "MYSR12345", "", "Agent B"])
+
         wb.save(src_xlsx)
-        
+
         generate_ei_report(str(src_xlsx), str(out_xlsx))
         assert out_xlsx.exists()
+
+        import openpyxl
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert wb_out.sheetnames == ["SUMMARY", "Filtered_Source_DC", "FWD EI", "REVERSE EI", "Agent Summary"]
+        ws_summary = wb_out["SUMMARY"]
+
+        # Check side-by-side title headers in row 1
+        assert ws_summary.cell(1, 1).value == "Forward EI"
+        assert ws_summary.cell(1, 7).value == "Reverse EI"
+        assert ws_summary.cell(1, 13).value == "Weekly Forward EI"
+        assert ws_summary.cell(1, 19).value == "Weekly Reverse EI"
+
+        # Check column headers in row 2
+        assert ws_summary.cell(2, 1).value == "Date"
+        assert ws_summary.cell(2, 2).value == "Source_DC"
+        assert ws_summary.cell(2, 7).value == "Date"
+        assert ws_summary.cell(2, 8).value == "Source_DC"
+        assert ws_summary.cell(2, 13).value == "Date"
+        assert ws_summary.cell(2, 14).value == "Source_DC"
+        assert ws_summary.cell(2, 19).value == "Date"
+        assert ws_summary.cell(2, 20).value == "Source_DC"
+
+        # Check data row 3
+        assert ws_summary.cell(3, 2).value == "ALG"
+        assert ws_summary.cell(3, 8).value == "ALG"
+        assert ws_summary.cell(3, 14).value == "ALG"
+        assert ws_summary.cell(3, 20).value == "ALG"

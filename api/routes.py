@@ -113,7 +113,7 @@ async def get_job_status_route(
         default_tabs = {
             "2nd_attempt_adherence": ["Summary", "Raw"],
             "second_attempt_adherence": ["Summary", "Raw"],
-            "ei": ["Summary", "Raw", "FWD", "REV", "Agent Summary"],
+            "ei": ["SUMMARY", "Filtered_Source_DC", "FWD EI", "REVERSE EI", "Agent Summary"],
             "tat": ["Summary", "SCM TAT raw data"],
             "scm_tat": ["Summary", "SCM TAT raw data"],
             "forward_pendency": ["Summary", "Raw", "CPD-DID"],
