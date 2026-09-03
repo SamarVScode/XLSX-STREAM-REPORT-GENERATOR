@@ -5,20 +5,21 @@
 # ============================================================
 
 ALLOWED_SOURCE_DCS = [
-    'ALG', 'AYP', 'DEO', 'JHS', 'JNP',
-    'KNP', 'MAU', 'MRZ', 'MTH', 'MZN',
-    'RBR', 'SPR', 'VNS', 'ALL', 'NDL',
-    'JAI', 'GUR', 'WDL', 'LKO', 'LXR',
-    'NDA', 'GRM', 'SDL', 'GZB', 'GND',
-    'CAR', 'FAR', 'MPR', 'MHP', 'MEE',
-    'DRD', 'UDR', 'JLD', 'LDH', 'JMU',
-    'ALW', 'JDH', 'AGR', 'GKP', 'MOR',
-    'ATQ', 'KRN', 'BRL', 'KOT', 'ROH',
-    'HDN', 'BKR', 'SIK', 'SGG', 'HIS',
-    'PTL', 'BLW', 'AJM', 'AMB', 'RKR',
-    'HRD', 'RDP', 'RUP', 'YMG', 'BTD',
-    'SRG', 'PPT', 'KRK', 'SHM', 'RSH',
-    'SON', 'PTK', 'LUD', 'FZD'
+    'GZB', 'NDA', 'GND', 'WDL', 'MEE',
+    'AGR', 'MTH', 'SPR', 'MZN', 'HPA',
+    'FZD', 'LKO', 'BRL', 'MOR', 'GKP',
+    'DRD', 'HDN', 'HRD', 'RDP', 'RSH',
+    'RKR', 'GRM', 'GUR', 'KOT', 'JDH',
+    'UDR', 'AJM', 'BKR', 'BLW', 'SIK',
+    'SGG', 'ALW', 'HIS', 'ROH', 'SON',
+    'PPT', 'KRN', 'AMB', 'YMG', 'KRK',
+    'JMU', 'ATQ', 'SRG', 'PTK', 'NBZ',
+    'LXR', 'FAR', 'SDL', 'JAI', 'ALL',
+    'KNP', 'VNS', 'MAU', 'MRZ', 'AYP',
+    'ALG', 'DEO', 'JNP', 'JHS', 'RBR',
+    'BTD', 'CAR', 'JLD', 'LDH', 'LUD',
+    'PTL', 'RUP', 'SHM', 'MPR', 'MHP',
+    'NDL'
 ]
 
 ALLOWED_DCS_SET = set(ALLOWED_SOURCE_DCS)
