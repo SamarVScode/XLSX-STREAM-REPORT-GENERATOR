@@ -180,12 +180,23 @@ def assemble_stream_workbook(
     """
     Stitches in-memory styled OpenPyXL Summary workbook with any number of disk-streamed XML data sheets.
     Generates standard valid OpenXML .xlsx archive with constant O(1) memory.
+    Supports both placeholder sheet replacement (for exact tab positioning) and appending.
     """
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     for s_writer in stream_sheets:
         s_writer.close()
+
+    stream_map = {s_writer.sheet_name: s_writer for s_writer in stream_sheets}
+    summary_sheetnames = list(summary_workbook.sheetnames) if hasattr(summary_workbook, 'sheetnames') else []
+
+    placeholder_replacements = {}
+    for idx, s_name in enumerate(summary_sheetnames, start=1):
+        if s_name in stream_map:
+            placeholder_replacements[f'xl/worksheets/sheet{idx}.xml'] = stream_map[s_name]
+
+    unmatched_stream_sheets = [s for s in stream_sheets if s.sheet_name not in summary_sheetnames]
 
     # Save summary workbook to in-memory bytes
     temp_sum = io.BytesIO()
@@ -199,38 +210,52 @@ def assemble_stream_workbook(
     z_in = zipfile.ZipFile(temp_sum, 'r')
     z_out = zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED)
 
-    num_summary_sheets = len(summary_workbook.sheetnames) if hasattr(summary_workbook, 'sheetnames') else 1
+    num_summary_sheets = len(summary_sheetnames) if summary_sheetnames else 1
 
     for item in z_in.infolist():
-        if item.filename == '[Content_Types].xml':
+        if item.filename in placeholder_replacements:
+            s_writer = placeholder_replacements[item.filename]
+            with z_out.open(item.filename, 'w', force_zip64=True) as zf_entry:
+                if s_writer.temp_file and s_writer.temp_file.exists():
+                    with open(s_writer.temp_file, 'rb') as f_xml_in:
+                        while True:
+                            buf = f_xml_in.read(1024 * 1024)
+                            if not buf:
+                                break
+                            zf_entry.write(buf)
+
+        elif item.filename == '[Content_Types].xml':
             ct = z_in.read(item.filename).decode('utf-8')
-            overrides = []
-            for idx, _ in enumerate(stream_sheets, start=num_summary_sheets + 1):
-                overrides.append(f'<Override PartName="/xl/worksheets/sheet{idx}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
-            ct = ct.replace('</Types>', ''.join(overrides) + '</Types>')
+            if unmatched_stream_sheets:
+                overrides = []
+                for idx, _ in enumerate(unmatched_stream_sheets, start=num_summary_sheets + 1):
+                    overrides.append(f'<Override PartName="/xl/worksheets/sheet{idx}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+                ct = ct.replace('</Types>', ''.join(overrides) + '</Types>')
             z_out.writestr(item.filename, ct)
 
         elif item.filename == 'xl/workbook.xml':
             wb_xml = z_in.read(item.filename).decode('utf-8')
-            sheet_tags = []
-            for idx, s_writer in enumerate(stream_sheets, start=num_summary_sheets + 1):
-                safe_sheet_name = esc(s_writer.sheet_name)
-                sheet_tags.append(f'<sheet name="{safe_sheet_name}" sheetId="{idx}" r:id="rId{idx}"/>')
-            wb_xml = wb_xml.replace('</sheets>', ''.join(sheet_tags) + '</sheets>')
+            if unmatched_stream_sheets:
+                sheet_tags = []
+                for idx, s_writer in enumerate(unmatched_stream_sheets, start=num_summary_sheets + 1):
+                    safe_sheet_name = esc(s_writer.sheet_name)
+                    sheet_tags.append(f'<sheet name="{safe_sheet_name}" sheetId="{idx}" r:id="rId{idx}"/>')
+                wb_xml = wb_xml.replace('</sheets>', ''.join(sheet_tags) + '</sheets>')
             z_out.writestr(item.filename, wb_xml)
 
         elif item.filename == 'xl/_rels/workbook.xml.rels':
             wb_rels = z_in.read(item.filename).decode('utf-8')
-            rel_tags = []
-            for idx, _ in enumerate(stream_sheets, start=num_summary_sheets + 1):
-                rel_tags.append(f'<Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{idx}.xml"/>')
-            wb_rels = wb_rels.replace('</Relationships>', ''.join(rel_tags) + '</Relationships>')
+            if unmatched_stream_sheets:
+                rel_tags = []
+                for idx, _ in enumerate(unmatched_stream_sheets, start=num_summary_sheets + 1):
+                    rel_tags.append(f'<Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{idx}.xml"/>')
+                wb_rels = wb_rels.replace('</Relationships>', ''.join(rel_tags) + '</Relationships>')
             z_out.writestr(item.filename, wb_rels)
 
         else:
             z_out.writestr(item, z_in.read(item.filename))
 
-    for idx, s_writer in enumerate(stream_sheets, start=num_summary_sheets + 1):
+    for idx, s_writer in enumerate(unmatched_stream_sheets, start=num_summary_sheets + 1):
         with z_out.open(f'xl/worksheets/sheet{idx}.xml', 'w', force_zip64=True) as zf_entry:
             if s_writer.temp_file and s_writer.temp_file.exists():
                 with open(s_writer.temp_file, 'rb') as f_xml_in:

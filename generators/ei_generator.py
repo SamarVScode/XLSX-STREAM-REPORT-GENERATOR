@@ -2,21 +2,35 @@ import sys
 import os
 import gc
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Union
+from typing import Union, List, Dict, Any, Optional
+
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
+
+# Ensure server root is in sys.path
+SERVER_ROOT = Path(__file__).resolve().parent.parent
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
+
 try:
     from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
 except ImportError:
     from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
 
+from core.stream_engine import (
+    XmlSheetWriter,
+    assemble_stream_workbook,
+    open_stream_reader,
+    get_sheet_names,
+    ColumnFinder
+)
+
 log = logging.getLogger("ei_stream_server.ei_generator")
 
-# Alias for backward compatibility within this module
 ALLOWED_SOURCE_DC = ALLOWED_SOURCE_DCS
 
 IDENTITY_COLS = 3
@@ -68,45 +82,68 @@ def _safe_float(val, fallback=0.0):
     except (TypeError, ValueError):
         return fallback
 
-def parse_task_per_1k(ws):
-    max_col = ws.max_column
-    max_row = ws.max_row
-    row1 = [ws.cell(1, c).value for c in range(1, max_col + 1)]
+def _parse_date(val):
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, date):
+        return datetime.combine(val, datetime.min.time())
+    if isinstance(val, (int, float)):
+        try:
+            return datetime(1899, 12, 30) + timedelta(days=float(val))
+        except Exception:
+            pass
+    if isinstance(val, str):
+        val = val.strip()
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%d-%b-%Y', '%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y'):
+            try:
+                return datetime.strptime(val, fmt)
+            except ValueError:
+                pass
+    return val
 
+def parse_task_per_1k_rows(all_rows: List[List[Any]]):
+    if not all_rows:
+        raise ValueError("Sheet 'Task_per_1k' is empty.")
+
+    row1 = all_rows[0]
     block_starts = []
     for i in range(IDENTITY_COLS, len(row1)):
         v = row1[i]
-        if v is not None:
-            block_starts.append((i + 1, v))
+        if v is not None and str(v).strip() != '':
+            v_parsed = _parse_date(v)
+            block_starts.append((i, v_parsed))
 
     if not block_starts:
         raise ValueError("No date/WTD blocks found in Task_per_1k row 1.")
 
     raw_rows = []
-    for r in range(3, max_row + 1):
-        dc = ws.cell(r, 1).value
+    for r_idx in range(2, len(all_rows)):
+        row = all_rows[r_idx]
+        if not row:
+            continue
+        dc = row[0] if len(row) > 0 else None
         if dc is None:
             continue
         dc = str(dc).strip()
         if not dc:
             continue
-        region = ws.cell(r, 2).value
-        city   = ws.cell(r, 3).value
-        raw_rows.append((r, dc, region, city))
+        region = row[1] if len(row) > 1 else ''
+        city   = row[2] if len(row) > 2 else ''
+        raw_rows.append((row, dc, region, city))
 
     blocks = []
     for col_start, label in block_starts:
         is_wtd = isinstance(label, str) and label.strip().upper() == 'WTD'
         block_rows = []
-        for (r, dc, region, city) in raw_rows:
+        for (row, dc, region, city) in raw_rows:
             if dc not in ALLOWED_SOURCE_DC:
                 continue
-            ofd      = _safe_float(ws.cell(r, col_start + IDX_OFD).value)
-            fwd_task = _safe_float(ws.cell(r, col_start + IDX_FWD_TASK).value)
-            fwd_1k   = _safe_float(ws.cell(r, col_start + IDX_FWD_1K).value)
-            ofp      = _safe_float(ws.cell(r, col_start + IDX_OFP).value)
-            rev_task = _safe_float(ws.cell(r, col_start + IDX_REV_TASK).value)
-            rev_1k   = _safe_float(ws.cell(r, col_start + IDX_REV_1K).value)
+            ofd      = _safe_float(row[col_start + IDX_OFD] if len(row) > col_start + IDX_OFD else 0)
+            fwd_task = _safe_float(row[col_start + IDX_FWD_TASK] if len(row) > col_start + IDX_FWD_TASK else 0)
+            fwd_1k   = _safe_float(row[col_start + IDX_FWD_1K] if len(row) > col_start + IDX_FWD_1K else 0)
+            ofp      = _safe_float(row[col_start + IDX_OFP] if len(row) > col_start + IDX_OFP else 0)
+            rev_task = _safe_float(row[col_start + IDX_REV_TASK] if len(row) > col_start + IDX_REV_TASK else 0)
+            rev_1k   = _safe_float(row[col_start + IDX_REV_1K] if len(row) > col_start + IDX_REV_1K else 0)
 
             if ofd == 0 and fwd_task == 0 and ofp == 0 and rev_task == 0:
                 continue
@@ -290,119 +327,12 @@ def write_summary_sheet(wb, daily_block, wtd_block, date_range_str):
     for col, width in col_widths.items():
         ws.column_dimensions[get_column_letter(col)].width = width
 
-def parse_raw_tab(ws):
-    max_col = ws.max_column
-    max_row = ws.max_row
-    headers = [ws.cell(1, c).value for c in range(1, max_col + 1)]
-
-    col_map = {}
-    for i, h in enumerate(headers):
-        if h is not None:
-            col_map[str(h).strip().lower()] = i
-
-    dc_idx = None
-    for candidate in ['source_dc', 'source dc', 'dc']:
-        if candidate in col_map:
-            dc_idx = col_map[candidate]
-            break
-
-    track_idx = None
-    for candidate in ['final_tracking_no', 'tracking_id', 'tracking id', 'waybill']:
-        if candidate in col_map:
-            track_idx = col_map[candidate]
-            break
-
-    fwd_agt_idx = col_map.get('fwd_agent name') or col_map.get('fwd agent') or col_map.get('fwd_agent')
-    rev_agt_idx = col_map.get('rev_agent name') or col_map.get('rev agent') or col_map.get('rev_agent')
-
-    if dc_idx is None:
-        raise ValueError('Column Source_DC not found in Raw tab.')
-    if track_idx is None:
-        raise ValueError('Column Final_tracking_no / Tracking_ID not found in Raw tab.')
-
-    all_data_rows   = []
-    filt_data_rows  = []
-
-    for row_tuple in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col, values_only=True):
-        row = list(row_tuple)
-        if not any(v for v in row):
-            continue
-        all_data_rows.append(row)
-        dc = str(row[dc_idx] or '').strip()
-        if dc in ALLOWED_SOURCE_DC:
-            filt_data_rows.append(row)
-
-    return headers, filt_data_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx
-
-def write_filtered_dc_tab(wb, headers, filt_rows):
-    ws = wb.create_sheet("Filtered_Source_DC")
-    for c, h in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font       = Font(bold=True)
-        cell.fill       = PatternFill("solid", fgColor="F1F5F9")
-        cell.alignment  = _center()
-    for row in filt_rows:
-        ws.append(row)
-    for c in range(1, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 18
-
-def write_fwd_ei_tab(wb, headers, filt_rows, track_idx):
-    ws = wb.create_sheet("FWD EI")
-    fwd_rows = []
-    for row in filt_rows:
-        tno = str(row[track_idx] or '').strip().upper()
-        if tno.startswith('MYSC') or tno.startswith('MYSP'):
-            fwd_rows.append(row)
-    for c, h in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font      = Font(bold=True)
-        cell.fill      = PatternFill("solid", fgColor="F1F5F9")
-        cell.alignment = _center()
-    for row in fwd_rows:
-        ws.append(row)
-    for c in range(1, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 18
-
-def write_rev_ei_tab(wb, headers, filt_rows, track_idx):
-    ws = wb.create_sheet("REVERSE EI")
-    rev_rows = []
-    for row in filt_rows:
-        tno = str(row[track_idx] or '').strip().upper()
-        if tno.startswith('MYSR'):
-            rev_rows.append(row)
-    for c, h in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font      = Font(bold=True)
-        cell.fill      = PatternFill("solid", fgColor="F1F5F9")
-        cell.alignment = _center()
-    for row in rev_rows:
-        ws.append(row)
-    for c in range(1, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 18
-
 C_WARN_TITLE = "991B1B"
 C_WARN_HDR   = "B91C1C"
 
-def write_agent_summary_tab(wb, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx):
+def write_agent_summary_tab(wb, counts):
     ws = wb.create_sheet("Agent Summary")
     ws.sheet_view.showGridLines = False
-
-    counts = {}
-    for row in filt_rows:
-        dc  = str(row[dc_idx] or '').strip()
-        if not dc:
-            continue
-        tno = str(row[track_idx] or '').strip().upper()
-        if tno.startswith('MYSC') or tno.startswith('MYSP'):
-            agent = str(row[fwd_agt_idx] or '').strip() if fwd_agt_idx is not None else ''
-        elif tno.startswith('MYSR'):
-            agent = str(row[rev_agt_idx] or '').strip() if rev_agt_idx is not None else ''
-        else:
-            agent = ''
-        if not agent:
-            agent = '#N/A'
-        counts.setdefault(dc, {})
-        counts[dc][agent] = counts[dc].get(agent, 0) + 1
 
     dc_order = ALLOWED_SOURCE_DC
     agent_rows     = []
@@ -479,56 +409,102 @@ def generate_ei_report(source_file_path: Union[str, Path], output_file_path: Uni
     source_path = Path(source_file_path)
     output_path = Path(output_file_path)
 
-    log.info(f"Generating EI report: {source_path} → {output_path}")
+    log.info(f"Generating EI report (Single-Pass Stream Mode): {source_path} -> {output_path}")
 
-    log.info("Phase 1: Loading source workbook")
-    wb_src = openpyxl.load_workbook(str(source_path), data_only=True)
+    # Phase 1: Parse Task_per_1k tab
+    log.info("Phase 1: Parsing Task_per_1k sheet")
+    task_rows = []
+    with open_stream_reader(source_path, sheet_name='Task_per_1k', header_row=1) as (t_hdr, t_iter):
+        task_rows.append(t_hdr)
+        for r in t_iter:
+            task_rows.append(r)
 
-    if 'Task_per_1k' not in wb_src.sheetnames:
-        raise ValueError("Sheet 'Task_per_1k' not found in source workbook")
-
-    log.info("Phase 2: Parsing Task_per_1k sheet")
-    blocks = parse_task_per_1k(wb_src['Task_per_1k'])
-    log.info(f"  Found {len(blocks)} blocks ({sum(1 for b in blocks if not b['is_wtd'])} daily, {sum(1 for b in blocks if b['is_wtd'])} WTD)")
-
+    blocks = parse_task_per_1k_rows(task_rows)
     daily_block = select_daily_block(blocks)
     wtd_block   = select_wtd_block(blocks)
     date_range  = build_date_range(blocks)
     log.info(f"  Daily block: {daily_block['label']}, WTD block: {wtd_block['label']}, range: {date_range}")
 
-    log.info("Phase 3: Parsing Raw sheet")
-    if 'Raw' not in wb_src.sheetnames:
-        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = [], [], {}, None, None, None, None
-        log.warning("  Raw sheet not found — skipping FWD/REV tabs")
-    else:
-        headers, filt_rows, col_map, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx = parse_raw_tab(wb_src['Raw'])
-        log.info(f"  Total rows: {len(filt_rows)}, filtered by allowed DCs")
-    wb_src.close()
+    # Phase 2: Stream Raw tab
+    all_sheet_names = get_sheet_names(source_path)
+    sheet_map = {s.lower(): s for s in all_sheet_names}
 
-    log.info("Phase 4: Writing output workbook")
+    raw_sheet_name = None
+    for cand in ['raw', 'raw_data', 'sheet1']:
+        if cand in sheet_map:
+            raw_sheet_name = sheet_map[cand]
+            break
+
+    if not raw_sheet_name and all_sheet_names:
+        raw_sheet_name = all_sheet_names[0]
+
+    counts: Dict[str, Dict[str, int]] = {}
+    stream_writers: List[XmlSheetWriter] = []
+
+    if raw_sheet_name:
+        log.info(f"Phase 2: Streaming Raw tab '{raw_sheet_name}'")
+        with open_stream_reader(source_path, sheet_name=raw_sheet_name) as (raw_headers, raw_iter):
+            cf = ColumnFinder(raw_headers, {
+                'tracking': ['final_tracking_no', 'tracking_id', 'tracking id', 'tracking_no', 'trackingno', 'waybill', 'awb', 'shipment'],
+                'sdc': ['source_dc', 'source dc', 'dc', 'hub', 'origin'],
+                'fwd_agt': ['fwd_agent name', 'fwd_agent_name', 'fwd agent', 'fwd_agent', 'fwd_delivery_agent', 'delivery_agent', 'agent_name'],
+                'rev_agt': ['rev_agent name', 'rev_agent_name', 'rev agent', 'rev_agent', 'rev_delivery_agent', 'pickup_agent', 'agent_name']
+            })
+
+            track_idx   = cf['tracking']
+            dc_idx      = cf['sdc']
+            fwd_agt_idx = cf.get('fwd_agt', None)
+            rev_agt_idx = cf.get('rev_agt', None)
+
+            writer_filtered = XmlSheetWriter("Filtered_Source_DC", raw_headers)
+            writer_fwd      = XmlSheetWriter("FWD EI", raw_headers)
+            writer_rev      = XmlSheetWriter("REVERSE EI", raw_headers)
+
+            stream_writers = [writer_filtered, writer_fwd, writer_rev]
+
+            with writer_filtered, writer_fwd, writer_rev:
+                for row in raw_iter:
+                    if not row or len(row) <= dc_idx:
+                        continue
+                    raw_dc = row[dc_idx]
+                    if raw_dc is None:
+                        continue
+                    dc_clean = str(raw_dc).strip()
+
+                    if dc_clean in ALLOWED_SOURCE_DC or dc_clean.upper() in ALLOWED_DCS_SET:
+                        writer_filtered.write_row(row)
+
+                        tno = str(row[track_idx] or '').strip().upper() if len(row) > track_idx and row[track_idx] is not None else ''
+
+                        agent = ''
+                        if tno.startswith('MYSC') or tno.startswith('MYSP'):
+                            writer_fwd.write_row(row)
+                            if fwd_agt_idx is not None and len(row) > fwd_agt_idx and row[fwd_agt_idx] is not None:
+                                agent = str(row[fwd_agt_idx] or '').strip()
+                        elif tno.startswith('MYSR'):
+                            writer_rev.write_row(row)
+                            if rev_agt_idx is not None and len(row) > rev_agt_idx and row[rev_agt_idx] is not None:
+                                agent = str(row[rev_agt_idx] or '').strip()
+
+                        if not agent:
+                            agent = '#N/A'
+
+                        counts.setdefault(dc_clean, {})
+                        counts[dc_clean][agent] = counts[dc_clean].get(agent, 0) + 1
+
+    # Phase 3: Build OpenPyXL workbook with exact 1:1 tabs & ordering
+    log.info("Phase 3: Building Summary Sheets")
     wb_out = openpyxl.Workbook()
     wb_out.remove(wb_out.active)
 
     write_summary_sheet(wb_out, daily_block, wtd_block, date_range)
-    log.info("  Summary sheet written")
+    wb_out.create_sheet("Filtered_Source_DC")
+    wb_out.create_sheet("FWD EI")
+    wb_out.create_sheet("REVERSE EI")
+    write_agent_summary_tab(wb_out, counts)
 
-    if filt_rows:
-        write_filtered_dc_tab(wb_out, headers, filt_rows)
-        write_fwd_ei_tab(wb_out, headers, filt_rows, track_idx)
-        write_rev_ei_tab(wb_out, headers, filt_rows, track_idx)
-        write_agent_summary_tab(wb_out, filt_rows, track_idx, fwd_agt_idx, rev_agt_idx, dc_idx)
-        log.info("  FWD EI, REVERSE EI, Filtered, Agent Summary tabs written")
-
-    log.info("Phase 5: Saving output file")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    wb_out.save(str(output_path))
-    try:
-        wb_out.close()
-    except Exception:
-        pass
-
-    del wb_src, wb_out
-    gc.collect()
-
-    log.info(f"Report saved: {output_path}")
+    # Phase 4: Assemble final streaming workbook
+    log.info("Phase 4: Assembling final workbook")
+    assemble_stream_workbook(wb_out, stream_writers, output_path)
+    log.info(f"EI Summary Report successfully generated: {output_path.name}")
     return output_path
