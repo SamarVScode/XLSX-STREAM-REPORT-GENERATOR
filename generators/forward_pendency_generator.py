@@ -36,6 +36,7 @@ from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
     open_stream_reader,
+    get_sheet_names,
     ColumnFinder
 )
 
@@ -260,6 +261,18 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
 
     log.info(f"Loading input workbook for Forward Pendency Report (Single-Pass Stream): {input_path}")
 
+    all_sheets = get_sheet_names(input_path)
+    sheet_map = {name.lower(): name for name in all_sheets}
+    target_sheet = None
+    for candidate in ['raw_data_north', 'raw_data', 'raw', 'praw data', 'data', 'north']:
+        if candidate in sheet_map:
+            target_sheet = sheet_map[candidate]
+            break
+    if not target_sheet and all_sheets:
+        target_sheet = all_sheets[0]
+
+    log.info(f"Using sheet '{target_sheet}' for Forward Pendency Report.")
+
     t1_pivot = defaultdict(lambda: defaultdict(int))
     t2_pivot = defaultdict(lambda: defaultdict(int))
     t3_pivot = defaultdict(lambda: defaultdict(int))
@@ -267,26 +280,30 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
     total_filtered = 0
     cpd_count = 0
 
-    with open_stream_reader(input_path, sheet_name='raw_data_North') as (headers, row_iter):
+    with open_stream_reader(input_path, sheet_name=target_sheet) as (headers, row_iter):
         if not headers:
-            raise ValueError("Sheet 'raw_data_North' is empty or not found.")
+            raise ValueError(f"Sheet '{target_sheet}' is empty or not found.")
 
         cf = ColumnFinder(headers, {
             'aging': ['aging', 'agingbucket', 'agebucket', 'ageing', 'agingdays'],
-            'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc'],
-            'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio'],
-            'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb'],
-            'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt']
+            'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc', 'source_dc'],
+            'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio', 'customer_priority_v2'],
+            'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb', 'tracking_number'],
+            'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt', 'attempt_status']
         })
 
-        aging_col_idx = cf['aging']
-        sdc_idx = cf['sdc']
-        prio_idx = cf['prio']
-        shipment_idx = cf['shipment']
-        attempt_idx = cf['attempt']
+        aging_col_idx = cf.get('aging', 8)
+        sdc_idx = cf.get('sdc', 24)
+        prio_idx = cf.get('prio', 20)
+        shipment_idx = cf.get('shipment', 2)
+        attempt_idx = cf.get('attempt', 23)
 
         raw_header_out = list(headers)
-        raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
+        if aging_col_idx < len(raw_header_out):
+            raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
+        else:
+            raw_header_out.append('Aging Category')
+
         cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
 
         cpd_writer = XmlSheetWriter("CPD-DID pendency", cpd_headers)
@@ -318,9 +335,12 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
                     elif prio == "P2":
                         t3_pivot[sdc_upper]["DID (P2)"] += 1
 
-                    # Write RAW row (insert Aging Category)
+                    # Write RAW row (insert Aging Category safely)
                     r_out = list(row)
-                    r_out.insert(aging_col_idx + 1, aging_cat)
+                    if aging_col_idx < len(r_out):
+                        r_out.insert(aging_col_idx + 1, aging_cat)
+                    else:
+                        r_out.append(aging_cat)
                     raw_writer.write_row(r_out)
 
                     # Write CPD-DID row if P2 or P3

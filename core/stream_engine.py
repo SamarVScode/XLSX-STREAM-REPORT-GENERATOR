@@ -17,6 +17,7 @@ import math
 import tempfile
 import zipfile
 import logging
+from datetime import datetime, date
 from pathlib import Path
 from typing import Iterator, List, Dict, Any, Optional, Union, Tuple
 from contextlib import contextmanager
@@ -37,6 +38,8 @@ def esc(val: Any) -> str:
     """Fast XML entity escaping for Excel inline strings."""
     if val is None:
         return ""
+    if isinstance(val, (datetime, date)):
+        return val.strftime('%Y-%m-%d %H:%M:%S' if isinstance(val, datetime) and (val.hour or val.minute or val.second) else '%Y-%m-%d')
     s = str(val)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
@@ -130,8 +133,10 @@ class XmlSheetWriter:
         
         for c_i, val in enumerate(row_values, 1):
             col_let = get_column_letter(c_i)
-            if isinstance(val, (int, float)) and not math.isnan(val) and not math.isinf(val):
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and not math.isnan(val) and not math.isinf(val):
                 r_xml.append(f'<c r="{col_let}{r_num}"><v>{val}</v></c>')
+            elif isinstance(val, bool):
+                r_xml.append(f'<c r="{col_let}{r_num}" t="b"><v>{"1" if val else "0"}</v></c>')
             else:
                 r_xml.append(f'<c r="{col_let}{r_num}" t="inlineStr"><is><t>{esc(val)}</t></is></c>')
 
@@ -303,14 +308,12 @@ def _extract_headers_and_iterator(raw_iterator, header_row: Optional[int] = None
     current_idx = 0
 
     if header_row is not None:
-        # Advance until explicit header_row is reached
         for row in raw_iterator:
             current_idx += 1
             if current_idx == header_row:
                 headers = [str(c).strip() if c is not None else "" for c in row] if row else []
                 break
     else:
-        # Auto-detect: Skip empty rows or single-cell banners (e.g. title rows)
         for row in raw_iterator:
             current_idx += 1
             if not row:

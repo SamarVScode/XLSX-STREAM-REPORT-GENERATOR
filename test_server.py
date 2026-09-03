@@ -84,15 +84,16 @@ def test_conversion_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         src_xlsx = tmp_path / "conv_src.xlsx"
-        out_xlsx = tmp_path / "conv_out.xlsx"
+        out_sameday = tmp_path / "conv_sameday_out.xlsx"
+        out_d1 = tmp_path / "conv_d1_out.xlsx"
         
         with pd.ExcelWriter(src_xlsx, engine='openpyxl') as writer:
             dc_df = pd.DataFrame([{
-                'Source_DC': 'ALG', 'Succ_pickup%': '80%', 'Succ_del%': '85%',
+                'Source_DC': 'ALG', 'Picked-up': 80.0, 'OFP': 100.0, 'Succ_pickup%': '80%', 'Succ_del%': '85%',
                 'COD_Succ_del%': '80%', 'PP_Succ_del%': '90%'
             }])
             agent_df = pd.DataFrame([{
-                'Source_DC': 'ALG', 'Picked-up': 80, 'OFP': 100, 'del_update': 85, 'OFD': 100
+                'Source_DC': 'ALG', 'Picked-up': 80.0, 'OFP': 100.0, 'del_update': 85.0, 'OFD': 100.0
             }])
             e2e_cols = [f"col_{i}" for i in range(25)]
             e2e_cols[22] = "Source_DC"
@@ -104,8 +105,27 @@ def test_conversion_stream():
             agent_df.to_excel(writer, sheet_name='Agent_view', index=False)
             e2e_df.to_excel(writer, sheet_name='E2E_Raw', index=False)
             
-        generate_conversion_report(src_xlsx, out_xlsx)
-        assert out_xlsx.exists()
+        generate_conversion_report(src_xlsx, out_sameday, sub_type='sameday')
+        assert out_sameday.exists()
+        from openpyxl import load_workbook
+        wb_same = load_workbook(out_sameday)
+        assert wb_same.sheetnames == ['Sameday DC_View', 'Sameday Agent_View']
+        ws_dc = wb_same['Sameday DC_View']
+        # Check whole number formatting
+        for col_idx in range(1, ws_dc.max_column + 1):
+            header = ws_dc.cell(row=1, column=col_idx).value
+            cell_val = ws_dc.cell(row=2, column=col_idx).value
+            num_fmt = ws_dc.cell(row=2, column=col_idx).number_format
+            if header in ('Picked-up', 'OFP'):
+                assert isinstance(cell_val, int)
+                assert num_fmt == '#,##0'
+            elif header and '%' in str(header):
+                assert num_fmt == '0.0%'
+
+        generate_conversion_report(src_xlsx, out_d1, sub_type='d-1')
+        assert out_d1.exists()
+        wb_d1 = load_workbook(out_d1)
+        assert wb_d1.sheetnames == ['D-1 DC_View', 'D-1 Agent_View']
 
 def test_nps_stream():
     with tempfile.TemporaryDirectory() as tmpdir:

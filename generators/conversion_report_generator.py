@@ -213,6 +213,7 @@ def _pct_fill_font(value, thresholds):
 
 
 def style_sheet(ws, pct_cols=None):
+    pct_cols = pct_cols or {}
     for cell in ws[1]:
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
@@ -222,32 +223,43 @@ def style_sheet(ws, pct_cols=None):
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=ws.max_column):
         for cell in row:
             cell.border = THIN_BORDER
-            if isinstance(cell.value, float):
-                cell.number_format = '0.000'
             cell.alignment = Alignment(horizontal='center')
-
-    if pct_cols:
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            for cell in row:
-                if cell.column_letter in pct_cols and isinstance(cell.value, (int, float)):
+            if cell.column_letter in pct_cols:
+                if isinstance(cell.value, (int, float)):
                     thresholds = pct_cols[cell.column_letter]
                     fill, font = _pct_fill_font(cell.value, thresholds)
                     cell.fill = fill
                     cell.font = font
                     cell.number_format = '0.0%'
+            else:
+                if isinstance(cell.value, (int, float)):
+                    if isinstance(cell.value, float) and abs(cell.value - round(cell.value)) < 1e-9:
+                        cell.value = int(round(cell.value))
+                        cell.number_format = '#,##0'
+                    elif isinstance(cell.value, int):
+                        cell.number_format = '#,##0'
+                    elif isinstance(cell.value, float):
+                        cell.number_format = '#,##0.00'
 
     ws.auto_filter.ref = ws.dimensions
 
 
 def _col_letter_by_name(ws, col_name: str):
     for cell in ws[1]:
-        if cell.value == col_name:
+        if cell.value and str(cell.value).strip().lower() == col_name.strip().lower():
             return cell.column_letter
     return None
 
 
 def generate_conversion_report(input_file: Path, output_file: Path, sub_type: str = 'sameday') -> Path:
-    prefix = 'Sameday' if sub_type == 'sameday' else 'Nextday'
+    clean_sub = str(sub_type).strip().lower() if sub_type else 'sameday'
+    if clean_sub in ('d1', 'd-1', 'd_1', 'nextday'):
+        prefix = 'D-1'
+    elif clean_sub == 'sameday':
+        prefix = 'Sameday'
+    else:
+        prefix = str(sub_type).strip()
+
     log.info(f"Generating {prefix} Conversion Report for: {input_file.name}")
 
     df_dc = build_dc_view(input_file)
