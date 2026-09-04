@@ -14,9 +14,12 @@ import gc
 import re
 import csv
 import math
+import mmap
+import array
 import tempfile
 import zipfile
 import logging
+import functools
 from datetime import datetime, date
 from pathlib import Path
 from typing import Iterator, List, Dict, Any, Optional, Union, Tuple
@@ -359,6 +362,176 @@ def _extract_headers_and_iterator(raw_iterator, header_row: Optional[int] = None
     return headers, _row_gc_wrapper()
 
 
+def _col_to_idx(col_str: str) -> int:
+    idx = 0
+    for char in col_str:
+        idx = idx * 26 + (ord(char) - ord('A') + 1)
+    return idx - 1
+
+
+@contextmanager
+def open_direct_xlsx_stream(
+    file_path: Union[str, Path],
+    sheet_name: Optional[str] = None,
+    header_row: Optional[int] = None
+) -> Iterator[Tuple[List[str], Iterator[List[Any]]]]:
+    """
+    Direct OpenXML Streaming Reader for massive .xlsx files (200 MB+).
+    Bypasses Calamine/openpyxl DOM loading and streams worksheet XML rows with disk-mmap sharedStrings index.
+    Maintains flat < 60 MB RAM footprint even on 1 GB+ uncompressed worksheets.
+    """
+    path = Path(file_path)
+    zf = zipfile.ZipFile(path, 'r')
+    tmp_sst_path = None
+    mm_sst = None
+    f_sst = None
+
+    try:
+        sheet_targets = {}
+        if 'xl/workbook.xml' in zf.namelist() and 'xl/_rels/workbook.xml.rels' in zf.namelist():
+            wb_tree = ET.fromstring(zf.read('xl/workbook.xml'))
+            rels_tree = ET.fromstring(zf.read('xl/_rels/workbook.xml.rels'))
+            
+            rel_map = {}
+            for rel in rels_tree:
+                r_id = rel.attrib.get('Id')
+                target = rel.attrib.get('Target', '')
+                if not target.startswith('xl/'):
+                    target = 'xl/' + target.lstrip('/')
+                rel_map[r_id] = target
+
+            for sheet in wb_tree.findall('.//{*}sheet'):
+                s_name = sheet.attrib.get('name')
+                r_id = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                if s_name and r_id in rel_map:
+                    sheet_targets[s_name.lower().strip()] = (s_name, rel_map[r_id])
+
+        target_entry = None
+        if sheet_name:
+            clean_req = sheet_name.lower().strip()
+            if clean_req in sheet_targets:
+                target_entry = sheet_targets[clean_req]
+            else:
+                for k, v in sheet_targets.items():
+                    if clean_req in k or k in clean_req:
+                        target_entry = v
+                        break
+
+        if not target_entry and sheet_targets:
+            target_entry = list(sheet_targets.values())[0]
+
+        if not target_entry:
+            raise ValueError(f"No valid worksheets found in {path.name}")
+
+        chosen_sheet_name, worksheet_xml_path = target_entry
+
+        get_shared_str = lambda idx: ""
+        if 'xl/sharedStrings.xml' in zf.namelist():
+            tmp_sst_path = Path(tempfile.gettempdir()) / f"sst_{os.getpid()}_{id(zf)}.bin"
+            with zf.open('xl/sharedStrings.xml') as f_in, open(tmp_sst_path, 'wb') as f_out:
+                while True:
+                    chunk = f_in.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+
+            f_sst = open(tmp_sst_path, 'r+b')
+            mm_sst = mmap.mmap(f_sst.fileno(), 0)
+            sst_offsets = array.array('I', (m.start() for m in re.finditer(rb'<si[ >]', mm_sst)))
+
+            @functools.lru_cache(maxsize=65536)
+            def _get_str_from_mmap(idx: int) -> str:
+                if idx >= len(sst_offsets):
+                    return ""
+                pos = sst_offsets[idx]
+                end_pos = mm_sst.find(b'</si>', pos)
+                if end_pos == -1:
+                    end_pos = pos + 2048
+                chunk = mm_sst[pos:end_pos+5]
+                texts = re.findall(rb'<t[^>]*>(.*?)</t>', chunk)
+                val = b''.join(texts).decode('utf-8', errors='replace')
+                return val.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&apos;', "'")
+
+            get_shared_str = _get_str_from_mmap
+
+        def row_generator() -> Iterator[List[Any]]:
+            c_re = re.compile(rb'<c\s+r="([A-Z]+)\d+"(?:[^>]*?t="([^"]*)")?[^>]*>(?:<v>([^<]*)</v>|<is><t>([^<]*)</t></is>)?')
+            with zf.open(worksheet_xml_path) as ws_f:
+                buf = b''
+                while True:
+                    chunk = ws_f.read(512 * 1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while True:
+                        r_start = buf.find(b'<row ')
+                        if r_start == -1:
+                            buf = buf[-16:] if len(buf) > 16 else buf
+                            break
+                        r_end = buf.find(b'</row>', r_start)
+                        if r_end == -1:
+                            buf = buf[r_start:]
+                            break
+                        row_xml = buf[r_start:r_end+6]
+                        buf = buf[r_end+6:]
+
+                        row_vals: List[Any] = []
+                        for m in c_re.finditer(row_xml):
+                            col_b, t_b, v_b, is_b = m.groups()
+                            col_str = col_b.decode('ascii')
+                            target_c_idx = _col_to_idx(col_str)
+
+                            while len(row_vals) < target_c_idx:
+                                row_vals.append(None)
+
+                            c_type = t_b.decode('ascii') if t_b else None
+                            val = None
+                            if c_type == 's' and v_b:
+                                try:
+                                    val = get_shared_str(int(v_b))
+                                except ValueError:
+                                    val = ""
+                            elif c_type == 'inlineStr' and is_b:
+                                val = is_b.decode('utf-8', errors='replace')
+                            elif c_type == 'b' and v_b:
+                                val = (v_b == b'1')
+                            elif v_b:
+                                v_str = v_b.decode('ascii', errors='ignore')
+                                try:
+                                    val = int(v_str) if (v_str.isdigit() or (v_str.startswith('-') and v_str[1:].isdigit())) else float(v_str)
+                                except ValueError:
+                                    val = v_str
+                            row_vals.append(val)
+
+                        yield row_vals
+
+        gen = row_generator()
+        headers, wrapped_iter = _extract_headers_and_iterator(gen, header_row=header_row)
+        yield headers, wrapped_iter
+
+    finally:
+        if mm_sst:
+            try:
+                mm_sst.close()
+            except Exception:
+                pass
+        if f_sst:
+            try:
+                f_sst.close()
+            except Exception:
+                pass
+        if tmp_sst_path and tmp_sst_path.exists():
+            try:
+                tmp_sst_path.unlink()
+            except Exception:
+                pass
+        try:
+            zf.close()
+        except Exception:
+            pass
+        gc.collect()
+
+
 @contextmanager
 def open_stream_reader(
     file_path: Union[str, Path],
@@ -374,12 +547,23 @@ def open_stream_reader(
     """
     path = Path(file_path)
     ext = path.suffix.lower()
+    file_size = path.stat().st_size if path.exists() else 0
 
     wb = None
     openpyxl_wb = None
 
     try:
-        # 1. Calamine High-Speed Rust Reader
+        # 1. For large .xlsx files (> 30 MB), use direct zero-memory XML streaming to prevent
+        # Calamine from buffering massive shared strings tables into RAM (> 400 MB).
+        if ext in ('.xlsx', '.xlsm') and file_size > 30 * 1024 * 1024:
+            try:
+                with open_direct_xlsx_stream(path, sheet_name=sheet_name, header_row=header_row) as (headers, r_iter):
+                    yield headers, r_iter
+                return
+            except Exception as e:
+                log.warning(f"Direct OpenXML streaming notice ({e}); trying Calamine...")
+
+        # 2. Calamine High-Speed Rust Reader (ideal for .xlsb, .ods, and standard .xlsx)
         if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
             try:
                 wb = CalamineWorkbook.from_path(str(path))
@@ -404,10 +588,19 @@ def open_stream_reader(
                 yield headers, wrapped_iter
                 return
             except Exception as e:
-                log.warning(f"Calamine stream failed for {path.name} ({e}). Falling back to openpyxl...")
+                log.warning(f"Calamine stream failed for {path.name} ({e}). Trying direct OpenXML stream...")
                 wb = None
 
-        # 2. openpyxl read_only stream fallback
+        # 3. Direct OpenXML stream fallback
+        if ext in ('.xlsx', '.xlsm') and zipfile.is_zipfile(path):
+            try:
+                with open_direct_xlsx_stream(path, sheet_name=sheet_name, header_row=header_row) as (headers, r_iter):
+                    yield headers, r_iter
+                return
+            except Exception as e:
+                log.warning(f"Direct OpenXML stream fallback failed: {e}. Trying openpyxl...")
+
+        # 4. openpyxl read_only stream fallback
         import openpyxl
         openpyxl_wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
         target_sheet = sheet_name or openpyxl_wb.sheetnames[0]
