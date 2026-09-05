@@ -290,15 +290,7 @@ def get_sheet_names(file_path: Union[str, Path]) -> List[str]:
     path = Path(file_path)
     ext = path.suffix.lower()
 
-    if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
-        try:
-            wb = CalamineWorkbook.from_path(str(path))
-            names = wb.sheet_names
-            del wb
-            return names
-        except Exception as e:
-            log.warning(f"Calamine get_sheet_names failed ({e}); falling back...")
-
+    # 1. Zero-memory zip inspection for .xlsx and .xlsm
     if ext in ('.xlsx', '.xlsm') and zipfile.is_zipfile(path):
         try:
             with zipfile.ZipFile(path, 'r') as z:
@@ -312,6 +304,16 @@ def get_sheet_names(file_path: Union[str, Path]) -> List[str]:
                             return [s.attrib.get('name', '') for s in sheets if s.attrib.get('name')]
         except Exception as e:
             log.warning(f"Zip workbook parse failed: {e}")
+
+    # 2. Calamine High-Speed Rust Reader (ideal for .xlsb, .ods, .xls)
+    if HAS_CALAMINE and ext in ('.xlsx', '.xlsb', '.ods', '.xls', '.xlsm'):
+        try:
+            wb = CalamineWorkbook.from_path(str(path))
+            names = wb.sheet_names
+            del wb
+            return names
+        except Exception as e:
+            log.warning(f"Calamine get_sheet_names failed ({e}); falling back...")
 
     if ext in ('.csv', '.tsv', '.txt'):
         return [path.stem]
@@ -369,6 +371,10 @@ def _col_to_idx(col_str: str) -> int:
     return idx - 1
 
 
+_COL_BYTES_MAP = {get_column_letter(i).encode('ascii'): i - 1 for i in range(1, 703)}
+
+
+
 @contextmanager
 def open_direct_xlsx_stream(
     file_path: Union[str, Path],
@@ -395,9 +401,10 @@ def open_direct_xlsx_stream(
             rel_map = {}
             for rel in rels_tree:
                 r_id = rel.attrib.get('Id')
-                target = rel.attrib.get('Target', '')
-                if not target.startswith('xl/'):
-                    target = 'xl/' + target.lstrip('/')
+                raw_target = rel.attrib.get('Target', '').lstrip('/')
+                target = raw_target if raw_target.startswith('xl/') else f"xl/{raw_target}"
+                if target not in zf.namelist() and raw_target in zf.namelist():
+                    target = raw_target
                 rel_map[r_id] = target
 
             for sheet in wb_tree.findall('.//{*}sheet'):
@@ -478,8 +485,9 @@ def open_direct_xlsx_stream(
                         row_vals: List[Any] = []
                         for m in c_re.finditer(row_xml):
                             col_b, t_b, v_b, is_b = m.groups()
-                            col_str = col_b.decode('ascii')
-                            target_c_idx = _col_to_idx(col_str)
+                            target_c_idx = _COL_BYTES_MAP.get(col_b)
+                            if target_c_idx is None:
+                                target_c_idx = _col_to_idx(col_b.decode('ascii'))
 
                             while len(row_vals) < target_c_idx:
                                 row_vals.append(None)
@@ -496,11 +504,10 @@ def open_direct_xlsx_stream(
                             elif c_type == 'b' and v_b:
                                 val = (v_b == b'1')
                             elif v_b:
-                                v_str = v_b.decode('ascii', errors='ignore')
                                 try:
-                                    val = int(v_str) if (v_str.isdigit() or (v_str.startswith('-') and v_str[1:].isdigit())) else float(v_str)
+                                    val = int(v_b) if (v_b.isdigit() or (v_b.startswith(b'-') and v_b[1:].isdigit())) else float(v_b)
                                 except ValueError:
-                                    val = v_str
+                                    val = v_b.decode('ascii', errors='ignore')
                             row_vals.append(val)
 
                         yield row_vals
@@ -553,9 +560,9 @@ def open_stream_reader(
     openpyxl_wb = None
 
     try:
-        # 1. For large .xlsx files (> 30 MB), use direct zero-memory XML streaming to prevent
+        # 1. For large .xlsx files (> 8 MB), use direct zero-memory XML streaming to prevent
         # Calamine from buffering massive shared strings tables into RAM (> 400 MB).
-        if ext in ('.xlsx', '.xlsm') and file_size > 30 * 1024 * 1024:
+        if ext in ('.xlsx', '.xlsm') and file_size > 8 * 1024 * 1024:
             try:
                 with open_direct_xlsx_stream(path, sheet_name=sheet_name, header_row=header_row) as (headers, r_iter):
                     yield headers, r_iter

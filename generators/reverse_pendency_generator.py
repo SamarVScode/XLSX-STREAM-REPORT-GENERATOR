@@ -36,6 +36,7 @@ from core.stream_engine import (
     XmlSheetWriter,
     assemble_stream_workbook,
     open_stream_reader,
+    get_sheet_names,
     ColumnFinder
 )
 
@@ -146,9 +147,19 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
     total_filtered = 0
     p0_count = 0
 
-    with open_stream_reader(input_path, sheet_name='Raw') as (headers, row_iter):
+    sheet_names = get_sheet_names(input_path)
+    sheet_map = {name.lower(): name for name in sheet_names}
+    target_sheet = None
+    for candidate in ['raw', 'raw_data', 'raw data', 'data', 'sheet1']:
+        if candidate in sheet_map:
+            target_sheet = sheet_map[candidate]
+            break
+    if not target_sheet and sheet_names:
+        target_sheet = sheet_names[0]
+
+    with open_stream_reader(input_path, sheet_name=target_sheet) as (headers, row_iter):
         if not headers:
-            raise ValueError("Sheet 'Raw' is empty or not found.")
+            raise ValueError(f"Sheet '{target_sheet or 'Raw'}' is empty or not found.")
 
         cf = ColumnFinder(headers, {
             'region': ['region', 'reg', 'zone'],
