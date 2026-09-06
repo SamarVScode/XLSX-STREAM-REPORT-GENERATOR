@@ -462,7 +462,7 @@ def open_direct_xlsx_stream(
             get_shared_str = _get_str_from_mmap
 
         def row_generator() -> Iterator[List[Any]]:
-            c_re = re.compile(rb'<c\s+r="([A-Z]+)\d+"(?:[^>]*?t="([^"]*)")?[^>]*>(?:<v>([^<]*)</v>|<is><t>([^<]*)</t></is>)?')
+            c_re = re.compile(rb'<c\s+r="([A-Z]+)\d+"(?:[^>]*?t="([^"]*)")?[^>]*>(?:<f\b[^>]*?/>|<f\b[^>]*?>[^<]*</f>)?(?:<v>([^<]*)</v>|<is><t>([^<]*)</t></is>)?')
             with zf.open(worksheet_xml_path) as ws_f:
                 buf = b''
                 while True:
@@ -503,11 +503,13 @@ def open_direct_xlsx_stream(
                                 val = is_b.decode('utf-8', errors='replace')
                             elif c_type == 'b' and v_b:
                                 val = (v_b == b'1')
+                            elif c_type == 'str' and v_b:
+                                val = v_b.decode('utf-8', errors='replace')
                             elif v_b:
                                 try:
                                     val = int(v_b) if (v_b.isdigit() or (v_b.startswith(b'-') and v_b[1:].isdigit())) else float(v_b)
                                 except ValueError:
-                                    val = v_b.decode('ascii', errors='ignore')
+                                    val = v_b.decode('utf-8', errors='replace')
                             row_vals.append(val)
 
                         yield row_vals

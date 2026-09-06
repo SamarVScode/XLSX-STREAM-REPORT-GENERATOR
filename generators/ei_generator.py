@@ -94,6 +94,12 @@ def _parse_date(val):
             pass
     if isinstance(val, str):
         val = val.strip()
+        try:
+            val_float = float(val)
+            if 30000 <= val_float <= 70000:
+                return datetime(1899, 12, 30) + timedelta(days=val_float)
+        except (ValueError, OverflowError):
+            pass
         for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%d-%b-%Y', '%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y'):
             try:
                 return datetime.strptime(val, fmt)
@@ -162,6 +168,16 @@ def select_daily_block(blocks):
     today     = datetime.now().date()
     yesterday = today - timedelta(days=1)
     daily_blocks = [b for b in blocks if not b['is_wtd']]
+
+    for b in daily_blocks:
+        lbl = b['label']
+        if isinstance(lbl, datetime) and lbl.date() == yesterday and len(b['rows']) > 0:
+            return b
+
+    dated_with_rows = [(b['label'].date(), b) for b in daily_blocks if isinstance(b['label'], datetime) and len(b['rows']) > 0]
+    if dated_with_rows:
+        dated_with_rows.sort(key=lambda x: x[0], reverse=True)
+        return dated_with_rows[0][1]
 
     for b in daily_blocks:
         lbl = b['label']
@@ -477,7 +493,7 @@ def generate_ei_report(source_file_path: Union[str, Path], output_file_path: Uni
                         tno = str(row[track_idx] or '').strip().upper() if len(row) > track_idx and row[track_idx] is not None else ''
 
                         agent = ''
-                        if tno.startswith('MYSC') or tno.startswith('MYSP'):
+                        if tno.startswith(('MYSC', 'MYSD', 'MYSP')):
                             writer_fwd.write_row(row)
                             if fwd_agt_idx is not None and len(row) > fwd_agt_idx and row[fwd_agt_idx] is not None:
                                 agent = str(row[fwd_agt_idx] or '').strip()
