@@ -13,6 +13,7 @@ Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 
 import sys
 import re
+import math
 import logging
 from datetime import datetime, date
 from pathlib import Path
@@ -141,10 +142,13 @@ def build_dc_view(input_file: Path) -> pd.DataFrame:
     if 'Source_DC' in df.columns:
         df = df[df['Source_DC'].astype(str).str.strip().str.upper().isin(ALLOWED_DCS)].copy()
 
-    if 'Picked-up' in df.columns:
-        df['Picked-up'] = pd.to_numeric(df['Picked-up'], errors='coerce').fillna(0)
-    if 'OFP' in df.columns:
-        df['OFP'] = pd.to_numeric(df['OFP'], errors='coerce').fillna(0)
+    count_cols = [
+        'L4D', '#Stores', 'OFP', 'Picked-up', 'OFD', 'Success_Del',
+        'OFD_COD', 'OFD_PP', 'cod_del_update', 'pp_del_update'
+    ]
+    for col in count_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     for col in PCT_COLS_DC:
         if col in df.columns:
@@ -226,6 +230,8 @@ def style_sheet(ws, pct_cols=None):
             cell.alignment = Alignment(horizontal='center')
             if cell.column_letter in pct_cols:
                 if isinstance(cell.value, (int, float)):
+                    if not math.isfinite(cell.value):
+                        cell.value = 0.0
                     thresholds = pct_cols[cell.column_letter]
                     fill, font = _pct_fill_font(cell.value, thresholds)
                     cell.fill = fill
@@ -233,7 +239,10 @@ def style_sheet(ws, pct_cols=None):
                     cell.number_format = '0.0%'
             else:
                 if isinstance(cell.value, (int, float)):
-                    if isinstance(cell.value, float) and abs(cell.value - round(cell.value)) < 1e-9:
+                    if not math.isfinite(cell.value):
+                        cell.value = 0
+                        cell.number_format = '0'
+                    elif isinstance(cell.value, float) and abs(cell.value - round(cell.value)) < 1e-9:
                         cell.value = int(round(cell.value))
                         cell.number_format = '0'
                     elif isinstance(cell.value, int):
