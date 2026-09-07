@@ -84,7 +84,12 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path) -> Path:
 
         cf = ColumnFinder(headers, {
             'dc': ['source_dc', 'source dc', 'sourcedc', 'dc', 'hub', 'hubname', 'hub_name', 'origin'],
-            'status': ['vms status', 'vms_status', 'vmsstatus', 'status', 'adherence status', 'adherence_status', 'adherence', 'sheetstatus', 'sheet_status']
+            'status': [
+                'vms status', 'vms_status', 'vmsstatus', 'status',
+                'adherence status', 'adherence_status', 'adherence',
+                'vms adherence', 'vms_adherence', 'non-adherence', 'non adherence',
+                'sheetstatus', 'sheet_status'
+            ]
         })
 
         source_dc_idx = cf['dc']
@@ -104,8 +109,18 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path) -> Path:
                     total_filtered += 1
                     raw_writer.write_row(row)
 
-                    status_str = str(row[vms_status_idx] or '').strip().lower() if len(row) > vms_status_idx else ''
-                    if status_str in ('done', 'adhere', 'adhered', 'yes', 'compliant', 'true', '1'):
+                    status_raw = str(row[vms_status_idx] or '').strip() if len(row) > vms_status_idx else ''
+                    status_clean = status_raw.lower().replace('_', ' ').replace('-', ' ').strip()
+
+                    # Check negative / non-adherence conditions FIRST
+                    # (This prevents 'non-adherence' from reaching the 'adher' check in elif)
+                    if (
+                        any(neg in status_clean for neg in ('non adher', 'not adher', 'not done', 'non compliant', 'unadher'))
+                        or status_clean.startswith(('non ', 'not ', 'un'))
+                        or status_clean in ('no', 'false', '0', 'not', 'non')
+                    ):
+                        stats[dc_clean]['not_done'] += 1
+                    elif any(pos in status_clean for pos in ('adher', 'compliant')) or status_clean in ('done', 'yes', 'true', '1'):
                         stats[dc_clean]['done'] += 1
                     else:
                         stats[dc_clean]['not_done'] += 1
@@ -184,7 +199,7 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path) -> Path:
         ws_sum.cell(row=1, column=c).border = purple_border
 
     # Row 3: Headers
-    sum_headers = ['Source DC', 'Total', 'VMS Done', 'VMS Not Done', 'Done %']
+    sum_headers = ['Source DC', 'Total', 'Adherence', 'Non-Adherence', 'Adherence %']
     for i, h in enumerate(sum_headers, 1):
         cell = ws_sum.cell(row=3, column=i, value=h)
         cell.fill = header_fill

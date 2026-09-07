@@ -2,6 +2,7 @@ import pytest
 import tempfile
 import pandas as pd
 from pathlib import Path
+import openpyxl
 from openpyxl import Workbook
 from datetime import datetime, timedelta
 
@@ -185,10 +186,40 @@ def test_vms_stream():
         ws.append(headers)
         ws.append(["ALG", "Done", "Val"])
         ws.append(["AYP", "Not Done", "Val"])
+        ws.append(["KNP", "Adherence", "Val"])
+        ws.append(["LKO", "Non-Adherence", "Val"])
+        ws.append(["GZB", "Non Adherence", "Val"])
         wb.save(src_xlsx)
         
         generate_vms_adherence_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx, data_only=True)
+        assert "Summary" in wb_out.sheetnames
+        assert "Raw" in wb_out.sheetnames
+        ws_sum = wb_out["Summary"]
+
+        # Check headers
+        headers_read = [ws_sum.cell(row=3, column=c).value for c in range(1, 6)]
+        assert headers_read == ['Source DC', 'Total', 'Adherence', 'Non-Adherence', 'Adherence %']
+
+        # Check rows content
+        rows_data = {}
+        for r in range(4, 9):
+            dc = ws_sum.cell(row=r, column=1).value
+            if dc and dc != 'TOTAL / SUMMARY':
+                rows_data[dc] = {
+                    "total": ws_sum.cell(row=r, column=2).value,
+                    "adh": ws_sum.cell(row=r, column=3).value,
+                    "non_adh": ws_sum.cell(row=r, column=4).value,
+                    "pct": ws_sum.cell(row=r, column=5).value,
+                }
+        assert rows_data["KNP"]["adh"] == 1 and rows_data["KNP"]["non_adh"] == 0
+        assert rows_data["LKO"]["adh"] == 0 and rows_data["LKO"]["non_adh"] == 1
+        assert rows_data["GZB"]["adh"] == 0 and rows_data["GZB"]["non_adh"] == 1
+        assert rows_data["ALG"]["adh"] == 1 and rows_data["ALG"]["non_adh"] == 0
+        assert rows_data["AYP"]["adh"] == 0 and rows_data["AYP"]["non_adh"] == 1
+        wb_out.close()
 
 def test_second_attempt_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
