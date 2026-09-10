@@ -27,6 +27,7 @@ ROUTE_TYPE_MAP = {
     "/reports/eob": "eob",
     "/reports/untraceable": "untraceable",
     "/reports/ut": "untraceable",
+    "/reports/cpd_breach": "cpd_breach",
 }
 
 @router.get("/")
@@ -76,6 +77,7 @@ async def convert_async(
 @router.post("/reports/eob")
 @router.post("/reports/untraceable")
 @router.post("/reports/ut")
+@router.post("/reports/cpd_breach")
 async def convert_upload(
     request: Request,
     file: UploadFile = File(...),
@@ -124,7 +126,8 @@ async def get_job_status_route(
             "vms": ["Summary", "Raw"],
             "eob": ["Summary", "Raw"],
             "untraceable": ["Summary", "Raw"],
-            "ut": ["Summary", "Raw"]
+            "ut": ["Summary", "Raw"],
+            "cpd_breach": ["summary", "raw"]
         }
         tabs = default_tabs.get(report_type, ["Summary", "Raw"])
 

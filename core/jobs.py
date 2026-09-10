@@ -24,7 +24,8 @@ from generators import (
     generate_vms_adherence_report,
     generate_second_attempt_adherence_report,
     generate_eob_report,
-    generate_untraceable_report
+    generate_untraceable_report,
+    generate_cpd_breach_report
 )
 
 log = logging.getLogger("ei_stream_server.jobs")
@@ -158,7 +159,8 @@ def generate_proper_report_filename(
         "untraceable": "Untraceable_Report",
         "untraceable_report": "Untraceable_Report",
         "untraceable-report": "Untraceable_Report",
-        "ut": "Untraceable_Report"
+        "ut": "Untraceable_Report",
+        "cpd_breach": "CPD_Breach_Report"
     }
 
     norm_type = report_type.lower().strip().replace(" ", "_")
@@ -293,6 +295,8 @@ def background_report_job(job_id: str, file_id: str, output_path: Path, report_t
             generate_eob_report(tmp_input, output_path)
         elif norm_type in ("untraceable", "untraceable_report", "ut"):
             generate_untraceable_report(tmp_input, output_path)
+        elif norm_type == "cpd_breach":
+            generate_cpd_breach_report(tmp_input, output_path)
         else:
             generate_ei_report(str(tmp_input), str(output_path))
 

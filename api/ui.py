@@ -36,6 +36,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="second_attempt_adherence">🎯 2nd Attempt Adherence Report</option>
       <option value="eob">📦 EOB Priority Report</option>
       <option value="untraceable">🔍 Untraceable Report</option>
+      <option value="cpd_breach">🚨 CPD Breach Report</option>
     </select>
     <label>API Key:</label>
     <input type="text" id="apiKey" value="OoV81VZ6ugIQ5qu_JNKfDM0jEp0SQyhpuZMaPTv5BbQ">

@@ -23,7 +23,8 @@ from generators import (
     generate_vms_adherence_report,
     generate_second_attempt_adherence_report,
     generate_eob_report,
-    generate_untraceable_report
+    generate_untraceable_report,
+    generate_cpd_breach_report
 )
 
 client = TestClient(create_app())
@@ -360,3 +361,50 @@ def test_ei_stream():
         assert ws_summary.cell(3, 8).value == "ALG"
         assert ws_summary.cell(3, 14).value == "ALG"
         assert ws_summary.cell(3, 20).value == "ALG"
+
+
+def test_cpd_breach_stream():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        src_xlsx = tmp_path / "breach_src.xlsx"
+        out_xlsx = tmp_path / "breach_out.xlsx"
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "LM"
+        headers = [
+            'tracking_number', 'order_created_date', 'customer_promise_date',
+            'New_Final_delay_tag', 'rto_ic_flag', 'Latest Status', 'Current Location',
+            'Latest Update Time', 'Cs Notes', 'No. of Attempts', 'DC Code', 'Source DC', 'Region'
+        ]
+        ws.append(headers)
+        ws.append(["TRK001", "01/09/26 10:00", "09/09/2026", "Customer Attributed", 0, "Delivered", "Hub1", "46275.0", "", 1, "ALG", "ALG", "North"])
+        ws.append(["TRK002", "02/09/26 11:00", "09/09/2026", "Last Mile delay", 0, "Out_For_Delivery", "Hub2", "46275.1", "", 2, "ALG", "ALG", "North"])
+        ws.append(["TRK003", "03/09/26 12:00", "09/09/2026", "RTO/IC - NCD", 1, "RTO", "Hub3", "46275.2", "", 0, "ALL", "ALL", "North"])
+        ws.append(["TRK004", "04/09/26 13:00", "09/09/2026", "Last Mile delay", 0, "Out_For_Delivery", "Hub4", "46275.3", "", 1, "XYZ_NON_ALLOWED", "XYZ_NON_ALLOWED", "South"])
+        wb.save(src_xlsx)
+
+        generate_cpd_breach_report(src_xlsx, out_xlsx)
+        assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert wb_out.sheetnames == ["summary", "raw"]
+
+        ws_sum = wb_out["summary"]
+        assert ws_sum.cell(1, 1).value == "Source DC"
+        assert ws_sum.cell(1, 2).value == "Customer Attributed"
+        assert ws_sum.cell(1, 3).value == "Last Mile delay"
+        assert ws_sum.cell(1, 4).value == "RTO/IC - NCD"
+        assert ws_sum.cell(1, 5).value == "Total CPD Breach"
+
+        # Check Total Result row at bottom
+        last_row = ws_sum.max_row
+        assert ws_sum.cell(last_row, 1).value == "Total Result"
+        assert ws_sum.cell(last_row, 2).value == 1  # Customer Attributed
+        assert ws_sum.cell(last_row, 3).value == 1  # Last Mile delay
+        assert ws_sum.cell(last_row, 4).value == 1  # RTO/IC - NCD
+        assert ws_sum.cell(last_row, 5).value == 3  # Total CPD Breach
+
+        # Check raw sheet: should have 3 rows (excluding non-allowed DC)
+        ws_raw = wb_out["raw"]
+        assert ws_raw.max_row == 4  # header + 3 data rows

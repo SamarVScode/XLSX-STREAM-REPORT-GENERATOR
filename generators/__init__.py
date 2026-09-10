@@ -11,3 +11,4 @@ from .vms_adherence_report_generator import generate_vms_adherence_report
 from .second_attempt_adherence_generator import generate_second_attempt_adherence_report
 from .eob_generator import generate_eob_report
 from .untraceable_report_generator import generate_untraceable_report
+from .cpd_breach_report_generator import generate_cpd_breach_report
