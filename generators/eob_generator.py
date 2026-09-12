@@ -32,9 +32,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_SOURCE_DCS
+    from config.dc_config import ALLOWED_SOURCE_DCS, normalize_dc_code, is_allowed_dc
 except ImportError:
-    from dc_config import ALLOWED_SOURCE_DCS
+    from dc_config import ALLOWED_SOURCE_DCS, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -123,10 +123,12 @@ def generate_eob_report(input_file: Path, output_file: Path):
                 raw_dc = row[sdc_idx]
                 if raw_dc is None:
                     continue
-                dc_clean = str(raw_dc).strip().upper()
+                dc_clean = normalize_dc_code(raw_dc)
 
                 if dc_clean in TARGET_SOURCE_DCS:
-                    raw_writer.write_row(row)
+                    r_out = list(row)
+                    r_out[sdc_idx] = dc_clean
+                    raw_writer.write_row(r_out)
 
                     t_no = str(row[t_idx]).strip() if len(row) > t_idx and row[t_idx] is not None else ""
                     prio = str(row[prio_idx]).strip() if len(row) > prio_idx and row[prio_idx] is not None else ""

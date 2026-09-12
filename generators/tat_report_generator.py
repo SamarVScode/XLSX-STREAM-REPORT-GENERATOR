@@ -28,9 +28,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET_LOWER
+    from config.dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
+    from dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -82,14 +82,15 @@ def generate_tat_report(input_file: Path, output_file: Path):
                 raw_hub = row[hub_idx]
                 if raw_hub is None:
                     continue
-                hub_clean = str(raw_hub).strip().lower()
+                hub_upper = normalize_dc_code(raw_hub)
 
-                if hub_clean in ALLOWED_DCS_SET_LOWER:
+                if is_allowed_dc(hub_upper):
                     total_filtered += 1
-                    raw_writer.write_row(row)
+                    r_out = list(row)
+                    r_out[hub_idx] = hub_upper
+                    raw_writer.write_row(r_out)
 
                     status = str(row[status_idx] or '').strip().lower()
-                    hub_upper = hub_clean.upper()
                     if status in ('closed', 'task resolved', 'resolved', 'complete', 'completed'):
                         stats_map[hub_upper]['complete'] += 1
                     else:

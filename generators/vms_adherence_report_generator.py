@@ -32,9 +32,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET_LOWER
+    from config.dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    from dc_config import ALLOWED_DCS_SET_LOWER
+    from dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -103,11 +103,13 @@ def generate_vms_adherence_report(input_file: Path, output_file: Path) -> Path:
                 raw_dc = row[source_dc_idx]
                 if raw_dc is None:
                     continue
-                dc_clean = str(raw_dc).strip().lower()
+                dc_clean = normalize_dc_code(raw_dc)
 
-                if dc_clean in ALLOWED_DCS_SET_LOWER:
+                if is_allowed_dc(dc_clean):
                     total_filtered += 1
-                    raw_writer.write_row(row)
+                    r_out = list(row)
+                    r_out[source_dc_idx] = dc_clean
+                    raw_writer.write_row(r_out)
 
                     status_raw = str(row[vms_status_idx] or '').strip() if len(row) > vms_status_idx else ''
                     status_clean = status_raw.lower().replace('_', ' ').replace('-', ' ').strip()

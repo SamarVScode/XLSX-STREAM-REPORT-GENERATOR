@@ -28,6 +28,9 @@ ROUTE_TYPE_MAP = {
     "/reports/untraceable": "untraceable",
     "/reports/ut": "untraceable",
     "/reports/cpd_breach": "cpd_breach",
+    "/reports/weekly-scm-tat": "weekly_scm_tat",
+    "/reports/weekly_scm_tat": "weekly_scm_tat",
+    "/reports/weekly-tat": "weekly_scm_tat",
 }
 
 @router.get("/")
@@ -78,6 +81,8 @@ async def convert_async(
 @router.post("/reports/untraceable")
 @router.post("/reports/ut")
 @router.post("/reports/cpd_breach")
+@router.post("/reports/weekly-scm-tat")
+@router.post("/reports/weekly_scm_tat")
 async def convert_upload(
     request: Request,
     file: UploadFile = File(...),

@@ -28,9 +28,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET as ALLOWED_DCS
+    from config.dc_config import ALLOWED_DCS_SET as ALLOWED_DCS, normalize_dc_code
 except ImportError:
-    from dc_config import ALLOWED_DCS_SET as ALLOWED_DCS
+    from dc_config import ALLOWED_DCS_SET as ALLOWED_DCS, normalize_dc_code
 
 from core.stream_engine import (
     open_stream_reader,
@@ -140,7 +140,8 @@ def build_dc_view(input_file: Path) -> pd.DataFrame:
     if dc_col and dc_col != 'Source_DC':
         df.rename(columns={dc_col: 'Source_DC'}, inplace=True)
     if 'Source_DC' in df.columns:
-        df = df[df['Source_DC'].astype(str).str.strip().str.upper().isin(ALLOWED_DCS)].copy()
+        df['Source_DC'] = df['Source_DC'].apply(normalize_dc_code)
+        df = df[df['Source_DC'].isin(ALLOWED_DCS)].copy()
 
     count_cols = [
         'L4D', '#Stores', 'OFP', 'Picked-up', 'OFD', 'Success_Del',
@@ -150,14 +151,42 @@ def build_dc_view(input_file: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    for col in PCT_COLS_DC:
-        if col in df.columns:
-            df[col] = df[col].apply(_clean_pct_val)
+    # Consolidate duplicate parent DC rows (e.g. when mini-DCs like CAR-KHR map to CAR)
+    if 'Source_DC' in df.columns and df['Source_DC'].duplicated().any():
+        agg_dict = {}
+        for col in df.columns:
+            if col == 'Source_DC':
+                continue
+            elif col in count_cols:
+                agg_dict[col] = 'sum'
+            elif col in PCT_COLS_DC:
+                continue
+            else:
+                agg_dict[col] = 'first'
+        df = df.groupby('Source_DC', as_index=False).agg(agg_dict)
 
-    if 'Picked-up' in df.columns and 'OFP' in df.columns:
-        if 'Succ_pickup%' not in df.columns or df['Succ_pickup%'].sum() == 0:
+        # Recalculate percentage columns from consolidated counts
+        if 'Picked-up' in df.columns and 'OFP' in df.columns:
             ofp_denom = df['OFP'].replace(0, float('nan'))
             df['Succ_pickup%'] = (df['Picked-up'] / ofp_denom).astype('float64').round(4).fillna(0.0)
+        if 'Success_Del' in df.columns and 'OFD' in df.columns:
+            ofd_denom = df['OFD'].replace(0, float('nan'))
+            df['Succ_del%'] = (df['Success_Del'] / ofd_denom).astype('float64').round(4).fillna(0.0)
+        if 'cod_del_update' in df.columns and 'OFD_COD' in df.columns:
+            ofd_cod_denom = df['OFD_COD'].replace(0, float('nan'))
+            df['COD_Succ_del%'] = (df['cod_del_update'] / ofd_cod_denom).astype('float64').round(4).fillna(0.0)
+        if 'pp_del_update' in df.columns and 'OFD_PP' in df.columns:
+            ofd_pp_denom = df['OFD_PP'].replace(0, float('nan'))
+            df['PP_Succ_del%'] = (df['pp_del_update'] / ofd_pp_denom).astype('float64').round(4).fillna(0.0)
+    else:
+        for col in PCT_COLS_DC:
+            if col in df.columns:
+                df[col] = df[col].apply(_clean_pct_val)
+
+        if 'Picked-up' in df.columns and 'OFP' in df.columns:
+            if 'Succ_pickup%' not in df.columns or df['Succ_pickup%'].sum() == 0:
+                ofp_denom = df['OFP'].replace(0, float('nan'))
+                df['Succ_pickup%'] = (df['Picked-up'] / ofp_denom).astype('float64').round(4).fillna(0.0)
 
     return df
 
@@ -175,7 +204,8 @@ def build_agent_view(input_file: Path) -> pd.DataFrame:
     if dc_col and dc_col != 'Source_DC':
         df.rename(columns={dc_col: 'Source_DC'}, inplace=True)
     if 'Source_DC' in df.columns:
-        df = df[df['Source_DC'].astype(str).str.strip().str.upper().isin(ALLOWED_DCS)].copy()
+        df['Source_DC'] = df['Source_DC'].apply(normalize_dc_code)
+        df = df[df['Source_DC'].isin(ALLOWED_DCS)].copy()
 
     del_col = None
     if 'del_update' in df.columns:

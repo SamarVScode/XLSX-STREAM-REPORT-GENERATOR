@@ -239,10 +239,12 @@ def assemble_stream_workbook(
         elif item.filename == 'xl/workbook.xml':
             wb_xml = z_in.read(item.filename).decode('utf-8')
             if unmatched_stream_sheets:
+                if 'xmlns:r=' not in wb_xml:
+                    wb_xml = wb_xml.replace('<workbook ', '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ', 1)
                 sheet_tags = []
                 for idx, s_writer in enumerate(unmatched_stream_sheets, start=num_summary_sheets + 1):
                     safe_sheet_name = esc(s_writer.sheet_name)
-                    sheet_tags.append(f'<sheet name="{safe_sheet_name}" sheetId="{idx}" r:id="rId{idx}"/>')
+                    sheet_tags.append(f'<sheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="{safe_sheet_name}" sheetId="{idx}" state="visible" r:id="rId{idx}"/>')
                 wb_xml = wb_xml.replace('</sheets>', ''.join(sheet_tags) + '</sheets>')
             z_out.writestr(item.filename, wb_xml)
 

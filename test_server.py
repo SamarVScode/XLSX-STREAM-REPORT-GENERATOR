@@ -24,7 +24,8 @@ from generators import (
     generate_second_attempt_adherence_report,
     generate_eob_report,
     generate_untraceable_report,
-    generate_cpd_breach_report
+    generate_cpd_breach_report,
+    generate_weekly_scm_tat_report
 )
 
 client = TestClient(create_app())
@@ -59,10 +60,45 @@ def test_forward_pendency_stream():
         ws.append(["SHIP1001", "ALG", 1, "P2", "Attempted"])
         ws.append(["SHIP1002", "AYP", 4, "P3", "Unattempted"])
         ws.append(["SHIP1003", "DEO", 7, "P4", "Attempted"])
+        ws.append(["SHIP1004", "ALG", 0, "P0", "Attempted"])
+        ws.append(["SHIP1005", "AYP", 2, "P1", "Unattempted"])
+        ws.append(["SHIP1006", "CAR-KHR", 2, "P0", "Attempted"])
         wb.save(src_xlsx)
         
         generate_forward_pendency_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        res_wb = openpyxl.load_workbook(out_xlsx)
+        assert "Summary" in res_wb.sheetnames
+        assert "CPD-DID pendency" in res_wb.sheetnames
+        assert "RAW" in res_wb.sheetnames
+
+        # Check Summary Priority Table headers (row 3, columns 9 to 15)
+        sum_ws = res_wb["Summary"]
+        prio_headers = [sum_ws.cell(row=3, column=c).value for c in range(9, 16)]
+        assert prio_headers == ["Source DC", "P0", "P1", "P2", "P3", "P4", "Total Pendency"]
+
+        # Check CAR is in summary and CAR-KHR is not
+        dcs_in_summary = [sum_ws.cell(row=r, column=9).value for r in range(4, sum_ws.max_row + 1)]
+        assert "CAR" in dcs_in_summary
+        assert "CAR-KHR" not in dcs_in_summary
+
+        # Check RAW sheet contains CAR, not CAR-KHR
+        raw_ws = res_wb["RAW"]
+        raw_dcs = [raw_ws.cell(row=r, column=2).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+
+        # Check CPD-DID sheet contains P0, P1, P2, P3 rows and CAR
+        cpd_ws = res_wb["CPD-DID pendency"]
+        cpd_rows = list(cpd_ws.iter_rows(values_only=True))
+        assert len(cpd_rows) == 6  # header + 5 data rows (P2, P3, P0, P1, P0 from CAR-KHR)
+        priorities_in_cpd = [r[4] for r in cpd_rows[1:]]
+        assert set(priorities_in_cpd) == {"P0", "P1", "P2", "P3"}
+        cpd_dcs = [r[1] for r in cpd_rows[1:]]
+        assert "CAR" in cpd_dcs
+        assert "CAR-KHR" not in cpd_dcs
+        res_wb.close()
 
 def test_reverse_pendency_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -77,10 +113,29 @@ def test_reverse_pendency_stream():
         ws.append(headers)
         ws.append(["TRACK101", "ALG", "North", 1, "", "Done"])
         ws.append(["TRACK102", "AYP", "North", 3, "", "Pending"])
+        ws.append(["TRACK103", "CAR-KHR", "North", 4, "", "Pending"])
         wb.save(src_xlsx)
         
         generate_reverse_pendency_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        res_wb = openpyxl.load_workbook(out_xlsx)
+        assert "Summary" in res_wb.sheetnames
+        assert "Critical P0" in res_wb.sheetnames
+        assert "Raw" in res_wb.sheetnames
+
+        # Check Raw sheet contains CAR, not CAR-KHR
+        raw_ws = res_wb["Raw"]
+        raw_dcs = [raw_ws.cell(row=r, column=2).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+
+        # Check Critical P0 contains CAR
+        p0_ws = res_wb["Critical P0"]
+        p0_dcs = [p0_ws.cell(row=r, column=2).value for r in range(2, p0_ws.max_row + 1)]
+        assert "CAR" in p0_dcs
+        assert "CAR-KHR" not in p0_dcs
+        res_wb.close()
 
 def test_conversion_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -90,13 +145,28 @@ def test_conversion_stream():
         out_d1 = tmp_path / "conv_d1_out.xlsx"
         
         with pd.ExcelWriter(src_xlsx, engine='openpyxl') as writer:
-            dc_df = pd.DataFrame([{
-                'Source_DC': 'ALG', 'Picked-up': 80.0, 'OFP': 100.0, 'Succ_pickup%': '80%', 'Succ_del%': '85%',
-                'COD_Succ_del%': '80%', 'PP_Succ_del%': '90%'
-            }])
-            agent_df = pd.DataFrame([{
-                'Source_DC': 'ALG', 'Picked-up': 80.0, 'OFP': 100.0, 'del_update': 85.0, 'OFD': 100.0
-            }])
+            dc_df = pd.DataFrame([
+                {
+                    'Source_DC': 'ALG', 'Picked-up': 80.0, 'OFP': 100.0, 'Succ_pickup%': '80%', 'Succ_del%': '85%',
+                    'COD_Succ_del%': '80%', 'PP_Succ_del%': '90%'
+                },
+                {
+                    'Source_DC': 'CAR', 'Picked-up': 30.0, 'OFP': 50.0, 'Succ_pickup%': '60%', 'Succ_del%': '70%',
+                    'COD_Succ_del%': '70%', 'PP_Succ_del%': '70%'
+                },
+                {
+                    'Source_DC': 'CAR-KHR', 'Picked-up': 20.0, 'OFP': 50.0, 'Succ_pickup%': '40%', 'Succ_del%': '80%',
+                    'COD_Succ_del%': '80%', 'PP_Succ_del%': '80%'
+                }
+            ])
+            agent_df = pd.DataFrame([
+                {
+                    'Source_DC': 'ALG', 'Picked-up': 80.0, 'OFP': 100.0, 'del_update': 85.0, 'OFD': 100.0
+                },
+                {
+                    'Source_DC': 'CAR-KHR', 'Picked-up': 20.0, 'OFP': 50.0, 'del_update': 40.0, 'OFD': 50.0
+                }
+            ])
             e2e_cols = [f"col_{i}" for i in range(25)]
             e2e_cols[22] = "Source_DC"
             row = ["val"] * 25
@@ -123,11 +193,24 @@ def test_conversion_stream():
                 assert num_fmt == '0'
             elif header and '%' in str(header):
                 assert num_fmt == '0.0%'
+        wb_same.close()
 
         generate_conversion_report(src_xlsx, out_d1, sub_type='d-1')
         assert out_d1.exists()
         wb_d1 = load_workbook(out_d1)
         assert wb_d1.sheetnames == ['D-1 DC_View', 'D-1 Agent_View']
+        ws_d1_dc = wb_d1['D-1 DC_View']
+        # CAR and CAR-KHR should be consolidated into a single 'CAR' row
+        dc_names = [ws_d1_dc.cell(row=r, column=1).value for r in range(2, ws_d1_dc.max_row + 1)]
+        assert "CAR" in dc_names
+        assert "CAR-KHR" not in dc_names
+
+        # Agent view should have CAR (from CAR-KHR)
+        ws_d1_agent = wb_d1['D-1 Agent_View']
+        agent_dcs = [ws_d1_agent.cell(row=r, column=1).value for r in range(2, ws_d1_agent.max_row + 1)]
+        assert "CAR" in agent_dcs
+        assert "CAR-KHR" not in agent_dcs
+        wb_d1.close()
 
 def test_nps_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -147,10 +230,24 @@ def test_nps_stream():
         row1[22] = "Agent A"
         row1[28] = "ALG"
         ws.append(row1)
+
+        row2 = [""] * 29
+        row2[4] = "Neutral"
+        row2[22] = "Agent B"
+        row2[28] = "CAR-KHR"
+        ws.append(row2)
         wb.save(src_xlsx)
         
         generate_nps_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert "Raw" in wb_out.sheetnames
+        raw_ws = wb_out["Raw"]
+        raw_dcs = [raw_ws.cell(row=r, column=29).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+        wb_out.close()
 
 def test_tat_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -169,10 +266,23 @@ def test_tat_stream():
         row1[4] = "Complete"
         row1[28] = "ALG"
         ws.append(row1)
+
+        row2 = [""] * 29
+        row2[4] = "Pending"
+        row2[28] = "CAR-KHR"
+        ws.append(row2)
         wb.save(src_xlsx)
         
         generate_tat_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert "SCM TAT raw data" in wb_out.sheetnames
+        raw_ws = wb_out["SCM TAT raw data"]
+        raw_dcs = [raw_ws.cell(row=r, column=29).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+        wb_out.close()
 
 def test_vms_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -190,6 +300,7 @@ def test_vms_stream():
         ws.append(["KNP", "Adherence", "Val"])
         ws.append(["LKO", "Non-Adherence", "Val"])
         ws.append(["GZB", "Non Adherence", "Val"])
+        ws.append(["CAR-KHR", "Done", "Val"])
         wb.save(src_xlsx)
         
         generate_vms_adherence_report(src_xlsx, out_xlsx)
@@ -206,7 +317,7 @@ def test_vms_stream():
 
         # Check rows content
         rows_data = {}
-        for r in range(4, 9):
+        for r in range(4, 10):
             dc = ws_sum.cell(row=r, column=1).value
             if dc and dc != 'TOTAL / SUMMARY':
                 rows_data[dc] = {
@@ -220,6 +331,13 @@ def test_vms_stream():
         assert rows_data["GZB"]["adh"] == 0 and rows_data["GZB"]["non_adh"] == 1
         assert rows_data["ALG"]["adh"] == 1 and rows_data["ALG"]["non_adh"] == 0
         assert rows_data["AYP"]["adh"] == 0 and rows_data["AYP"]["non_adh"] == 1
+        assert rows_data["CAR"]["adh"] == 1 and rows_data["CAR"]["non_adh"] == 0
+        assert "CAR-KHR" not in rows_data
+
+        raw_ws = wb_out["Raw"]
+        raw_dcs = [raw_ws.cell(row=r, column=1).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
         wb_out.close()
 
 def test_second_attempt_stream():
@@ -237,12 +355,14 @@ def test_second_attempt_stream():
         ws_sum.append(["Source DC", "Non Adherence", "Adherence", "Grand Total", "Adherence %", "", "Source DC", "Non Adherence", "Adherence", "Grand Total", "Adherence %"])
         ws_sum.append(["ALG", 5, 45, 50, 0.90, "", "ALG", 2, 18, 20, 0.90])
         ws_sum.append(["AYP", 10, 15, 25, 0.60, "", "AYP", 1, 9, 10, 0.90])
+        ws_sum.append(["CAR-KHR", 2, 8, 10, 0.80, "", "CAR-KHR", 1, 4, 5, 0.80])
         
         # 2. FWD sheet
         ws_fwd = wb.create_sheet("FWD")
         ws_fwd.append(["Tracking_No", "Source_DC", "Agent", "Status"])
         ws_fwd.append(["TRK001", "ALG", "Agent 1", "Delivered"])
         ws_fwd.append(["TRK002", "AYP", "Agent 2", "Undelivered"])
+        ws_fwd.append(["TRK004", "CAR-KHR", "Agent 4", "Delivered"])
         
         # 3. REV sheet
         ws_rev = wb.create_sheet("REV")
@@ -253,6 +373,15 @@ def test_second_attempt_stream():
         
         generate_second_attempt_adherence_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert "Raw" in wb_out.sheetnames
+        raw_ws = wb_out["Raw"]
+        # Source_DC is at column 3 (since col 1 is Flow_Type)
+        raw_dcs = [raw_ws.cell(row=r, column=3).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+        wb_out.close()
 
 def test_eob_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -267,10 +396,19 @@ def test_eob_stream():
         ws.append(headers)
         ws.append(["TRACK1", "ALG", "Out_For_Delivery", "1-2 days"])
         ws.append(["TRACK2", "AYP", "Undelivered_Attempted", "3-5 days"])
+        ws.append(["TRACK3", "CAR-KHR", "Out_For_Delivery", "1-2 days"])
         wb.save(src_xlsx)
         
         generate_eob_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert "Raw" in wb_out.sheetnames
+        raw_ws = wb_out["Raw"]
+        raw_dcs = [raw_ws.cell(row=r, column=2).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+        wb_out.close()
 
 def test_untraceable_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -285,10 +423,19 @@ def test_untraceable_stream():
         ws.append(headers)
         ws.append(["SHIP1", "ALG", "0-2 Days", 500])
         ws.append(["SHIP2", "AYP", "6-10 Days", 1200])
+        ws.append(["SHIP3", "CAR-KHR", "0-2 Days", 800])
         wb.save(src_xlsx)
         
         generate_untraceable_report(src_xlsx, out_xlsx)
         assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert "Raw" in wb_out.sheetnames
+        raw_ws = wb_out["Raw"]
+        raw_dcs = [raw_ws.cell(row=r, column=2).value for r in range(2, raw_ws.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+        wb_out.close()
 
 def test_ei_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -325,10 +472,29 @@ def test_ei_stream():
         ws_task.cell(3, 14, 5)   # REV Task
         ws_task.cell(3, 15, 20)  # REV 1k
 
+        ws_task.cell(4, 1, "CAR-KHR")
+        ws_task.cell(4, 2, "North")
+        ws_task.cell(4, 3, "Khurja")
+        # daily
+        ws_task.cell(4, 4, 50)
+        ws_task.cell(4, 5, 1)
+        ws_task.cell(4, 6, 20)
+        ws_task.cell(4, 7, 25)
+        ws_task.cell(4, 8, 1)
+        ws_task.cell(4, 9, 40)
+        # WTD
+        ws_task.cell(4, 10, 250)
+        ws_task.cell(4, 11, 5)
+        ws_task.cell(4, 12, 20)
+        ws_task.cell(4, 13, 125)
+        ws_task.cell(4, 14, 2)
+        ws_task.cell(4, 15, 16)
+
         ws_raw = wb.create_sheet("Raw")
         ws_raw.append(["Source_DC", "Final_tracking_no", "fwd_agent name", "rev_agent name"])
         ws_raw.append(["ALG", "MYSC12345", "Agent A", ""])
         ws_raw.append(["ALG", "MYSR12345", "", "Agent B"])
+        ws_raw.append(["CAR-KHR", "MYSC99999", "Agent C", ""])
 
         wb.save(src_xlsx)
 
@@ -356,11 +522,11 @@ def test_ei_stream():
         assert ws_summary.cell(2, 19).value == "Date"
         assert ws_summary.cell(2, 20).value == "Source_DC"
 
-        # Check data row 3
-        assert ws_summary.cell(3, 2).value == "ALG"
-        assert ws_summary.cell(3, 8).value == "ALG"
-        assert ws_summary.cell(3, 14).value == "ALG"
-        assert ws_summary.cell(3, 20).value == "ALG"
+        # Check Filtered_Source_DC sheet contains CAR, not CAR-KHR
+        ws_filt = wb_out["Filtered_Source_DC"]
+        filt_dcs = [ws_filt.cell(row=r, column=1).value for r in range(2, ws_filt.max_row + 1)]
+        assert "CAR" in filt_dcs
+        assert "CAR-KHR" not in filt_dcs
 
 
 def test_cpd_breach_stream():
@@ -382,6 +548,7 @@ def test_cpd_breach_stream():
         ws.append(["TRK002", "02/09/26 11:00", "09/09/2026", "Last Mile delay", 0, "Out_For_Delivery", "Hub2", "46275.1", "", 2, "ALG", "ALG", "North"])
         ws.append(["TRK003", "03/09/26 12:00", "09/09/2026", "RTO/IC - NCD", 1, "RTO", "Hub3", "46275.2", "", 0, "ALL", "ALL", "North"])
         ws.append(["TRK004", "04/09/26 13:00", "09/09/2026", "Last Mile delay", 0, "Out_For_Delivery", "Hub4", "46275.3", "", 1, "XYZ_NON_ALLOWED", "XYZ_NON_ALLOWED", "South"])
+        ws.append(["TRK005", "05/09/26 14:00", "09/09/2026", "Customer Attributed", 0, "Delivered", "Hub5", "46275.4", "", 1, "CAR-KHR", "CAR-KHR", "North"])
         wb.save(src_xlsx)
 
         generate_cpd_breach_report(src_xlsx, out_xlsx)
@@ -400,11 +567,126 @@ def test_cpd_breach_stream():
         # Check Total Result row at bottom
         last_row = ws_sum.max_row
         assert ws_sum.cell(last_row, 1).value == "Total Result"
-        assert ws_sum.cell(last_row, 2).value == 1  # Customer Attributed
+        assert ws_sum.cell(last_row, 2).value == 2  # Customer Attributed (ALG + CAR-KHR)
         assert ws_sum.cell(last_row, 3).value == 1  # Last Mile delay
         assert ws_sum.cell(last_row, 4).value == 1  # RTO/IC - NCD
-        assert ws_sum.cell(last_row, 5).value == 3  # Total CPD Breach
+        assert ws_sum.cell(last_row, 5).value == 4  # Total CPD Breach
 
-        # Check raw sheet: should have 3 rows (excluding non-allowed DC)
+        # Check summary has CAR and not CAR-KHR
+        sum_dcs = [ws_sum.cell(row=r, column=1).value for r in range(2, last_row)]
+        assert "CAR" in sum_dcs
+        assert "CAR-KHR" not in sum_dcs
+
+        # Check raw sheet: should have 4 rows (excluding non-allowed DC)
         ws_raw = wb_out["raw"]
-        assert ws_raw.max_row == 4  # header + 3 data rows
+        assert ws_raw.max_row == 5  # header + 4 data rows
+        raw_dcs = [ws_raw.cell(row=r, column=12).value for r in range(2, ws_raw.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+        wb_out.close()
+
+
+def test_weekly_scm_tat_stream():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        src_xlsx = tmp_path / "weekly_tat_src.xlsx"
+        out_xlsx = tmp_path / "weekly_tat_out.xlsx"
+
+        wb = Workbook()
+        
+        # 1. DC sheet
+        ws_dc = wb.active
+        ws_dc.title = "DC"
+        ws_dc.append(["Overall DC"] + [""] * 8 + ["Forward DC"] + [""] * 8 + ["Reverse DC"])
+        ws_dc.append([None, "06-Sep-26", "07-Sep-26", "08-Sep-26", "09-Sep-26", "10-Sep-26", "11-Sep-26", "Grand Total", None, "Forward DC", "06-Sep-26", "07-Sep-26", "08-Sep-26", "09-Sep-26", "10-Sep-26", "11-Sep-26", "Grand Total", None, "Reverse DC", "06-Sep-26", "07-Sep-26", "08-Sep-26", "09-Sep-26", "10-Sep-26", "11-Sep-26", "Grand Total"])
+        ws_dc.append(["ALG", 0.96, 0.92, 0.85, 0.98, 0.95, 0.91, 0.928, None, "ALG", 0.96, 0.92, 0.85, 0.98, 0.95, 0.91, 0.928, None, "ALG", 0.96, 0.92, 0.85, 0.98, 0.95, 0.91, 0.928])
+        ws_dc.append(["AYP", 0.99, 0.99, 0.97, 0.98, 0.99, 0.96, 0.98, None, "AYP", 0.99, 0.99, 0.97, 0.98, 0.99, 0.96, 0.98, None, "AYP", 0.99, 0.99, 0.97, 0.98, 0.99, 0.96, 0.98])
+        
+        # 2. Data sheet
+        ws_data = wb.create_sheet(title="Data")
+        headers = ["dummy"] * 37
+        headers[4] = "status_status"
+        headers[11] = "l4_name"
+        headers[12] = "l5_name"
+        headers[23] = "Attribute"
+        headers[26] = "Source DC"
+        headers[34] = "Aging"
+        ws_data.append(headers)
+
+        row1 = ["val"] * 37
+        row1[4] = "Open"
+        row1[11] = "Delay"
+        row1[12] = "Traffic"
+        row1[23] = "Forward"
+        row1[26] = "ALG"
+        row1[34] = "1"
+        ws_data.append(row1)
+
+        row2 = ["val"] * 37
+        row2[4] = "Closed"
+        row2[11] = "Damage"
+        row2[12] = "Handling"
+        row2[23] = "Reverse"
+        row2[26] = "ALG"
+        row2[34] = "2"
+        ws_data.append(row2)
+
+        row3 = ["val"] * 37
+        row3[4] = "Pending"
+        row3[11] = "Delay"
+        row3[12] = "Weather"
+        row3[23] = "Reverse"
+        row3[26] = "AYP"
+        row3[34] = "3"
+        ws_data.append(row3)
+
+        row4 = ["val"] * 37
+        row4[4] = "Open"
+        row4[11] = "Other"
+        row4[12] = "Other"
+        row4[23] = "Forward"
+        row4[26] = "NON_ALLOWED_DC"
+        row4[34] = "1"
+        ws_data.append(row4)
+
+        row5 = ["val"] * 37
+        row5[4] = "Open"
+        row5[11] = "Delay"
+        row5[12] = "Weather"
+        row5[23] = "Forward"
+        row5[26] = "CAR-KHR"
+        row5[34] = "1"
+        ws_data.append(row5)
+
+        wb.save(src_xlsx)
+
+        generate_weekly_scm_tat_report(src_xlsx, out_xlsx)
+        assert out_xlsx.exists()
+
+        wb_out = openpyxl.load_workbook(out_xlsx)
+        assert wb_out.sheetnames == ["summary", "raw data", "todays tasks", "today's task summary"]
+
+        # Check KPI cards on today's task summary
+        ws_kpi = wb_out["today's task summary"]
+        assert ws_kpi.cell(2, 1).value == "OPEN TASKS"
+        assert str(ws_kpi.cell(3, 1).value).replace(",", "") == "3"
+        assert ws_kpi.cell(2, 4).value == "FORWARD FLOW"
+        assert str(ws_kpi.cell(3, 4).value).replace(",", "") == "2"
+        assert ws_kpi.cell(2, 7).value == "REVERSE FLOW"
+        assert str(ws_kpi.cell(3, 7).value).replace(",", "") == "1"
+
+        # Check raw data has 4 rows (excluding non-allowed DC)
+        ws_raw = wb_out["raw data"]
+        assert ws_raw.max_row == 5  # header + 4 data rows
+        raw_dcs = [ws_raw.cell(row=r, column=27).value for r in range(2, ws_raw.max_row + 1)]
+        assert "CAR" in raw_dcs
+        assert "CAR-KHR" not in raw_dcs
+
+        # Check todays tasks has 3 rows (only non-closed allowed rows)
+        ws_tasks = wb_out["todays tasks"]
+        assert ws_tasks.max_row == 4  # header + 3 open tasks
+        task_dcs = [ws_tasks.cell(row=r, column=27).value for r in range(2, ws_tasks.max_row + 1)]
+        assert "CAR" in task_dcs
+        assert "CAR-KHR" not in task_dcs
+
+        wb_out.close()

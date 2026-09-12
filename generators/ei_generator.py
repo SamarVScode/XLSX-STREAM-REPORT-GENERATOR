@@ -17,9 +17,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
+    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
+    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -127,10 +127,10 @@ def parse_task_per_1k_rows(all_rows: List[List[Any]]):
         row = all_rows[r_idx]
         if not row:
             continue
-        dc = row[0] if len(row) > 0 else None
-        if dc is None:
+        raw_dc = row[0] if len(row) > 0 else None
+        if raw_dc is None:
             continue
-        dc = str(dc).strip()
+        dc = normalize_dc_code(raw_dc)
         if not dc:
             continue
         region = row[1] if len(row) > 1 else ''
@@ -140,27 +140,36 @@ def parse_task_per_1k_rows(all_rows: List[List[Any]]):
     blocks = []
     for col_start, label in block_starts:
         is_wtd = isinstance(label, str) and label.strip().upper() == 'WTD'
-        block_rows = []
+        dc_map = {}
         for (row, dc, region, city) in raw_rows:
-            if dc not in ALLOWED_SOURCE_DC:
+            if not is_allowed_dc(dc):
                 continue
             ofd      = _safe_float(row[col_start + IDX_OFD] if len(row) > col_start + IDX_OFD else 0)
             fwd_task = _safe_float(row[col_start + IDX_FWD_TASK] if len(row) > col_start + IDX_FWD_TASK else 0)
-            fwd_1k   = _safe_float(row[col_start + IDX_FWD_1K] if len(row) > col_start + IDX_FWD_1K else 0)
             ofp      = _safe_float(row[col_start + IDX_OFP] if len(row) > col_start + IDX_OFP else 0)
             rev_task = _safe_float(row[col_start + IDX_REV_TASK] if len(row) > col_start + IDX_REV_TASK else 0)
-            rev_1k   = _safe_float(row[col_start + IDX_REV_1K] if len(row) > col_start + IDX_REV_1K else 0)
 
             if ofd == 0 and fwd_task == 0 and ofp == 0 and rev_task == 0:
                 continue
 
-            block_rows.append({
-                'dc': dc, 'region': region, 'city': city,
-                'ofd': ofd, 'fwd_task': fwd_task, 'fwd_1k': fwd_1k,
-                'ofp': ofp, 'rev_task': rev_task, 'rev_1k': rev_1k,
-            })
+            if dc in dc_map:
+                entry = dc_map[dc]
+                entry['ofd'] += ofd
+                entry['fwd_task'] += fwd_task
+                entry['ofp'] += ofp
+                entry['rev_task'] += rev_task
+                entry['fwd_1k'] = (entry['fwd_task'] / entry['ofd'] * 1000) if entry['ofd'] > 0 else 0
+                entry['rev_1k'] = (entry['rev_task'] / entry['ofp'] * 1000) if entry['ofp'] > 0 else 0
+            else:
+                fwd_1k   = _safe_float(row[col_start + IDX_FWD_1K] if len(row) > col_start + IDX_FWD_1K else 0)
+                rev_1k   = _safe_float(row[col_start + IDX_REV_1K] if len(row) > col_start + IDX_REV_1K else 0)
+                dc_map[dc] = {
+                    'dc': dc, 'region': region, 'city': city,
+                    'ofd': ofd, 'fwd_task': fwd_task, 'fwd_1k': fwd_1k,
+                    'ofp': ofp, 'rev_task': rev_task, 'rev_1k': rev_1k,
+                }
 
-        blocks.append({'label': label, 'is_wtd': is_wtd, 'rows': block_rows})
+        blocks.append({'label': label, 'is_wtd': is_wtd, 'rows': list(dc_map.values())})
 
     return blocks
 
@@ -485,20 +494,22 @@ def generate_ei_report(source_file_path: Union[str, Path], output_file_path: Uni
                     raw_dc = row[dc_idx]
                     if raw_dc is None:
                         continue
-                    dc_clean = str(raw_dc).strip()
+                    dc_clean = normalize_dc_code(raw_dc)
 
-                    if dc_clean in ALLOWED_SOURCE_DC or dc_clean.upper() in ALLOWED_DCS_SET:
-                        writer_filtered.write_row(row)
+                    if is_allowed_dc(dc_clean):
+                        r_out = list(row)
+                        r_out[dc_idx] = dc_clean
+                        writer_filtered.write_row(r_out)
 
                         tno = str(row[track_idx] or '').strip().upper() if len(row) > track_idx and row[track_idx] is not None else ''
 
                         agent = ''
                         if tno.startswith(('MYSC', 'MYSD', 'MYSP')):
-                            writer_fwd.write_row(row)
+                            writer_fwd.write_row(r_out)
                             if fwd_agt_idx is not None and len(row) > fwd_agt_idx and row[fwd_agt_idx] is not None:
                                 agent = str(row[fwd_agt_idx] or '').strip()
                         elif tno.startswith('MYSR'):
-                            writer_rev.write_row(row)
+                            writer_rev.write_row(r_out)
                             if rev_agt_idx is not None and len(row) > rev_agt_idx and row[rev_agt_idx] is not None:
                                 agent = str(row[rev_agt_idx] or '').strip()
 

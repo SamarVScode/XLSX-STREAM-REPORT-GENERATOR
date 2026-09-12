@@ -28,9 +28,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
+    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET
+    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -187,16 +187,18 @@ def generate_reverse_pendency_report(input_file: Path, output_file: Path):
                     continue
 
                 region = str(row[region_idx] or '').strip().lower() if len(row) > region_idx else ''
-                dc = str(row[src_dc_idx] or '').strip().upper()
+                dc = normalize_dc_code(row[src_dc_idx])
 
-                if region == 'north' and dc in ALLOWED_DCS_SET:
+                if region == 'north' and is_allowed_dc(dc):
                     total_filtered += 1
                     aging_val = row[aging_idx] if len(row) > aging_idx else None
                     age_bucket = compute_age_bucket(aging_val)
                     pivot[dc][age_bucket] += 1
 
-                    # Write Raw row with Age_Bucket
-                    raw_writer.write_row(list(row) + [age_bucket])
+                    # Write Raw row with Age_Bucket and normalized DC
+                    r_out = list(row)
+                    r_out[src_dc_idx] = dc
+                    raw_writer.write_row(r_out + [age_bucket])
 
                     # Check P0 condition (aging >= 2)
                     try:

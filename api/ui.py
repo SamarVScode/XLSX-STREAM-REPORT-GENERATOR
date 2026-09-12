@@ -37,6 +37,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="eob">📦 EOB Priority Report</option>
       <option value="untraceable">🔍 Untraceable Report</option>
       <option value="cpd_breach">🚨 CPD Breach Report</option>
+      <option value="weekly_scm_tat">📅 Weekly SCM TAT Report</option>
     </select>
     <label>API Key:</label>
     <input type="text" id="apiKey" value="OoV81VZ6ugIQ5qu_JNKfDM0jEp0SQyhpuZMaPTv5BbQ">

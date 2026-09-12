@@ -31,14 +31,16 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET
+    from config.dc_config import ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
     TARGET_DCS = set(dc.upper() for dc in ALLOWED_DCS_SET if dc.upper() != 'ALL')
 except ImportError:
     try:
-        from dc_config import ALLOWED_DCS_SET
+        from dc_config import ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
         TARGET_DCS = set(dc.upper() for dc in ALLOWED_DCS_SET if dc.upper() != 'ALL')
     except ImportError:
         TARGET_DCS = {'ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'KNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR', 'VNS'}
+        normalize_dc_code = lambda x: str(x or '').strip().upper()
+        is_allowed_dc = lambda x: x in TARGET_DCS
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -108,33 +110,47 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                 continue
             # FWD (Cols 0-4)
             if len(r) >= 5 and r[0] is not None:
-                dc = str(r[0]).strip().upper()
+                dc = normalize_dc_code(r[0])
                 if dc in TARGET_DCS:
                     non_adh = safe_int(r[1])
                     adh = safe_int(r[2])
                     total = safe_int(r[3]) if r[3] is not None else (non_adh + adh)
-                    pct = safe_float(r[4]) if (r[4] is not None and not math.isnan(safe_float(r[4]))) else (adh / total if total > 0 else 0.0)
-                    fwd_dict[dc] = {
-                        "non_adherence": non_adh,
-                        "adherence": adh,
-                        "grand_total": total,
-                        "adherence_pct": pct
-                    }
+                    if dc in fwd_dict:
+                        fwd_dict[dc]["non_adherence"] += non_adh
+                        fwd_dict[dc]["adherence"] += adh
+                        fwd_dict[dc]["grand_total"] += total
+                        tot = fwd_dict[dc]["grand_total"]
+                        fwd_dict[dc]["adherence_pct"] = (fwd_dict[dc]["adherence"] / tot) if tot > 0 else 0.0
+                    else:
+                        pct = safe_float(r[4]) if (r[4] is not None and not math.isnan(safe_float(r[4]))) else (adh / total if total > 0 else 0.0)
+                        fwd_dict[dc] = {
+                            "non_adherence": non_adh,
+                            "adherence": adh,
+                            "grand_total": total,
+                            "adherence_pct": pct
+                        }
 
             # REV (Cols 6-10)
             if len(r) >= 11 and r[6] is not None:
-                dc = str(r[6]).strip().upper()
+                dc = normalize_dc_code(r[6])
                 if dc in TARGET_DCS:
                     non_adh = safe_int(r[7])
                     adh = safe_int(r[8])
                     total = safe_int(r[9]) if r[9] is not None else (non_adh + adh)
-                    pct = safe_float(r[10]) if (r[10] is not None and not math.isnan(safe_float(r[10]))) else (adh / total if total > 0 else 0.0)
-                    rev_dict[dc] = {
-                        "non_adherence": non_adh,
-                        "adherence": adh,
-                        "grand_total": total,
-                        "adherence_pct": pct
-                    }
+                    if dc in rev_dict:
+                        rev_dict[dc]["non_adherence"] += non_adh
+                        rev_dict[dc]["adherence"] += adh
+                        rev_dict[dc]["grand_total"] += total
+                        tot = rev_dict[dc]["grand_total"]
+                        rev_dict[dc]["adherence_pct"] = (rev_dict[dc]["adherence"] / tot) if tot > 0 else 0.0
+                    else:
+                        pct = safe_float(r[10]) if (r[10] is not None and not math.isnan(safe_float(r[10]))) else (adh / total if total > 0 else 0.0)
+                        rev_dict[dc] = {
+                            "non_adherence": non_adh,
+                            "adherence": adh,
+                            "grand_total": total,
+                            "adherence_pct": pct
+                        }
 
     sorted_dcs = sorted(list(set(fwd_dict.keys()) | set(rev_dict.keys())))
 
@@ -314,15 +330,21 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
                 with open_stream_reader(input_path, sheet_name=sheet_map["fwd"]) as (_, fwd_iter):
                     for row in fwd_iter:
                         if len(row) > dc_idx and row[dc_idx] is not None:
-                            if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                                raw_writer.write_row(["FWD"] + list(row))
+                            dc_clean = normalize_dc_code(row[dc_idx])
+                            if dc_clean in TARGET_DCS:
+                                r_out = list(row)
+                                r_out[dc_idx] = dc_clean
+                                raw_writer.write_row(["FWD"] + r_out)
                                 raw_record_count += 1
             if has_rev:
                 with open_stream_reader(input_path, sheet_name=sheet_map["rev"]) as (_, rev_iter):
                     for row in rev_iter:
                         if len(row) > dc_idx and row[dc_idx] is not None:
-                            if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                                raw_writer.write_row(["REV"] + list(row))
+                            dc_clean = normalize_dc_code(row[dc_idx])
+                            if dc_clean in TARGET_DCS:
+                                r_out = list(row)
+                                r_out[dc_idx] = dc_clean
+                                raw_writer.write_row(["REV"] + r_out)
                                 raw_record_count += 1
     else:
         raw_tab = None
@@ -342,8 +364,11 @@ def generate_second_attempt_adherence_report(input_path: Union[str, Path], outpu
             with raw_writer:
                 for row in raw_iter:
                     if len(row) > dc_idx and row[dc_idx] is not None:
-                        if str(row[dc_idx]).strip().upper() in TARGET_DCS:
-                            raw_writer.write_row(row)
+                        dc_clean = normalize_dc_code(row[dc_idx])
+                        if dc_clean in TARGET_DCS:
+                            r_out = list(row)
+                            r_out[dc_idx] = dc_clean
+                            raw_writer.write_row(r_out)
                             raw_record_count += 1
 
     log.info(f"Summary DC Items: FWD={len(fwd_dict)}, REV={len(rev_dict)}")

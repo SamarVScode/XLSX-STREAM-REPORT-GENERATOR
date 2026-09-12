@@ -5,7 +5,7 @@ Forward Pendency Report Generator Module for ei_stream_server
 Reads 'raw_data_North' from input Excel file, filters rows where Source_DC is in allowed list,
 computes the 'Aging Category' column right beside 'Aging', and generates output workbook:
   1. Summary Sheet (3 Sidewise Tables with Red/Green highlights)
-  2. CPD-DID pendency Sheet (P2 & P3 actual row details)
+  2. CPD-DID pendency Sheet (P0, P1, P2 & P3 actual row details)
   3. RAW Sheet (Full filtered rows dataset with Aging Category)
 
 Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
@@ -28,9 +28,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
+    from config.dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER, normalize_dc_code, is_allowed_dc
 except ImportError:
-    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER
+    from dc_config import ALLOWED_SOURCE_DCS, ALLOWED_DCS_SET, ALLOWED_DCS_SET_LOWER, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -69,13 +69,19 @@ def normalize_priority(val) -> str:
     s = str(val).strip().upper()
     if not s:
         return "Unknown"
+    if s in ("P0", "0", "0.0", "P-0", "P 0", "PRIORITY 0", "PRIORITY-0", "PRIORITY_0"):
+        return "P0"
+    if s in ("P1", "1", "1.0", "P-1", "P 1", "PRIORITY 1", "PRIORITY-1", "PRIORITY_1"):
+        return "P1"
     if s in ("P2", "2", "2.0", "P-2", "P 2", "PRIORITY 2", "PRIORITY-2", "PRIORITY_2"):
         return "P2"
     if s in ("P3", "3", "3.0", "P-3", "P 3", "PRIORITY 3", "PRIORITY-3", "PRIORITY_3"):
         return "P3"
     if s in ("P4", "4", "4.0", "P-4", "P 4", "PRIORITY 4", "PRIORITY-4", "PRIORITY_4"):
         return "P4"
-    if s in ("P1", "1", "1.0", "P-1", "P 1", "PRIORITY 1", "PRIORITY-1", "PRIORITY_1"):
+    if "P0" in s:
+        return "P0"
+    if "P1" in s:
         return "P1"
     if "P2" in s or "DID" in s:
         return "P2"
@@ -83,8 +89,6 @@ def normalize_priority(val) -> str:
         return "P3"
     if "P4" in s:
         return "P4"
-    if "P1" in s:
-        return "P1"
     return s
 
 
@@ -153,7 +157,7 @@ def write_side_table(ws, start_col: int, start_row: int, title: str, headers: li
                     cell.font = red_font
                     highlighted = True
                 elif title == "Priority Table":
-                    if h_name in ['P2', 'P3']:
+                    if h_name in ['P0', 'P1', 'P2', 'P3']:
                         cell.fill = red_fill
                         cell.font = red_font
                         highlighted = True
@@ -201,7 +205,7 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     t1_totals = ["Total"] + [tot_cats_t1[cat] for cat in AGING_CATEGORIES] + [sum(tot_cats_t1.values())]
     table1_data.append(t1_totals)
 
-    prio_keys = ["P2", "P3", "P4"]
+    prio_keys = ["P0", "P1", "P2", "P3", "P4"]
     table2_headers = ["Source DC"] + prio_keys + ["Total Pendency"]
     table2_data = []
     tot_prios_t2 = defaultdict(int)
@@ -239,15 +243,15 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     start_row = 2
     write_side_table(ws, start_col=2,  start_row=start_row, title="Aging wise report", headers=table1_headers, data_matrix=table1_data)
     write_side_table(ws, start_col=9,  start_row=start_row, title="Priority Table",    headers=table2_headers, data_matrix=table2_data)
-    write_side_table(ws, start_col=15, start_row=start_row, title="CPD Pendency",     headers=table3_headers, data_matrix=table3_data)
+    write_side_table(ws, start_col=17, start_row=start_row, title="CPD Pendency",     headers=table3_headers, data_matrix=table3_data)
 
     ws.column_dimensions['A'].width = 3
     ws.column_dimensions['H'].width = 4
-    ws.column_dimensions['N'].width = 4
+    ws.column_dimensions['P'].width = 4
 
     for col in ws.columns:
         col_letter = get_column_letter(col[0].column)
-        if col_letter in ['A', 'H', 'N']:
+        if col_letter in ['A', 'H', 'P']:
             continue
         max_len = max(len(str(cell.value or '')) for cell in col)
         ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
@@ -316,11 +320,10 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
                 raw_sdc = row[sdc_idx]
                 if raw_sdc is None:
                     continue
-                sdc = str(raw_sdc).strip().lower()
+                sdc_upper = normalize_dc_code(raw_sdc)
 
-                if sdc in ALLOWED_DCS_SET_LOWER:
+                if is_allowed_dc(sdc_upper):
                     total_filtered += 1
-                    sdc_upper = sdc.upper()
                     aging_val = row[aging_col_idx] if len(row) > aging_col_idx else None
                     aging_cat = compute_aging_category(aging_val)
 
@@ -335,16 +338,17 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
                     elif prio == "P2":
                         t3_pivot[sdc_upper]["DID (P2)"] += 1
 
-                    # Write RAW row (insert Aging Category safely)
+                    # Write RAW row (insert Aging Category safely and ensure sdc is normalized)
                     r_out = list(row)
+                    r_out[sdc_idx] = sdc_upper
                     if aging_col_idx < len(r_out):
                         r_out.insert(aging_col_idx + 1, aging_cat)
                     else:
                         r_out.append(aging_cat)
                     raw_writer.write_row(r_out)
 
-                    # Write CPD-DID row if P2 or P3
-                    if prio in ("P2", "P3"):
+                    # Write CPD-DID row if P0, P1, P2 or P3
+                    if prio in ("P0", "P1", "P2", "P3"):
                         cpd_count += 1
                         shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
                         attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""

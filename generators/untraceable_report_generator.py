@@ -27,9 +27,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET_LOWER
+    from config.dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
+    from dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -88,12 +88,13 @@ def generate_untraceable_report(input_file: Path, output_file: Path):
                 raw_dc = row[source_dc_idx]
                 if raw_dc is None:
                     continue
-                dc_clean = str(raw_dc).strip().lower()
+                dc_name = normalize_dc_code(raw_dc)
 
-                if dc_clean in ALLOWED_DCS_SET_LOWER:
-                    raw_writer.write_row(row)
+                if is_allowed_dc(dc_name):
+                    r_out = list(row)
+                    r_out[source_dc_idx] = dc_name
+                    raw_writer.write_row(r_out)
 
-                    dc_name = str(raw_dc).strip().upper()
                     age_val = str(row[age_bucket_idx]).strip() if len(row) > age_bucket_idx and row[age_bucket_idx] is not None else '0-2 Days'
                     
                     amt_val = 0.0

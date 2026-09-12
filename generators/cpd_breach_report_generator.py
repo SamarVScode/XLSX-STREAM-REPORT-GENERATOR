@@ -31,9 +31,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET_LOWER
+    from config.dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    ALLOWED_DCS_SET_LOWER = {'alg', 'ayp', 'deo', 'jhs', 'jnp', 'knp', 'mau', 'mrz', 'mth', 'mzn', 'rbr', 'spr', 'vns', 'all'}
+    from dc_config import ALLOWED_DCS_SET_LOWER, ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -131,12 +131,14 @@ def generate_cpd_breach_report(input_file: Path, output_file: Path):
                 if raw_dc is None:
                     continue
 
-                dc_clean = str(raw_dc).strip().lower()
-                if dc_clean in ALLOWED_DCS_SET_LOWER:
+                dc_upper = normalize_dc_code(raw_dc)
+                if is_allowed_dc(dc_upper):
                     # Map row to the 13 required columns
                     row_vals: List[Any] = []
                     for c_idx in col_indices:
-                        if c_idx >= 0 and c_idx < len(row):
+                        if c_idx == source_dc_idx:
+                            row_vals.append(dc_upper)
+                        elif c_idx >= 0 and c_idx < len(row):
                             val = row[c_idx]
                             row_vals.append("" if val is None else val)
                         else:
@@ -146,7 +148,6 @@ def generate_cpd_breach_report(input_file: Path, output_file: Path):
                     filtered_count += 1
 
                     # Aggregate summary metrics
-                    dc_upper = str(raw_dc).strip().upper()
                     tag_val = str(row[delay_tag_idx]).strip() if delay_tag_idx >= 0 and delay_tag_idx < len(row) and row[delay_tag_idx] is not None else ""
 
                     if tag_val in sum_stats[dc_upper]:

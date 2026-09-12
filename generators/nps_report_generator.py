@@ -27,9 +27,9 @@ if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 
 try:
-    from config.dc_config import ALLOWED_DCS_SET
+    from config.dc_config import ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 except ImportError:
-    from dc_config import ALLOWED_DCS_SET
+    from dc_config import ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
 
 from core.stream_engine import (
     XmlSheetWriter,
@@ -91,11 +91,13 @@ def generate_nps_report(input_file: Path, output_file: Path):
                 raw_dc = row[source_dc_idx]
                 if raw_dc is None:
                     continue
-                source_dc = str(raw_dc).strip().upper()
+                source_dc = normalize_dc_code(raw_dc)
 
-                if source_dc in ALLOWED_DCS_SET:
+                if is_allowed_dc(source_dc):
                     total_filtered += 1
-                    raw_writer.write_row(row)
+                    r_out = list(row)
+                    r_out[source_dc_idx] = source_dc
+                    raw_writer.write_row(r_out)
 
                     option = str(row[option_idx]).strip() if len(row) > option_idx and row[option_idx] is not None else ''
                     agent = str(row[agent_idx]).strip() if len(row) > agent_idx and row[agent_idx] is not None else ''
