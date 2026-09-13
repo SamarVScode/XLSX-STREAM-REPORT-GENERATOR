@@ -183,7 +183,7 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
 
     dc_list = list(PRIMARY_NORTH_DCS)
     for dc in ALLOWED_SOURCE_DCS:
-        if dc.upper() != 'ALL' and dc.upper() not in dc_list:
+        if dc.upper() not in dc_list:
             if any(t1_pivot[dc.upper()].values()) or any(t2_pivot[dc.upper()].values()):
                 dc_list.append(dc.upper())
 

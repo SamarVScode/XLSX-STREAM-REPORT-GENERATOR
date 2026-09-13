@@ -32,11 +32,11 @@ if str(SERVER_ROOT) not in sys.path:
 
 try:
     from config.dc_config import ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
-    TARGET_DCS = set(dc.upper() for dc in ALLOWED_DCS_SET if dc.upper() != 'ALL')
+    TARGET_DCS = set(dc.upper() for dc in ALLOWED_DCS_SET)
 except ImportError:
     try:
         from dc_config import ALLOWED_DCS_SET, normalize_dc_code, is_allowed_dc
-        TARGET_DCS = set(dc.upper() for dc in ALLOWED_DCS_SET if dc.upper() != 'ALL')
+        TARGET_DCS = set(dc.upper() for dc in ALLOWED_DCS_SET)
     except ImportError:
         TARGET_DCS = {'ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'KNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR', 'VNS'}
         normalize_dc_code = lambda x: str(x or '').strip().upper()

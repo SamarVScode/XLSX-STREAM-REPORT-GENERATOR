@@ -46,7 +46,7 @@ from core.stream_engine import (
 
 log = logging.getLogger("ei_stream_server.eob_generator")
 
-TARGET_SOURCE_DCS = [dc.upper() for dc in ALLOWED_SOURCE_DCS if str(dc).upper() != 'ALL']
+TARGET_SOURCE_DCS = [dc.upper() for dc in ALLOWED_SOURCE_DCS]
 
 STATUS_SHORTFORMS = {
     'Out_For_Delivery': 'OFD',

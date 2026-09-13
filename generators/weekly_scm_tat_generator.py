@@ -2,14 +2,15 @@
 """
 Weekly SCM TAT & HCQ Report Generator Module for ei_stream_server
 ================================================================
-Generates a structured 6-tab workbook for SCM TAT & HCQ:
-  1. 'summary'              : Filtered & aligned DC scorecard with Green/Yellow/Red coloring
+Generates a structured 7-tab workbook for SCM TAT & HCQ:
+  1. 'summary'              : Filtered & aligned DC scorecard (4 tables: Overall, Forward, Reverse, Within vs Post TAT)
   2. 'raw data'             : All rows for configured DCs from the 'Data' tab (Streamed to Disk XML)
-  3. 'todays tasks'         : Open/pending tasks (status != 'Closed') (Streamed to Disk XML)
-  4. "today's task summary" : Executive KPI cards (Open, Forward, Reverse), DC x Aging matrix,
+  3. 'Tasks'                : Open/pending tasks (status != 'Closed') including both Within TAT and Post TAT (Streamed to Disk XML)
+  4. "today's tasky"        : Open tasks where Closure_TAT == 'Post TAT' and Aging == '<24Hrs' (Streamed to Disk XML)
+  5. "today's task summary" : Executive KPI cards (Open, Forward, Reverse), DC x Aging matrix,
                               and side-by-side L4 & L5 Root Cause breakdowns.
-  5. 'hub l5 summary'       : Hub-wise matrix with distinct L5 Root Reasons as column headers
-  6. 'hub l4 l5 breakdown'  : Detailed drilldown per hub (L4, L5, Open Tasks, Share of Hub %, Total Share %)
+  6. 'hub l5 summary'       : Hub-wise matrix with distinct L5 Root Reasons as column headers
+  7. 'hub l4 l5 breakdown'  : Detailed drilldown per hub (L4, L5, Open Tasks, Share of Hub %, Total Share %)
 
 Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
@@ -22,6 +23,8 @@ from pathlib import Path
 from collections import defaultdict, Counter
 import re
 import datetime
+import time
+import shutil
 import html
 import zipfile
 from typing import Dict, Any, List, Tuple
@@ -187,9 +190,13 @@ def parse_dc_sheet(input_path: Path, target_sheet: str) -> Tuple[Dict[str, List[
     return overall_dict, forward_dict, reverse_dict, date_headers
 
 
-def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict: dict, date_headers: list):
+def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict: dict, date_headers: list, dc_tat_volume: dict = None):
     """
-    Builds the formatted 'summary' tab with 3 side-by-side tables filtered to configured DCs.
+    Builds the formatted 'summary' tab with side-by-side tables filtered to configured DCs:
+      - Table 1: Overall DC - TAT Adherence (%)
+      - Table 2: Forward DC - TAT Adherence (%)
+      - Table 3: Reverse DC - TAT Adherence (%)
+      - Table 4: DC Task Volume (Within vs Post TAT Counts & Adherence %)
     Dynamically adjusts table widths, gaps, and formulas based on date count.
     Applies Green/Yellow/Red conditional color thresholds:
       - Green  (> 95%)        : Fill #C6EFCE, Font #006100
@@ -206,6 +213,7 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
     banner_fill_1 = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")  # Navy
     banner_fill_2 = PatternFill(start_color="0D9488", end_color="0D9488", fill_type="solid")  # Teal
     banner_fill_3 = PatternFill(start_color="7C3AED", end_color="7C3AED", fill_type="solid")  # Purple
+    banner_fill_4 = PatternFill(start_color="D97706", end_color="D97706", fill_type="solid")  # Amber
     subhead_fill  = PatternFill(start_color="334155", end_color="334155", fill_type="solid")  # Slate
     zebra_fill    = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
     total_fill    = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
@@ -252,6 +260,10 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
     
     t3_start = gap2_col + 1
     t3_end = t3_start + num_dates
+    gap3_col = t3_end + 1
+
+    t4_start = gap3_col + 1
+    t4_end = t4_start + 4 if dc_tat_volume else t3_end
 
     # Row 1: Top Section Banners
     banners = [
@@ -259,6 +271,9 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
         (t2_start, t2_end, "Forward DC - TAT Adherence", banner_fill_2),
         (t3_start, t3_end, "Reverse DC - TAT Adherence", banner_fill_3),
     ]
+    if dc_tat_volume:
+        banners.append((t4_start, t4_end, "DC Task Volume (Within vs Post TAT)", banner_fill_4))
+
     for c_st, c_en, label, b_fill in banners:
         ws.cell(1, c_st, label).font = font_banner
         ws.merge_cells(start_row=1, start_column=c_st, end_row=1, end_column=c_en)
@@ -288,9 +303,18 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
             c_dh.alignment = center_align
             c_dh.border = cell_border
 
+    if dc_tat_volume:
+        t4_hdrs = ["Source DC", "Within TAT", "Post TAT", "Total Tasks", "Adherence %"]
+        for i, h in enumerate(t4_hdrs):
+            c = ws.cell(2, t4_start + i, h)
+            c.font = font_subhead
+            c.fill = subhead_fill
+            c.alignment = center_align
+            c.border = cell_border
+
     ws.row_dimensions[2].height = 20
 
-    active_dcs = sorted([dc for dc in ALLOWED_SOURCE_DCS if dc.upper() != 'ALL'])
+    active_dcs = sorted([dc for dc in ALLOWED_SOURCE_DCS])
     curr_row = 3
 
     stats_overall = [[0.0, 0] for _ in range(num_dates)]
@@ -333,6 +357,61 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
                     cell.value = "-"
                     cell.alignment = center_align
 
+        # Table 4: DC Task Volume
+        if dc_tat_volume:
+            w_cnt = dc_tat_volume.get(dc, {}).get('within', 0)
+            p_cnt = dc_tat_volume.get(dc, {}).get('post', 0)
+            tot_cnt = w_cnt + p_cnt
+            adh_pct = (w_cnt / tot_cnt) if tot_cnt > 0 else None
+
+            c_dc4 = ws.cell(curr_row, t4_start, dc)
+            c_w = ws.cell(curr_row, t4_start + 1, w_cnt if w_cnt > 0 else "-")
+            c_p = ws.cell(curr_row, t4_start + 2, p_cnt if p_cnt > 0 else "-")
+            c_tot = ws.cell(curr_row, t4_start + 3, tot_cnt if tot_cnt > 0 else "-")
+            c_adh = ws.cell(curr_row, t4_start + 4)
+
+            c_dc4.font = font_dc
+            c_dc4.alignment = center_align
+            c_dc4.border = cell_border
+
+            c_w.font = font_normal
+            c_w.alignment = right_align if w_cnt > 0 else center_align
+            c_w.border = cell_border
+            if w_cnt > 0:
+                c_w.number_format = "#,##0"
+
+            c_p.font = font_normal
+            c_p.alignment = right_align if p_cnt > 0 else center_align
+            c_p.border = cell_border
+            if p_cnt > 0:
+                c_p.number_format = "#,##0"
+
+            c_tot.font = font_bold
+            c_tot.alignment = right_align if tot_cnt > 0 else center_align
+            c_tot.border = cell_border
+            if tot_cnt > 0:
+                c_tot.number_format = "#,##0"
+
+            c_adh.border = cell_border
+            if adh_pct is not None:
+                c_adh.value = adh_pct
+                c_adh.number_format = "0.0%"
+                c_adh.alignment = right_align
+                f_fill, f_font = get_cell_style(adh_pct, is_zebra)
+                if f_fill:
+                    c_adh.fill = f_fill
+                c_adh.font = f_font
+            else:
+                c_adh.value = "-"
+                c_adh.font = font_normal
+                c_adh.alignment = center_align
+
+            if row_fill:
+                for c_cell in (c_dc4, c_w, c_p, c_tot):
+                    c_cell.fill = row_fill
+                if adh_pct is None:
+                    c_adh.fill = row_fill
+
         curr_row += 1
 
     # Summary Row: Server DCs Avg
@@ -366,13 +445,67 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
                 cell.fill = total_fill
                 cell.alignment = center_align
 
+    # Table 4 Grand Total
+    if dc_tat_volume:
+        tot_w = sum(dc_tat_volume.get(d, {}).get('within', 0) for d in active_dcs)
+        tot_p = sum(dc_tat_volume.get(d, {}).get('post', 0) for d in active_dcs)
+        tot_all = tot_w + tot_p
+        tot_adh = (tot_w / tot_all) if tot_all > 0 else None
+
+        c_gt4 = ws.cell(curr_row, t4_start, "Grand Total")
+        c_gt4.font = font_bold
+        c_gt4.fill = total_fill
+        c_gt4.alignment = center_align
+        c_gt4.border = total_border
+
+        c_gt_w = ws.cell(curr_row, t4_start + 1, tot_w)
+        c_gt_w.font = font_bold
+        c_gt_w.fill = total_fill
+        c_gt_w.alignment = right_align
+        c_gt_w.number_format = "#,##0"
+        c_gt_w.border = total_border
+
+        c_gt_p = ws.cell(curr_row, t4_start + 2, tot_p)
+        c_gt_p.font = font_bold
+        c_gt_p.fill = total_fill
+        c_gt_p.alignment = right_align
+        c_gt_p.number_format = "#,##0"
+        c_gt_p.border = total_border
+
+        c_gt_all = ws.cell(curr_row, t4_start + 3, tot_all)
+        c_gt_all.font = font_bold
+        c_gt_all.fill = total_fill
+        c_gt_all.alignment = right_align
+        c_gt_all.number_format = "#,##0"
+        c_gt_all.border = total_border
+
+        c_gt_adh = ws.cell(curr_row, t4_start + 4)
+        c_gt_adh.border = total_border
+        if tot_adh is not None:
+            c_gt_adh.value = tot_adh
+            c_gt_adh.number_format = "0.0%"
+            c_gt_adh.alignment = right_align
+            f_fill, f_font = get_cell_style(tot_adh, False)
+            c_gt_adh.fill = f_fill if f_fill else total_fill
+            c_gt_adh.font = f_font if f_font else font_bold
+        else:
+            c_gt_adh.value = "-"
+            c_gt_adh.font = font_bold
+            c_gt_adh.fill = total_fill
+            c_gt_adh.alignment = center_align
+
     # Set column widths dynamically
-    for col in range(1, t3_end + 1):
+    max_col = t4_end if dc_tat_volume else t3_end
+    for col in range(1, max_col + 1):
         letter = get_column_letter(col)
-        if col in (gap1_col, gap2_col):
+        if col in (gap1_col, gap2_col) or (dc_tat_volume and col == gap3_col):
             ws.column_dimensions[letter].width = 3
-        elif col in (t1_start, t2_start, t3_start):
+        elif col in (t1_start, t2_start, t3_start) or (dc_tat_volume and col == t4_start):
             ws.column_dimensions[letter].width = 15
+        elif dc_tat_volume and col in (t4_start + 1, t4_start + 2, t4_start + 3):
+            ws.column_dimensions[letter].width = 13
+        elif dc_tat_volume and col == t4_start + 4:
+            ws.column_dimensions[letter].width = 14
         else:
             ws.column_dimensions[letter].width = 12
 
@@ -624,6 +757,7 @@ def build_hub_l5_matrix_tab(ws, hub_metrics: dict):
     Dynamic Hub-wise matrix with distinct L5 Root Reasons as column headers.
     """
     ws.sheet_view.showGridLines = True
+    ws.freeze_panes = 'B1'  # Freeze first column (Source DC)
     font_family = "Segoe UI"
 
     font_banner = Font(name=font_family, size=11, bold=True, color="FFFFFF")
@@ -848,7 +982,14 @@ def _post_process_xml_entities(xlsx_path: Path):
                 if item.filename.endswith('.xml') and b'&gt;' in data:
                     data = data.replace(b'&gt;', b'>')
                 z_out.writestr(item, data)
-        temp_path.replace(xlsx_path)
+        try:
+            temp_path.replace(xlsx_path)
+        except (PermissionError, OSError):
+            shutil.copyfile(temp_path, xlsx_path)
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
     except Exception as e:
         log.warning(f"Could not post-process XML entities in {xlsx_path.name}: {e}")
         if temp_path.exists():
@@ -906,6 +1047,7 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
     reverse_count = 0
     aging_buckets = set()
     dc_aging_map = defaultdict(lambda: defaultdict(int))
+    dc_tat_volume = defaultdict(lambda: defaultdict(int))
     l4_counts = defaultdict(int)
     l5_counts = defaultdict(int)
     dc_l5_map = defaultdict(lambda: defaultdict(int))
@@ -920,6 +1062,7 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
             'status': ['status_status', 'status', 'task_status', 'attempt_status', 'state'],
             'aging': ['aging', 'agingdays', 'agebucket', 'agingbucket'],
             'attr': ['attribute', 'flow', 'direction', 'movement', 'type'],
+            'closure': ['closure_tat', 'closuretat', 'closuredays', 'closure_status'],
             'l4': ['l4_name', 'l4', 'issue_category', 'issue_category_l4'],
             'l5': ['l5_name', 'l5', 'root_reason', 'root_reason_l5', 'root_cause']
         })
@@ -928,14 +1071,16 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
         status_idx = cf.get('status', 4)
         aging_idx = cf.get('aging', 34)
         attr_idx = cf.get('attr', 23)
+        closure_idx = cf.get('closure', 22)
         l4_idx = cf.get('l4', 11)
         l5_idx = cf.get('l5', 12)
 
         # Zero-DOM Disk XML streaming writers
         raw_writer = XmlSheetWriter("raw data", headers)
-        tasks_writer = XmlSheetWriter("todays tasks", headers)
+        tasks_writer = XmlSheetWriter("Tasks", headers)
+        tasky_writer = XmlSheetWriter("today's tasky", headers)
 
-        with raw_writer, tasks_writer:
+        with raw_writer, tasks_writer, tasky_writer:
             for row in row_iter:
                 if not row or len(row) <= sdc_idx:
                     continue
@@ -944,18 +1089,31 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
                     continue
                 dc_upper = normalize_dc_code(raw_sdc)
 
-                if is_allowed_dc(dc_upper) and dc_upper != 'ALL':
+                if is_allowed_dc(dc_upper):
                     total_filtered += 1
                     r_out = list(row)
                     r_out[sdc_idx] = dc_upper
                     raw_writer.write_row(r_out)
 
+                    raw_closure = str(row[closure_idx] or '').strip().lower() if len(row) > closure_idx else ''
+                    is_within_tat = ('within' in raw_closure)
+                    is_post_tat = ('post' in raw_closure)
+
+                    if is_within_tat:
+                        dc_tat_volume[dc_upper]['within'] += 1
+                    elif is_post_tat:
+                        dc_tat_volume[dc_upper]['post'] += 1
+
                     stat_val = str(row[status_idx] or '').strip().lower() if len(row) > status_idx else ''
                     if stat_val != 'closed':
                         total_open_tasks += 1
                         tasks_writer.write_row(r_out)
+
                         raw_ag = row[aging_idx] if len(row) > aging_idx else None
                         ag = normalize_aging_bucket(raw_ag)
+
+                        if is_post_tat and ag == '<24Hrs':
+                            tasky_writer.write_row(r_out)
                         att = str(row[attr_idx] or '').strip().lower() if len(row) > attr_idx else ''
                         l4 = str(row[l4_idx] or 'Unknown').strip() if len(row) > l4_idx else 'Unknown'
                         l5 = str(row[l5_idx] or 'Unknown').strip() if len(row) > l5_idx else 'Unknown'
@@ -999,35 +1157,38 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
         "dc_l4_l5_list": sorted_l4_l5
     }
 
-    # Construct OpenPyXL micro-workbook (< 2 MB RAM) with 6 sheets in exact tab order
+    # Construct OpenPyXL micro-workbook (< 2 MB RAM) with 7 sheets in exact tab order
     out_wb = openpyxl.Workbook()
 
-    # Sheet 1: summary
+    # Sheet 1: summary (with 4 tables)
     ws_sum = out_wb.active
     ws_sum.title = "summary"
-    build_summary_sheet(ws_sum, overall_dict, forward_dict, reverse_dict, date_headers)
+    build_summary_sheet(ws_sum, overall_dict, forward_dict, reverse_dict, date_headers, dc_tat_volume)
 
     # Sheet 2: raw data (placeholder replaced by assemble_stream_workbook)
     out_wb.create_sheet(title="raw data")
 
-    # Sheet 3: todays tasks (placeholder replaced by assemble_stream_workbook)
-    out_wb.create_sheet(title="todays tasks")
+    # Sheet 3: Tasks (placeholder replaced by assemble_stream_workbook)
+    out_wb.create_sheet(title="Tasks")
 
-    # Sheet 4: today's task summary
+    # Sheet 4: today's tasky (placeholder replaced by assemble_stream_workbook)
+    out_wb.create_sheet(title="today's tasky")
+
+    # Sheet 5: today's task summary
     ws_task_sum = out_wb.create_sheet(title="today's task summary")
     build_task_summary_sheet_from_metrics(ws_task_sum, metrics)
 
-    # Sheet 5: hub l5 summary
+    # Sheet 6: hub l5 summary
     ws_hub_l5 = out_wb.create_sheet(title="hub l5 summary")
     build_hub_l5_matrix_tab(ws_hub_l5, hub_metrics)
 
-    # Sheet 6: hub l4 l5 breakdown
+    # Sheet 7: hub l4 l5 breakdown
     ws_hub_breakdown = out_wb.create_sheet(title="hub l4 l5 breakdown")
     build_hub_l4_l5_breakdown_tab(ws_hub_breakdown, hub_metrics)
 
     # Assemble final .xlsx with zero-memory disk streaming
-    assemble_stream_workbook(out_wb, [raw_writer, tasks_writer], output_path)
+    assemble_stream_workbook(out_wb, [raw_writer, tasks_writer, tasky_writer], output_path)
 
     # Post-process XML entities to prevent Google Sheets from rendering &gt;
     _post_process_xml_entities(output_path)
-    log.info(f"Successfully generated Weekly SCM TAT Report: {output_path.name} (6 tabs assembled)")
+    log.info(f"Successfully generated Weekly SCM TAT Report: {output_path.name} (7 tabs assembled)")
