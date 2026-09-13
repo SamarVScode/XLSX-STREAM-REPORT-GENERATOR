@@ -2,12 +2,14 @@
 """
 Weekly SCM TAT & HCQ Report Generator Module for ei_stream_server
 ================================================================
-Generates a structured 4-tab workbook for SCM TAT & HCQ:
+Generates a structured 6-tab workbook for SCM TAT & HCQ:
   1. 'summary'              : Filtered & aligned DC scorecard with Green/Yellow/Red coloring
   2. 'raw data'             : All rows for configured DCs from the 'Data' tab (Streamed to Disk XML)
   3. 'todays tasks'         : Open/pending tasks (status != 'Closed') (Streamed to Disk XML)
   4. "today's task summary" : Executive KPI cards (Open, Forward, Reverse), DC x Aging matrix,
                               and side-by-side L4 & L5 Root Cause breakdowns.
+  5. 'hub l5 summary'       : Hub-wise matrix with distinct L5 Root Reasons as column headers
+  6. 'hub l4 l5 breakdown'  : Detailed drilldown per hub (L4, L5, Open Tasks, Share of Hub %, Total Share %)
 
 Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 - O(1) Memory Footprint (< 35MB RAM)
@@ -17,9 +19,11 @@ Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 import sys
 import logging
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 import re
 import datetime
+import html
+import zipfile
 from typing import Dict, Any, List, Tuple
 
 import openpyxl
@@ -78,20 +82,20 @@ def aging_sort_key(bucket_str: str) -> Tuple[int, int, str]:
 
 
 def normalize_aging_bucket(raw_aging: Any) -> str:
-    """Normalize raw aging values. Maps empty/dash to '<24Hrs'."""
+    """Normalize raw aging values. Maps empty/dash to '<24Hrs' and handles HTML entities."""
     if raw_aging is None:
         return "<24Hrs"
-    s = str(raw_aging).strip()
+    s = html.unescape(str(raw_aging)).strip()
     if not s or s in ('-', 'none', 'null', 'None'):
         return "<24Hrs"
     s_clean = s.replace(" ", "")
-    if s_clean.lower() in ('<24hrs', '<24hr', '<24h'):
+    if s_clean.lower() in ('<24hrs', '<24hr', '<24h', '&lt;24hrs', '&lt;24hr', '&lt;24h'):
         return "<24Hrs"
     if s_clean.lower() in ('24hrs', '24hr', '24h'):
         return "24Hrs"
     if s_clean.lower() in ('48hrs', '48hr', '48h'):
         return "48Hrs"
-    if s_clean.lower() in ('>48hrs', '>48hr', '>48h'):
+    if s_clean.lower() in ('>48hrs', '>48hr', '>48h', '&gt;48hrs', '&gt;48hr', '&gt;48h', '>48', '&gt;48'):
         return ">48 Hrs"
     return s
 
@@ -614,6 +618,246 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
     ws.column_dimensions[get_column_letter(l5_start + 2)].width = 12 # L5 Share %
 
 
+def build_hub_l5_matrix_tab(ws, hub_metrics: dict):
+    """
+    Builds Tab 5: 'hub l5 summary'
+    Dynamic Hub-wise matrix with distinct L5 Root Reasons as column headers.
+    """
+    ws.sheet_view.showGridLines = True
+    font_family = "Segoe UI"
+
+    font_banner = Font(name=font_family, size=11, bold=True, color="FFFFFF")
+    font_th = Font(name=font_family, size=9, bold=True, color="FFFFFF")
+    font_bold = Font(name=font_family, size=9, bold=True, color="0F172A")
+    font_normal = Font(name=font_family, size=9, color="334155")
+
+    banner_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")  # Navy
+    th_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    total_fill = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
+
+    thin_border_side = Side(style="thin", color="CBD5E1")
+    cell_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+    double_bottom_side = Side(style="double", color="64748B")
+    total_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=double_bottom_side)
+
+    center_align = Alignment(horizontal="center", vertical="center")
+    right_align = Alignment(horizontal="right", vertical="center")
+
+    total_open_tasks = hub_metrics["total_open_tasks"]
+    dc_l5_map = hub_metrics["dc_l5_map"]
+    l5_col_order = hub_metrics["l5_col_order"]
+
+    sorted_dcs = sorted([dc for dc, l5_dict in dc_l5_map.items() if sum(l5_dict.values()) > 0])
+    num_cols = 1 + len(l5_col_order) + 1
+
+    # Row 1: Banner Header
+    ws.cell(1, 1, "HUB-WISE ROOT REASON MATRIX (L5)").font = font_banner
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_cols)
+    for c in range(1, num_cols + 1):
+        ws.cell(1, c).fill = banner_fill
+        ws.cell(1, c).alignment = center_align
+    ws.row_dimensions[1].height = 24
+
+    # Row 2: Column Headers
+    headers = ["Source DC"] + l5_col_order + ["Total Open"]
+    ws.row_dimensions[2].height = 22
+    for col_i, h in enumerate(headers, 1):
+        c = ws.cell(2, col_i, h)
+        c.font = font_th
+        c.fill = th_fill
+        c.alignment = center_align
+        c.border = cell_border
+
+    # Data Rows
+    l5_col_totals = defaultdict(int)
+    curr_row = 3
+    for idx, dc in enumerate(sorted_dcs):
+        is_zebra = (idx % 2 == 1)
+        r_fill = zebra_fill if is_zebra else None
+        ws.row_dimensions[curr_row].height = 18
+
+        c_dc = ws.cell(curr_row, 1, dc)
+        c_dc.font = font_bold
+        c_dc.alignment = center_align
+        c_dc.border = cell_border
+        if r_fill:
+            c_dc.fill = r_fill
+
+        dc_row_total = 0
+        for col_offset, l5_cat in enumerate(l5_col_order, 2):
+            cnt = dc_l5_map[dc].get(l5_cat, 0)
+            dc_row_total += cnt
+            l5_col_totals[l5_cat] += cnt
+
+            cell = ws.cell(curr_row, col_offset, cnt if cnt > 0 else "-")
+            cell.font = font_normal
+            cell.border = cell_border
+            if r_fill:
+                cell.fill = r_fill
+            cell.alignment = right_align if cnt > 0 else center_align
+
+        c_tot = ws.cell(curr_row, num_cols, dc_row_total)
+        c_tot.font = font_bold
+        c_tot.alignment = right_align
+        c_tot.border = cell_border
+        if r_fill:
+            c_tot.fill = r_fill
+
+        curr_row += 1
+
+    # Grand Total Row
+    tot_row = curr_row
+    ws.row_dimensions[tot_row].height = 20
+    c_gt = ws.cell(tot_row, 1, "Grand Total")
+    c_gt.font = font_bold
+    c_gt.fill = total_fill
+    c_gt.alignment = center_align
+    c_gt.border = total_border
+
+    for col_offset, l5_cat in enumerate(l5_col_order, 2):
+        col_sum = l5_col_totals[l5_cat]
+        c_sum = ws.cell(tot_row, col_offset, col_sum)
+        c_sum.font = font_bold
+        c_sum.fill = total_fill
+        c_sum.alignment = right_align
+        c_sum.border = total_border
+
+    c_all = ws.cell(tot_row, num_cols, total_open_tasks)
+    c_all.font = font_bold
+    c_all.fill = total_fill
+    c_all.alignment = right_align
+    c_all.border = total_border
+
+    # Column Widths
+    ws.column_dimensions["A"].width = 14
+    for col_idx in range(2, num_cols):
+        let = get_column_letter(col_idx)
+        header_len = len(str(headers[col_idx - 1]))
+        ws.column_dimensions[let].width = max(14, min(header_len + 3, 30))
+    ws.column_dimensions[get_column_letter(num_cols)].width = 14
+
+
+def build_hub_l4_l5_breakdown_tab(ws, hub_metrics: dict):
+    """
+    Builds Tab 6: 'hub l4 l5 breakdown'
+    Columns: Source DC, Issue Category (L4), Root Reason (L5), Open Tasks, Share of Hub %, Total Share %
+    Total Share % formatted to 4 decimal places ('0.0000%').
+    """
+    ws.sheet_view.showGridLines = True
+    font_family = "Segoe UI"
+
+    font_banner = Font(name=font_family, size=11, bold=True, color="FFFFFF")
+    font_th = Font(name=font_family, size=9, bold=True, color="FFFFFF")
+    font_bold = Font(name=font_family, size=9, bold=True, color="0F172A")
+    font_normal = Font(name=font_family, size=9, color="334155")
+
+    banner_fill = PatternFill(start_color="0D9488", end_color="0D9488", fill_type="solid")  # Teal
+    th_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+
+    thin_border_side = Side(style="thin", color="CBD5E1")
+    cell_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+
+    center_align = Alignment(horizontal="center", vertical="center")
+    right_align = Alignment(horizontal="right", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+
+    total_open_tasks = hub_metrics["total_open_tasks"]
+    dc_l5_map = hub_metrics["dc_l5_map"]
+    dc_l4_l5_list = hub_metrics["dc_l4_l5_list"]
+
+    ws.cell(1, 1, "DETAILED HUB ROOT CAUSE BREAKDOWN (L4 & L5)").font = font_banner
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
+    for c in range(1, 7):
+        ws.cell(1, c).fill = banner_fill
+        ws.cell(1, c).alignment = center_align
+    ws.row_dimensions[1].height = 24
+
+    drill_headers = ["Source DC", "Issue Category (L4)", "Root Reason (L5)", "Open Tasks", "Share of Hub %", "Total Share %"]
+    ws.row_dimensions[2].height = 20
+    for col_i, h in enumerate(drill_headers, 1):
+        c = ws.cell(2, col_i, h)
+        c.font = font_th
+        c.fill = th_fill
+        c.alignment = center_align
+        c.border = cell_border
+
+    curr_row = 3
+    for idx, (dc, l4, l5, cnt) in enumerate(dc_l4_l5_list):
+        is_zebra = (idx % 2 == 1)
+        r_fill = zebra_fill if is_zebra else None
+        ws.row_dimensions[curr_row].height = 18
+
+        hub_total = sum(dc_l5_map[dc].values()) if dc in dc_l5_map else cnt
+        hub_share = (cnt / hub_total) if hub_total else 0
+        tot_share = (cnt / total_open_tasks) if total_open_tasks else 0
+
+        c_dc = ws.cell(curr_row, 1, dc)
+        c_l4 = ws.cell(curr_row, 2, l4)
+        c_l5 = ws.cell(curr_row, 3, l5)
+        c_cnt = ws.cell(curr_row, 4, cnt)
+        c_hshare = ws.cell(curr_row, 5, hub_share)
+        c_tshare = ws.cell(curr_row, 6, tot_share)
+
+        c_dc.font = font_bold
+        c_l4.font = font_normal
+        c_l5.font = font_normal
+        c_cnt.font = font_normal
+        c_hshare.font = font_normal
+        c_tshare.font = font_normal
+
+        c_dc.alignment = center_align
+        c_l4.alignment = left_align
+        c_l5.alignment = left_align
+        c_cnt.alignment = right_align
+        c_hshare.alignment = right_align
+        c_tshare.alignment = right_align
+
+        c_hshare.number_format = "0.0%"
+        c_tshare.number_format = "0.0000%"
+
+        for c_cell in (c_dc, c_l4, c_l5, c_cnt, c_hshare, c_tshare):
+            c_cell.border = cell_border
+            if r_fill:
+                c_cell.fill = r_fill
+
+        curr_row += 1
+
+    ws.column_dimensions["A"].width = 14  # Source DC
+    ws.column_dimensions["B"].width = 24  # L4
+    ws.column_dimensions["C"].width = 32  # L5
+    ws.column_dimensions["D"].width = 14  # Count
+    ws.column_dimensions["E"].width = 16  # Share of Hub %
+    ws.column_dimensions["F"].width = 16  # Total Share %
+
+
+def _post_process_xml_entities(xlsx_path: Path):
+    """
+    Sanitizes XML entries in the generated XLSX archive:
+    Replaces '&gt;' with literal '>' across XML worksheet entries.
+    Google Drive / Google Sheets has a known importer defect where '&gt;' in cell
+    strings is not unescaped, causing cells to display literal 'Aging: &gt;48 Hrs'.
+    In standard XML, '>' is completely valid inside character data without escaping.
+    """
+    temp_path = xlsx_path.with_suffix(".tmp_sanitized.xlsx")
+    try:
+        with zipfile.ZipFile(xlsx_path, 'r') as z_in, zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_DEFLATED) as z_out:
+            for item in z_in.infolist():
+                data = z_in.read(item.filename)
+                if item.filename.endswith('.xml') and b'&gt;' in data:
+                    data = data.replace(b'&gt;', b'>')
+                z_out.writestr(item, data)
+        temp_path.replace(xlsx_path)
+    except Exception as e:
+        log.warning(f"Could not post-process XML entities in {xlsx_path.name}: {e}")
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+
+
 def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
     """
     Main Zero-Memory Streaming Entrypoint for Weekly SCM TAT Report.
@@ -664,6 +908,8 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
     dc_aging_map = defaultdict(lambda: defaultdict(int))
     l4_counts = defaultdict(int)
     l5_counts = defaultdict(int)
+    dc_l5_map = defaultdict(lambda: defaultdict(int))
+    dc_l4_l5_counter = Counter()
 
     with open_stream_reader(input_path, sheet_name=data_sheet_name) as (headers, row_iter):
         if not headers:
@@ -726,6 +972,8 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
                             l4_counts[l4] += 1
                         if l5 and l5 != 'None':
                             l5_counts[l5] += 1
+                            dc_l5_map[dc_upper][l5] += 1
+                            dc_l4_l5_counter[(dc_upper, l4, l5)] += 1
 
     log.info(f"Filtered {total_filtered:,} matching rows ({total_open_tasks:,} open tasks).")
 
@@ -739,7 +987,19 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
         "l5_counts": l5_counts
     }
 
-    # Construct OpenPyXL micro-workbook (< 2 MB RAM) with 4 sheets in exact tab order
+    l5_col_order = [cat for cat, _ in sorted(l5_counts.items(), key=lambda x: x[1], reverse=True)]
+    sorted_l4_l5 = sorted(
+        [(dc, l4, l5, cnt) for (dc, l4, l5), cnt in dc_l4_l5_counter.items()],
+        key=lambda x: (x[0], -x[3], x[1], x[2])
+    )
+    hub_metrics = {
+        "total_open_tasks": total_open_tasks,
+        "dc_l5_map": dc_l5_map,
+        "l5_col_order": l5_col_order,
+        "dc_l4_l5_list": sorted_l4_l5
+    }
+
+    # Construct OpenPyXL micro-workbook (< 2 MB RAM) with 6 sheets in exact tab order
     out_wb = openpyxl.Workbook()
 
     # Sheet 1: summary
@@ -757,6 +1017,17 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
     ws_task_sum = out_wb.create_sheet(title="today's task summary")
     build_task_summary_sheet_from_metrics(ws_task_sum, metrics)
 
+    # Sheet 5: hub l5 summary
+    ws_hub_l5 = out_wb.create_sheet(title="hub l5 summary")
+    build_hub_l5_matrix_tab(ws_hub_l5, hub_metrics)
+
+    # Sheet 6: hub l4 l5 breakdown
+    ws_hub_breakdown = out_wb.create_sheet(title="hub l4 l5 breakdown")
+    build_hub_l4_l5_breakdown_tab(ws_hub_breakdown, hub_metrics)
+
     # Assemble final .xlsx with zero-memory disk streaming
     assemble_stream_workbook(out_wb, [raw_writer, tasks_writer], output_path)
-    log.info(f"Successfully generated Weekly SCM TAT Report: {output_path.name} (4 tabs assembled)")
+
+    # Post-process XML entities to prevent Google Sheets from rendering &gt;
+    _post_process_xml_entities(output_path)
+    log.info(f"Successfully generated Weekly SCM TAT Report: {output_path.name} (6 tabs assembled)")
