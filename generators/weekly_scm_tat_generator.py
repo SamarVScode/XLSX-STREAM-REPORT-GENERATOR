@@ -18,6 +18,7 @@ import sys
 import logging
 from pathlib import Path
 from collections import defaultdict
+import re
 import datetime
 from typing import Dict, Any, List, Tuple
 
@@ -63,12 +64,45 @@ from core.stream_engine import (
 log = logging.getLogger("ei_stream_server.weekly_scm_tat")
 
 
+def aging_sort_key(bucket_str: str) -> Tuple[int, int, str]:
+    """Sort key for aging buckets ensuring '<24Hrs', '24Hrs', '48Hrs', '>48 Hrs', etc. sort logically."""
+    s = str(bucket_str).strip()
+    nums = re.findall(r'\d+', s)
+    val = int(nums[0]) if nums else 9999
+    if '<' in s:
+        return (val, 0, s)
+    elif '>' in s or '+' in s:
+        return (val, 2, s)
+    else:
+        return (val, 1, s)
+
+
+def normalize_aging_bucket(raw_aging: Any) -> str:
+    """Normalize raw aging values. Maps empty/dash to '<24Hrs'."""
+    if raw_aging is None:
+        return "<24Hrs"
+    s = str(raw_aging).strip()
+    if not s or s in ('-', 'none', 'null', 'None'):
+        return "<24Hrs"
+    s_clean = s.replace(" ", "")
+    if s_clean.lower() in ('<24hrs', '<24hr', '<24h'):
+        return "<24Hrs"
+    if s_clean.lower() in ('24hrs', '24hr', '24h'):
+        return "24Hrs"
+    if s_clean.lower() in ('48hrs', '48hr', '48h'):
+        return "48Hrs"
+    if s_clean.lower() in ('>48hrs', '>48hr', '>48h'):
+        return ">48 Hrs"
+    return s
+
+
 def parse_dc_sheet(input_path: Path, target_sheet: str) -> Tuple[Dict[str, List[Any]], Dict[str, List[Any]], Dict[str, List[Any]], List[str]]:
     """
-    Parses the 3 parallel tables in the 'DC' tab:
-      - Overall DC (Cols A-H / index 0, 1..7)
-      - Forward DC (Cols J-Q / index 9, 10..16)
-      - Reverse DC (Cols S-Z / index 18, 19..25)
+    Dynamically parses the 3 parallel tables in the 'DC' tab:
+      - Overall DC
+      - Forward DC
+      - Reverse DC
+    Detects table column positions and date column count dynamically, adapting to growing or shrinking weeks.
     """
     overall_dict = {}
     forward_dict = {}
@@ -76,47 +110,75 @@ def parse_dc_sheet(input_path: Path, target_sheet: str) -> Tuple[Dict[str, List[
     date_headers = []
 
     with open_stream_reader(input_path, sheet_name=target_sheet) as (headers, row_iter):
-        # Row 1 is header ('Overall DC', ...)
-        # Row 2 contains the date headers in cols 1..7
-        r2 = None
+        overall_col = None
+        forward_col = None
+        reverse_col = None
+
+        for c_idx, val in enumerate(headers):
+            v = str(val or '').strip().lower()
+            if 'overall' in v:
+                overall_col = c_idx
+            elif 'forward' in v:
+                forward_col = c_idx
+            elif 'reverse' in v:
+                reverse_col = c_idx
+
+        if overall_col is None:
+            overall_col = 0
+
+        date_row = None
         for row in row_iter:
             if row and any(row):
-                r2 = row
+                date_row = row
                 break
 
-        if r2 is not None:
-            for i in range(1, 8):
-                if len(r2) > i and r2[i] is not None:
-                    val = str(r2[i]).strip()
-                    date_headers.append(val)
-                else:
-                    date_headers.append(f"Col{i+1}")
+        if date_row is None:
+            return overall_dict, forward_dict, reverse_dict, date_headers
+
+        def get_dates_and_indices(start_c):
+            if start_c is None:
+                return [], []
+            d_idx = []
+            d_hdrs = []
+            for c in range(start_c + 1, len(date_row)):
+                cell_val = str(date_row[c] or '').strip()
+                if cell_val.lower() == 'grand total' or not cell_val:
+                    break
+                d_idx.append(c)
+                d_hdrs.append(cell_val)
+            return d_hdrs, d_idx
+
+        o_headers, o_indices = get_dates_and_indices(overall_col)
+        f_headers, f_indices = get_dates_and_indices(forward_col)
+        r_headers, r_indices = get_dates_and_indices(reverse_col)
+
+        date_headers = o_headers or f_headers or r_headers
 
         # Process subsequent DC rows
         for row in row_iter:
             if not row or not any(row):
                 continue
 
-            # Table 1: Overall DC (Col A=0, B-H=1..7)
-            if len(row) > 0 and row[0] is not None:
-                dc_code = str(row[0]).strip()
+            # Table 1: Overall DC
+            if overall_col is not None and len(row) > overall_col and row[overall_col]:
+                dc_code = str(row[overall_col]).strip().upper()
                 if dc_code and dc_code.lower() != 'grand total':
-                    vals = [row[c] if len(row) > c else None for c in range(1, 8)]
-                    overall_dict[dc_code.upper()] = vals
+                    vals = [row[c] if len(row) > c else None for c in o_indices]
+                    overall_dict[dc_code] = vals
 
-            # Table 2: Forward DC (Col J=9, K-Q=10..16)
-            if len(row) > 9 and row[9] is not None:
-                dc_code = str(row[9]).strip()
+            # Table 2: Forward DC
+            if forward_col is not None and len(row) > forward_col and row[forward_col]:
+                dc_code = str(row[forward_col]).strip().upper()
                 if dc_code and dc_code.lower() != 'grand total':
-                    vals = [row[c] if len(row) > c else None for c in range(10, 17)]
-                    forward_dict[dc_code.upper()] = vals
+                    vals = [row[c] if len(row) > c else None for c in f_indices]
+                    forward_dict[dc_code] = vals
 
-            # Table 3: Reverse DC (Col S=18, T-Z=19..25)
-            if len(row) > 18 and row[18] is not None:
-                dc_code = str(row[18]).strip()
+            # Table 3: Reverse DC
+            if reverse_col is not None and len(row) > reverse_col and row[reverse_col]:
+                dc_code = str(row[reverse_col]).strip().upper()
                 if dc_code and dc_code.lower() != 'grand total':
-                    vals = [row[c] if len(row) > c else None for c in range(19, 26)]
-                    reverse_dict[dc_code.upper()] = vals
+                    vals = [row[c] if len(row) > c else None for c in r_indices]
+                    reverse_dict[dc_code] = vals
 
     return overall_dict, forward_dict, reverse_dict, date_headers
 
@@ -124,12 +186,17 @@ def parse_dc_sheet(input_path: Path, target_sheet: str) -> Tuple[Dict[str, List[
 def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict: dict, date_headers: list):
     """
     Builds the formatted 'summary' tab with 3 side-by-side tables filtered to configured DCs.
+    Dynamically adjusts table widths, gaps, and formulas based on date count.
     Applies Green/Yellow/Red conditional color thresholds:
       - Green  (> 95%)        : Fill #C6EFCE, Font #006100
       - Yellow (90% to 95%)   : Fill #FFEB9C, Font #9C5700
       - Red    (< 90%)        : Fill #FFC7CE, Font #9C0006
     """
     ws.sheet_view.showGridLines = True
+    num_dates = len(date_headers)
+    if num_dates == 0:
+        num_dates = 7
+        date_headers = [f"Col{i+1}" for i in range(num_dates)]
 
     font_family = "Segoe UI"
     banner_fill_1 = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")  # Navy
@@ -170,35 +237,39 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
                 return red_fill, red_font
         return (zebra_fill if is_zebra else None), font_normal
 
+    # Table start/end positions based on num_dates
+    t1_start = 1
+    t1_end = t1_start + num_dates
+    gap1_col = t1_end + 1
+    
+    t2_start = gap1_col + 1
+    t2_end = t2_start + num_dates
+    gap2_col = t2_end + 1
+    
+    t3_start = gap2_col + 1
+    t3_end = t3_start + num_dates
+
     # Row 1: Top Section Banners
-    ws.cell(1, 1, "Overall DC - TAT Adherence").font = font_banner
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
-    for col in range(1, 9):
-        c = ws.cell(1, col)
-        c.fill = banner_fill_1
-        c.alignment = center_align
-
-    ws.cell(1, 10, "Forward DC - TAT Adherence").font = font_banner
-    ws.merge_cells(start_row=1, start_column=10, end_row=1, end_column=17)
-    for col in range(10, 18):
-        c = ws.cell(1, col)
-        c.fill = banner_fill_2
-        c.alignment = center_align
-
-    ws.cell(1, 19, "Reverse DC - TAT Adherence").font = font_banner
-    ws.merge_cells(start_row=1, start_column=19, end_row=1, end_column=26)
-    for col in range(19, 27):
-        c = ws.cell(1, col)
-        c.fill = banner_fill_3
-        c.alignment = center_align
+    banners = [
+        (t1_start, t1_end, "Overall DC - TAT Adherence", banner_fill_1),
+        (t2_start, t2_end, "Forward DC - TAT Adherence", banner_fill_2),
+        (t3_start, t3_end, "Reverse DC - TAT Adherence", banner_fill_3),
+    ]
+    for c_st, c_en, label, b_fill in banners:
+        ws.cell(1, c_st, label).font = font_banner
+        ws.merge_cells(start_row=1, start_column=c_st, end_row=1, end_column=c_en)
+        for col in range(c_st, c_en + 1):
+            c = ws.cell(1, col)
+            c.fill = b_fill
+            c.alignment = center_align
 
     ws.row_dimensions[1].height = 24
 
     # Row 2: Sub-headers
     sub_configs = [
-        (1, "Source DC", date_headers),
-        (10, "Forward DC", date_headers),
-        (19, "Reverse DC", date_headers),
+        (t1_start, "Source DC", date_headers),
+        (t2_start, "Forward DC", date_headers),
+        (t3_start, "Reverse DC", date_headers),
     ]
     for start_col, label, d_headers in sub_configs:
         c = ws.cell(2, start_col, label)
@@ -218,98 +289,54 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
     active_dcs = sorted([dc for dc in ALLOWED_SOURCE_DCS if dc.upper() != 'ALL'])
     curr_row = 3
 
-    stats_overall = [[0.0, 0] for _ in range(7)]
-    stats_fwd = [[0.0, 0] for _ in range(7)]
-    stats_rev = [[0.0, 0] for _ in range(7)]
+    stats_overall = [[0.0, 0] for _ in range(num_dates)]
+    stats_fwd = [[0.0, 0] for _ in range(num_dates)]
+    stats_rev = [[0.0, 0] for _ in range(num_dates)]
 
     for idx, dc in enumerate(active_dcs):
         is_zebra = (idx % 2 == 1)
         row_fill = zebra_fill if is_zebra else None
         ws.row_dimensions[curr_row].height = 18
 
-        # Overall Table
-        c_dc1 = ws.cell(curr_row, 1, dc)
-        c_dc1.font = font_dc
-        c_dc1.alignment = center_align
-        c_dc1.border = cell_border
-        if row_fill:
-            c_dc1.fill = row_fill
-        vals1 = overall_dict.get(dc, [None] * 7)
-        for i, v in enumerate(vals1):
-            cell = ws.cell(curr_row, 2 + i)
-            cell.border = cell_border
-            f_fill, f_font = get_cell_style(v, is_zebra)
-            if f_fill:
-                cell.fill = f_fill
-            cell.font = f_font
-            if isinstance(v, (int, float)):
-                cell.value = v
-                cell.number_format = "0.0%"
-                cell.alignment = right_align
-                stats_overall[i][0] += v
-                stats_overall[i][1] += 1
-            else:
-                cell.value = "-"
-                cell.alignment = center_align
+        tables_data = [
+            (t1_start, overall_dict.get(dc, [None] * num_dates), stats_overall),
+            (t2_start, forward_dict.get(dc, [None] * num_dates), stats_fwd),
+            (t3_start, reverse_dict.get(dc, [None] * num_dates), stats_rev),
+        ]
+        for st_col, vals, stat_arr in tables_data:
+            c_dc = ws.cell(curr_row, st_col, dc)
+            c_dc.font = font_dc
+            c_dc.alignment = center_align
+            c_dc.border = cell_border
+            if row_fill:
+                c_dc.fill = row_fill
 
-        # Forward Table
-        c_dc2 = ws.cell(curr_row, 10, dc)
-        c_dc2.font = font_dc
-        c_dc2.alignment = center_align
-        c_dc2.border = cell_border
-        if row_fill:
-            c_dc2.fill = row_fill
-        vals2 = forward_dict.get(dc, [None] * 7)
-        for i, v in enumerate(vals2):
-            cell = ws.cell(curr_row, 11 + i)
-            cell.border = cell_border
-            f_fill, f_font = get_cell_style(v, is_zebra)
-            if f_fill:
-                cell.fill = f_fill
-            cell.font = f_font
-            if isinstance(v, (int, float)):
-                cell.value = v
-                cell.number_format = "0.0%"
-                cell.alignment = right_align
-                stats_fwd[i][0] += v
-                stats_fwd[i][1] += 1
-            else:
-                cell.value = "-"
-                cell.alignment = center_align
-
-        # Reverse Table
-        c_dc3 = ws.cell(curr_row, 19, dc)
-        c_dc3.font = font_dc
-        c_dc3.alignment = center_align
-        c_dc3.border = cell_border
-        if row_fill:
-            c_dc3.fill = row_fill
-        vals3 = reverse_dict.get(dc, [None] * 7)
-        for i, v in enumerate(vals3):
-            cell = ws.cell(curr_row, 20 + i)
-            cell.border = cell_border
-            f_fill, f_font = get_cell_style(v, is_zebra)
-            if f_fill:
-                cell.fill = f_fill
-            cell.font = f_font
-            if isinstance(v, (int, float)):
-                cell.value = v
-                cell.number_format = "0.0%"
-                cell.alignment = right_align
-                stats_rev[i][0] += v
-                stats_rev[i][1] += 1
-            else:
-                cell.value = "-"
-                cell.alignment = center_align
+            for i in range(num_dates):
+                v = vals[i] if len(vals) > i else None
+                cell = ws.cell(curr_row, st_col + 1 + i)
+                cell.border = cell_border
+                f_fill, f_font = get_cell_style(v, is_zebra)
+                if f_fill:
+                    cell.fill = f_fill
+                cell.font = f_font
+                if isinstance(v, (int, float)):
+                    cell.value = v
+                    cell.number_format = "0.0%"
+                    cell.alignment = right_align
+                    stat_arr[i][0] += v
+                    stat_arr[i][1] += 1
+                else:
+                    cell.value = "-"
+                    cell.alignment = center_align
 
         curr_row += 1
 
     # Summary Row: Server DCs Avg
     ws.row_dimensions[curr_row].height = 20
     summary_sections = [
-        (1, "Server DCs Avg", stats_overall),
-        (10, "Server DCs Avg", stats_fwd),
-        (19, "Server DCs Avg", stats_rev),
+        (t1_start, "Server DCs Avg", stats_overall),
+        (t2_start, "Server DCs Avg", stats_fwd),
+        (t3_start, "Server DCs Avg", stats_rev),
     ]
     for start_col, lbl, stat_arr in summary_sections:
         c_tot = ws.cell(curr_row, start_col, lbl)
@@ -335,12 +362,12 @@ def build_summary_sheet(ws, overall_dict: dict, forward_dict: dict, reverse_dict
                 cell.fill = total_fill
                 cell.alignment = center_align
 
-    # Column widths
-    for col in range(1, 27):
+    # Set column widths dynamically
+    for col in range(1, t3_end + 1):
         letter = get_column_letter(col)
-        if col in (9, 18):
+        if col in (gap1_col, gap2_col):
             ws.column_dimensions[letter].width = 3
-        elif col in (1, 10, 19):
+        elif col in (t1_start, t2_start, t3_start):
             ws.column_dimensions[letter].width = 15
         else:
             ws.column_dimensions[letter].width = 12
@@ -350,10 +377,12 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
     """
     Builds the 'today's task summary' tab:
       - 3 KPI Cards: OPEN TASKS, FORWARD FLOW, REVERSE FLOW
-      - Side-by-Side Arrangement:
-          * Left  (Cols A-E) : DC x Aging Matrix (DC, Aging buckets, Total Open)
-          * Right (Cols G-I) : L4 Issue Category Breakdown
-          * Right (Cols K-M) : L5 Root Reason Breakdown
+      - Dynamic Side-by-Side Arrangement:
+          * Left         : DC x Aging Matrix (DC, Aging buckets, Total Open)
+          * Gap 1        : 1 Blank separator column (width 4)
+          * Center/Right : L4 Issue Category Breakdown
+          * Gap 2        : 1 Blank separator column (width 4)
+          * Right        : L5 Root Reason Breakdown
     """
     ws.sheet_view.showGridLines = True
     font_family = "Segoe UI"
@@ -422,37 +451,49 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
     ws.row_dimensions[4].height = 18
 
     # ========================================================
-    # SECTION 2: SIDE-BY-SIDE TABLES (Starting Row 6 / 7)
+    # SECTION 2: DYNAMIC SIDE-BY-SIDE TABLES (Starting Row 6 / 7)
     # ========================================================
-    ws.cell(6, 1, "Open Tasks by DC & Aging").font = font_sec
-    ws.cell(6, 7, "Top Issue Categories (L4)").font = font_sec
-    ws.cell(6, 11, "Top Root Reasons (L5)").font = font_sec
+    matrix_headers = ["Source DC"] + [f"Aging: {b}" for b in sorted_agings] + ["Total Open"]
+    t1_start = 1
+    t1_end = t1_start + len(matrix_headers) - 1
+    gap1_col = t1_end + 1
+
+    l4_start = gap1_col + 1
+    l4_end = l4_start + 2
+    gap2_col = l4_end + 1
+
+    l5_start = gap2_col + 1
+    l5_end = l5_start + 2
+
+    # Row 6: Section Headers
+    ws.cell(6, t1_start, "Open Tasks by DC & Aging").font = font_sec
+    ws.cell(6, l4_start, "Top Issue Categories (L4)").font = font_sec
+    ws.cell(6, l5_start, "Top Root Reasons (L5)").font = font_sec
     ws.row_dimensions[6].height = 22
 
     matrix_start_row = 7
     ws.row_dimensions[matrix_start_row].height = 22
 
-    # Table 1 Headers (Cols 1..N) - DC x Aging
-    matrix_headers = ["Source DC"] + [f"Aging: {b}" for b in sorted_agings] + ["Total Open"]
-    for col_i, h in enumerate(matrix_headers, 1):
+    # Table 1 Headers (DC x Aging)
+    for col_i, h in enumerate(matrix_headers, t1_start):
         c = ws.cell(matrix_start_row, col_i, h)
         c.font = font_th
         c.fill = table_header_fill
         c.alignment = center_align
         c.border = cell_border
 
-    # Table 2 Headers (Cols 7..9) - L4
+    # Table 2 Headers (L4)
     l4_headers = ["Issue Category (L4)", "Count", "Share %"]
-    for col_i, h in enumerate(l4_headers, 7):
+    for col_i, h in enumerate(l4_headers, l4_start):
         c = ws.cell(matrix_start_row, col_i, h)
         c.font = font_th
         c.fill = table_header_fill
         c.alignment = center_align
         c.border = cell_border
 
-    # Table 3 Headers (Cols 11..13) - L5
+    # Table 3 Headers (L5)
     l5_headers = ["Root Reason (L5)", "Count", "Share %"]
-    for col_i, h in enumerate(l5_headers, 11):
+    for col_i, h in enumerate(l5_headers, l5_start):
         c = ws.cell(matrix_start_row, col_i, h)
         c.font = font_th
         c.fill = table_header_fill
@@ -478,7 +519,7 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
         # 1. Fill DC x Aging Row
         if i < num_dc_rows:
             dc = sorted_dcs_with_open[i]
-            c_dc = ws.cell(r_now, 1, dc)
+            c_dc = ws.cell(r_now, t1_start, dc)
             c_dc.font = font_bold
             c_dc.alignment = center_align
             c_dc.border = cell_border
@@ -487,7 +528,7 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
 
             dc_tot = dc_aging_map[dc]['__TOTAL__']
 
-            for b_idx, bucket in enumerate(sorted_agings, 2):
+            for b_idx, bucket in enumerate(sorted_agings, t1_start + 1):
                 cnt = dc_aging_map[dc][bucket]
                 aging_col_totals[bucket] += cnt
                 cell = ws.cell(r_now, b_idx, cnt if cnt > 0 else "-")
@@ -498,7 +539,7 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
                 cell.alignment = right_align if cnt > 0 else center_align
 
             # Total Open column
-            c_tot = ws.cell(r_now, len(sorted_agings) + 2, dc_tot)
+            c_tot = ws.cell(r_now, t1_end, dc_tot)
             c_tot.font = font_bold
             c_tot.alignment = right_align
             c_tot.border = cell_border
@@ -508,39 +549,39 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
         # 2. Fill L4 Row
         if i < len(top_l4):
             cat, cnt = top_l4[i]
-            c7 = ws.cell(r_now, 7, cat)
-            c8 = ws.cell(r_now, 8, cnt)
-            c9 = ws.cell(r_now, 9, cnt / total_open_tasks if total_open_tasks else 0)
-            c7.font, c8.font, c9.font = font_normal, font_normal, font_normal
-            c7.border, c8.border, c9.border = cell_border, cell_border, cell_border
-            c7.alignment, c8.alignment, c9.alignment = left_align, right_align, right_align
-            c9.number_format = "0.0%"
+            c_cat = ws.cell(r_now, l4_start, cat)
+            c_cnt = ws.cell(r_now, l4_start + 1, cnt)
+            c_pct = ws.cell(r_now, l4_start + 2, cnt / total_open_tasks if total_open_tasks else 0)
+            c_cat.font, c_cnt.font, c_pct.font = font_normal, font_normal, font_normal
+            c_cat.border, c_cnt.border, c_pct.border = cell_border, cell_border, cell_border
+            c_cat.alignment, c_cnt.alignment, c_pct.alignment = left_align, right_align, right_align
+            c_pct.number_format = "0.0%"
             if r_fill:
-                c7.fill, c8.fill, c9.fill = r_fill, r_fill, r_fill
+                c_cat.fill, c_cnt.fill, c_pct.fill = r_fill, r_fill, r_fill
 
         # 3. Fill L5 Row
         if i < len(top_l5):
             cat, cnt = top_l5[i]
-            c11 = ws.cell(r_now, 11, cat)
-            c12 = ws.cell(r_now, 12, cnt)
-            c13 = ws.cell(r_now, 13, cnt / total_open_tasks if total_open_tasks else 0)
-            c11.font, c12.font, c13.font = font_normal, font_normal, font_normal
-            c11.border, c12.border, c13.border = cell_border, cell_border, cell_border
-            c11.alignment, c12.alignment, c13.alignment = left_align, right_align, right_align
-            c13.number_format = "0.0%"
+            c_cat = ws.cell(r_now, l5_start, cat)
+            c_cnt = ws.cell(r_now, l5_start + 1, cnt)
+            c_pct = ws.cell(r_now, l5_start + 2, cnt / total_open_tasks if total_open_tasks else 0)
+            c_cat.font, c_cnt.font, c_pct.font = font_normal, font_normal, font_normal
+            c_cat.border, c_cnt.border, c_pct.border = cell_border, cell_border, cell_border
+            c_cat.alignment, c_cnt.alignment, c_pct.alignment = left_align, right_align, right_align
+            c_pct.number_format = "0.0%"
             if r_fill:
-                c11.fill, c12.fill, c13.fill = r_fill, r_fill, r_fill
+                c_cat.fill, c_cnt.fill, c_pct.fill = r_fill, r_fill, r_fill
 
     # Total Row for DC x Aging Matrix
     tot_row_idx = matrix_start_row + 1 + num_dc_rows
     ws.row_dimensions[tot_row_idx].height = 20
-    c_all = ws.cell(tot_row_idx, 1, "Grand Total")
+    c_all = ws.cell(tot_row_idx, t1_start, "Grand Total")
     c_all.font = font_bold
     c_all.fill = table_total_fill
     c_all.alignment = center_align
     c_all.border = total_border
 
-    for b_idx, bucket in enumerate(sorted_agings, 2):
+    for b_idx, bucket in enumerate(sorted_agings, t1_start + 1):
         col_sum = aging_col_totals[bucket]
         c_sum = ws.cell(tot_row_idx, b_idx, col_sum)
         c_sum.font = font_bold
@@ -548,27 +589,29 @@ def build_task_summary_sheet_from_metrics(ws, metrics: dict):
         c_sum.alignment = right_align
         c_sum.border = total_border
 
-    c_grand = ws.cell(tot_row_idx, len(sorted_agings) + 2, total_open_tasks)
+    c_grand = ws.cell(tot_row_idx, t1_end, total_open_tasks)
     c_grand.font = font_bold
     c_grand.fill = table_total_fill
     c_grand.alignment = right_align
     c_grand.border = total_border
 
-    # Set column widths
-    ws.column_dimensions["A"].width = 14  # Source DC
-    for b_idx in range(2, len(sorted_agings) + 2):
-        letter = get_column_letter(b_idx)
-        ws.column_dimensions[letter].width = 14
-    ws.column_dimensions[get_column_letter(len(sorted_agings) + 2)].width = 14  # Total Open
+    # Dynamic column widths
+    ws.column_dimensions[get_column_letter(t1_start)].width = 14  # Source DC
+    for b_col in range(t1_start + 1, t1_end):
+        ws.column_dimensions[get_column_letter(b_col)].width = 14
+    ws.column_dimensions[get_column_letter(t1_end)].width = 14    # Total Open
 
-    ws.column_dimensions["F"].width = 4   # Separator
-    ws.column_dimensions["G"].width = 24  # L4 Name
-    ws.column_dimensions["H"].width = 12  # L4 Count
-    ws.column_dimensions["I"].width = 12  # L4 Share %
-    ws.column_dimensions["J"].width = 4   # Separator
-    ws.column_dimensions["K"].width = 30  # L5 Name
-    ws.column_dimensions["L"].width = 12  # L5 Count
-    ws.column_dimensions["M"].width = 12  # L5 Share %
+    ws.column_dimensions[get_column_letter(gap1_col)].width = 4   # Gap 1
+
+    ws.column_dimensions[get_column_letter(l4_start)].width = 24     # L4 Name
+    ws.column_dimensions[get_column_letter(l4_start + 1)].width = 12 # L4 Count
+    ws.column_dimensions[get_column_letter(l4_start + 2)].width = 12 # L4 Share %
+
+    ws.column_dimensions[get_column_letter(gap2_col)].width = 4   # Gap 2
+
+    ws.column_dimensions[get_column_letter(l5_start)].width = 30     # L5 Name
+    ws.column_dimensions[get_column_letter(l5_start + 1)].width = 12 # L5 Count
+    ws.column_dimensions[get_column_letter(l5_start + 2)].width = 12 # L5 Share %
 
 
 def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
@@ -665,7 +708,8 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
                     if stat_val != 'closed':
                         total_open_tasks += 1
                         tasks_writer.write_row(r_out)
-                        ag = str(row[aging_idx] or '-').strip() if len(row) > aging_idx else '-'
+                        raw_ag = row[aging_idx] if len(row) > aging_idx else None
+                        ag = normalize_aging_bucket(raw_ag)
                         att = str(row[attr_idx] or '').strip().lower() if len(row) > attr_idx else ''
                         l4 = str(row[l4_idx] or 'Unknown').strip() if len(row) > l4_idx else 'Unknown'
                         l5 = str(row[l5_idx] or 'Unknown').strip() if len(row) > l5_idx else 'Unknown'
@@ -690,7 +734,7 @@ def generate_weekly_scm_tat_report(input_file: Path, output_file: Path):
         "forward_count": forward_count,
         "reverse_count": reverse_count,
         "dc_aging_map": dc_aging_map,
-        "sorted_agings": sorted(aging_buckets),
+        "sorted_agings": sorted(aging_buckets, key=aging_sort_key),
         "l4_counts": l4_counts,
         "l5_counts": l5_counts
     }
