@@ -389,7 +389,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
 
         cf = ColumnFinder(headers, {
             'aging': ['aging', 'agingbucket', 'agebucket', 'ageing', 'agingdays'],
-            'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc', 'source_dc'],
+            'sdc': ['sourcedc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc', 'source_dc'],
             'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio', 'customer_priority_v2'],
             'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb', 'tracking_number'],
             'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt', 'attempt_status'],
@@ -398,6 +398,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
 
         aging_col_idx = cf.get('aging', 20)
         sdc_idx = cf.get('sdc', 15)
+        dc_idx = cf.find(['dc', 'hubdc', 'facility', 'destinationdc'], default=-1)
         prio_idx = cf.get('prio', 13)
         shipment_idx = cf.get('shipment', 1)
         attempt_idx = cf.get('attempt', 23)
@@ -413,6 +414,7 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         cpd_headers = [
             "PendingShipments",
             "Source_DC",
+            "DC",
             "Aging Category",
             "Attempt_Status",
             "CustomerPriorityV2",
@@ -467,8 +469,9 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
                     if is_cpd_did or is_p0_p1:
                         cpd_count += 1
                         shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
+                        dc_val = str(row[dc_idx]).strip() if (0 <= dc_idx < len(row) and row[dc_idx] is not None) else ""
                         attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
-                        cpd_writer.write_row([shipment, sdc_upper, aging_cat, attempt_stat, prio, ship_prio])
+                        cpd_writer.write_row([shipment, sdc_upper, dc_val, aging_cat, attempt_stat, prio, ship_prio])
 
     log.info(f"Filtered {total_filtered} matching rows ({cpd_count} CPD-DID rows).")
 
