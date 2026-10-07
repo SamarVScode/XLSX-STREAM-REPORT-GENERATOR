@@ -55,14 +55,17 @@ def test_forward_pendency_stream():
         wb = Workbook()
         ws = wb.active
         ws.title = "raw_data_North"
-        headers = ["PendingShipments", "Source_DC", "Aging", "CustomerPriorityV2", "Attempt_Status"]
+        headers = ["PendingShipments", "Source_DC", "Aging", "CustomerPriorityV2", "Attempt_Status", "CPDvalue"]
         ws.append(headers)
-        ws.append(["SHIP1001", "ALG", 1, "P2", "Attempted"])
-        ws.append(["SHIP1002", "AYP", 4, "P3", "Unattempted"])
-        ws.append(["SHIP1003", "DEO", 7, "P4", "Attempted"])
-        ws.append(["SHIP1004", "ALG", 0, "P0", "Attempted"])
-        ws.append(["SHIP1005", "AYP", 2, "P1", "Unattempted"])
-        ws.append(["SHIP1006", "CAR-KHR", 2, "P0", "Attempted"])
+        today_str = datetime.now().strftime("%Y-%m-%d 23:59:59")
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
+        ws.append(["SHIP1001", "ALG", 1, "P2", "Attempted", yesterday_str])    # DID
+        ws.append(["SHIP1002", "AYP", 4, "P3", "Unattempted", today_str])       # CPD
+        ws.append(["SHIP1003", "DEO", 7, "P4", "Attempted", tomorrow_str])      # Non-CPD, P4 (skipped in CPD-DID)
+        ws.append(["SHIP1004", "ALG", 0, "P0", "Attempted", tomorrow_str])      # Non-CPD, but P0 (included in CPD-DID)
+        ws.append(["SHIP1005", "AYP", 2, "P1", "Unattempted", yesterday_str])   # DID, P1 (included)
+        ws.append(["SHIP1006", "CAR-KHR", 2, "P0", "Attempted", today_str])     # CPD, P0 (included)
         wb.save(src_xlsx)
         
         generate_forward_pendency_report(src_xlsx, out_xlsx)
@@ -73,13 +76,17 @@ def test_forward_pendency_stream():
         assert "CPD-DID pendency" in res_wb.sheetnames
         assert "RAW" in res_wb.sheetnames
 
-        # Check Summary Priority Table headers (row 3, columns 9 to 15)
         sum_ws = res_wb["Summary"]
-        prio_headers = [sum_ws.cell(row=3, column=c).value for c in range(9, 16)]
+        # Check Table 1: CPD Pendency headers (cols 2 to 5)
+        cpd_headers = [sum_ws.cell(row=3, column=c).value for c in range(2, 6)]
+        assert cpd_headers == ["Source DC", "CPD", "DID", "Total Pendency"]
+
+        # Check Table 3: Priority Table headers (cols 14 to 20)
+        prio_headers = [sum_ws.cell(row=3, column=c).value for c in range(14, 21)]
         assert prio_headers == ["Source DC", "P0", "P1", "P2", "P3", "P4", "Total Pendency"]
 
         # Check CAR is in summary and CAR-KHR is not
-        dcs_in_summary = [sum_ws.cell(row=r, column=9).value for r in range(4, sum_ws.max_row + 1)]
+        dcs_in_summary = [sum_ws.cell(row=r, column=2).value for r in range(4, sum_ws.max_row + 1)]
         assert "CAR" in dcs_in_summary
         assert "CAR-KHR" not in dcs_in_summary
 
@@ -88,11 +95,13 @@ def test_forward_pendency_stream():
         raw_dcs = [raw_ws.cell(row=r, column=2).value for r in range(2, raw_ws.max_row + 1)]
         assert "CAR" in raw_dcs
         assert "CAR-KHR" not in raw_dcs
+        assert "Shipment Priority" in [raw_ws.cell(row=1, column=c).value for c in range(1, raw_ws.max_column + 1)]
 
-        # Check CPD-DID sheet contains P0, P1, P2, P3 rows and CAR
+        # Check CPD-DID sheet contains headers and P0/P1 + CPD/DID rows
         cpd_ws = res_wb["CPD-DID pendency"]
         cpd_rows = list(cpd_ws.iter_rows(values_only=True))
-        assert len(cpd_rows) == 6  # header + 5 data rows (P2, P3, P0, P1, P0 from CAR-KHR)
+        assert cpd_rows[0] == ("PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2", "Shipment Priority")
+        assert len(cpd_rows) == 6  # header + 5 matching rows (SHIP1001, 1002, 1004, 1005, 1006)
         priorities_in_cpd = [r[4] for r in cpd_rows[1:]]
         assert set(priorities_in_cpd) == {"P0", "P1", "P2", "P3"}
         cpd_dcs = [r[1] for r in cpd_rows[1:]]

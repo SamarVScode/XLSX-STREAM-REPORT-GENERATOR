@@ -14,8 +14,10 @@ Uses Single-Pass Zero-Memory Streaming Engine (core.stream_engine):
 """
 
 import sys
+import re
 import logging
 from pathlib import Path
+from datetime import datetime, date, timedelta
 from collections import defaultdict
 import openpyxl
 from openpyxl import Workbook
@@ -42,8 +44,99 @@ from core.stream_engine import (
 
 PRIMARY_NORTH_DCS = ['ALG', 'AYP', 'DEO', 'JHS', 'JNP', 'MAU', 'MRZ', 'MTH', 'MZN', 'RBR', 'SPR']
 AGING_CATEGORIES = ['0-2 days', '3-5 days', '5-10 days', '>10 days']
+BASE_EXCEL_DATE = datetime(1899, 12, 30)
 
 log = logging.getLogger("ei_stream_server.forward_pendency")
+
+
+def extract_reference_date(input_path: Path) -> date:
+    """Extracts report date from filename or defaults to current date."""
+    fname = input_path.name
+    # Try YYYY-Mon-DD, e.g., 2026-Oct-07
+    m = re.search(r'(\d{4})-([A-Za-z]{3})-(\d{2})', fname)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)}-{m.group(2)}-{m.group(3)}", "%Y-%b-%d").date()
+        except ValueError:
+            pass
+    # Try YYYY-MM-DD
+    m2 = re.search(r'(\d{4})-(\d{2})-(\d{2})', fname)
+    if m2:
+        try:
+            return date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+        except ValueError:
+            pass
+    # Try DD-Mon-YYYY
+    m3 = re.search(r'(\d{2})-([A-Za-z]{3})-(\d{4})', fname)
+    if m3:
+        try:
+            return datetime.strptime(f"{m3.group(1)}-{m3.group(2)}-{m3.group(3)}", "%d-%b-%Y").date()
+        except ValueError:
+            pass
+    return datetime.now().date()
+
+
+def extract_cpd_date(val):
+    """Parses date from Excel serial float, datetime, or text string."""
+    if val is None:
+        return None
+    if isinstance(val, (datetime, date)):
+        return val.date() if isinstance(val, datetime) else val
+    if isinstance(val, (int, float)):
+        try:
+            return (BASE_EXCEL_DATE + timedelta(days=float(val))).date()
+        except Exception:
+            return None
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%d-%b-%Y', '%d-%b-%Y %H:%M:%S', '%d/%m/%Y', '%m/%d/%Y'):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def compute_shipment_priority(cpd_val, target_date: date) -> str:
+    """Classifies shipment based on CPD date: CPD, DID, or Non-CPD."""
+    d = extract_cpd_date(cpd_val)
+    if d is None:
+        return "Non-CPD"
+    if d == target_date:
+        return "CPD"
+    elif d < target_date:
+        return "DID"
+    else:
+        return "Non-CPD"
+
+
+def format_excel_datetime(val):
+    """Converts Excel serial floats or datetimes into readable YYYY-MM-DD HH:MM:SS strings."""
+    if val is None or val == "":
+        return ""
+    if isinstance(val, (datetime, date)):
+        return val.strftime('%Y-%m-%d %H:%M:%S' if isinstance(val, datetime) and (val.hour or val.minute or val.second) else '%Y-%m-%d')
+    if isinstance(val, (int, float)):
+        if 30000 <= val <= 65000:
+            try:
+                dt = BASE_EXCEL_DATE + timedelta(days=float(val))
+                if dt.microsecond >= 500000:
+                    dt = dt + timedelta(seconds=1)
+                dt = dt.replace(microsecond=0)
+                if dt.hour or dt.minute or dt.second:
+                    return dt.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    return dt.strftime('%Y-%m-%d')
+            except Exception:
+                return str(val)
+    return val
 
 
 def compute_aging_category(val) -> str:
@@ -152,7 +245,11 @@ def write_side_table(ws, start_col: int, start_row: int, title: str, headers: li
 
             highlighted = False
             if isinstance(val, (int, float)) and val > 0:
-                if title == "Aging wise report" and h_name in ['3-5 days', '5-10 days', '>10 days']:
+                if title == "CPD Pendency" and h_name in ['CPD', 'DID']:
+                    cell.fill = red_fill
+                    cell.font = red_font
+                    highlighted = True
+                elif title == "Aging wise report" and h_name in ['3-5 days', '5-10 days', '>10 days']:
                     cell.fill = red_fill
                     cell.font = red_font
                     highlighted = True
@@ -176,7 +273,8 @@ def write_side_table(ws, start_col: int, start_row: int, title: str, headers: li
         current_row += 1
 
 
-def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
+def build_summary_sheet_from_pivots(out_wb, t_cpd_pivot, t_aging_pivot, t_prio_pivot):
+    """Generates the Summary tab with Table 1 (CPD Pendency), Table 2 (Aging wise), and Table 3 (Priority)."""
     ws = out_wb.active
     ws.title = "Summary"
     ws.sheet_view.showGridLines = False
@@ -184,77 +282,75 @@ def build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot):
     dc_list = list(PRIMARY_NORTH_DCS)
     for dc in ALLOWED_SOURCE_DCS:
         if dc.upper() not in dc_list:
-            if any(t1_pivot[dc.upper()].values()) or any(t2_pivot[dc.upper()].values()):
+            if any(t_cpd_pivot[dc.upper()].values()) or any(t_aging_pivot[dc.upper()].values()) or any(t_prio_pivot[dc.upper()].values()):
                 dc_list.append(dc.upper())
 
-    table1_headers = ["Source DC"] + AGING_CATEGORIES + ["Total Pendency"]
-    table1_data = []
-    tot_cats_t1 = defaultdict(int)
+    # 1. CPD Pendency Table (FIRST)
+    t1_headers = ["Source DC", "CPD", "DID", "Total Pendency"]
+    t1_data = []
+    tot_cpd = 0
+    tot_did = 0
+    for dc in dc_list:
+        c_cpd = t_cpd_pivot[dc]["CPD"]
+        c_did = t_cpd_pivot[dc]["DID"]
+        t1_data.append([dc, c_cpd, c_did, c_cpd + c_did])
+        tot_cpd += c_cpd
+        tot_did += c_did
+    t1_data.append(["Total", tot_cpd, tot_did, tot_cpd + tot_did])
 
+    # 2. Aging wise report (SECOND)
+    t2_headers = ["Source DC"] + AGING_CATEGORIES + ["Total Pendency"]
+    t2_data = []
+    tot_cats = defaultdict(int)
     for dc in dc_list:
         row_vals = [dc]
         row_tot = 0
         for cat in AGING_CATEGORIES:
-            cnt = t1_pivot[dc][cat]
+            cnt = t_aging_pivot[dc][cat]
             row_vals.append(cnt)
             row_tot += cnt
-            tot_cats_t1[cat] += cnt
+            tot_cats[cat] += cnt
         row_vals.append(row_tot)
-        table1_data.append(row_vals)
+        t2_data.append(row_vals)
+    t2_data.append(["Total"] + [tot_cats[c] for c in AGING_CATEGORIES] + [sum(tot_cats.values())])
 
-    t1_totals = ["Total"] + [tot_cats_t1[cat] for cat in AGING_CATEGORIES] + [sum(tot_cats_t1.values())]
-    table1_data.append(t1_totals)
-
+    # 3. Priority Table (THIRD)
     prio_keys = ["P0", "P1", "P2", "P3", "P4"]
-    table2_headers = ["Source DC"] + prio_keys + ["Total Pendency"]
-    table2_data = []
-    tot_prios_t2 = defaultdict(int)
-
+    t3_headers = ["Source DC"] + prio_keys + ["Total Pendency"]
+    t3_data = []
+    tot_prios = defaultdict(int)
     for dc in dc_list:
         row_vals = [dc]
         row_tot = 0
         for p in prio_keys:
-            cnt = t2_pivot[dc][p]
+            cnt = t_prio_pivot[dc][p]
             row_vals.append(cnt)
             row_tot += cnt
-            tot_prios_t2[p] += cnt
+            tot_prios[p] += cnt
         row_vals.append(row_tot)
-        table2_data.append(row_vals)
-
-    t2_totals = ["Total"] + [tot_prios_t2[p] for p in prio_keys] + [sum(tot_prios_t2.values())]
-    table2_data.append(t2_totals)
-
-    table3_headers = ["Source DC", "CPD (P3)", "DID (P2)", "Total Pendency"]
-    table3_data = []
-    tot_cpd = 0
-    tot_did = 0
-
-    for dc in dc_list:
-        cpd_cnt = t3_pivot[dc]["CPD (P3)"]
-        did_cnt = t3_pivot[dc]["DID (P2)"]
-        row_tot = cpd_cnt + did_cnt
-        table3_data.append([dc, cpd_cnt, did_cnt, row_tot])
-        tot_cpd += cpd_cnt
-        tot_did += did_cnt
-
-    t3_totals = ["Total", tot_cpd, tot_did, tot_cpd + tot_did]
-    table3_data.append(t3_totals)
+        t3_data.append(row_vals)
+    t3_data.append(["Total"] + [tot_prios[p] for p in prio_keys] + [sum(tot_prios.values())])
 
     start_row = 2
-    write_side_table(ws, start_col=2,  start_row=start_row, title="Aging wise report", headers=table1_headers, data_matrix=table1_data)
-    write_side_table(ws, start_col=9,  start_row=start_row, title="Priority Table",    headers=table2_headers, data_matrix=table2_data)
-    write_side_table(ws, start_col=17, start_row=start_row, title="CPD Pendency",     headers=table3_headers, data_matrix=table3_data)
+    # Table 1: CPD Pendency (cols 2 to 5 -> B to E)
+    write_side_table(ws, start_col=2,  start_row=start_row, title="CPD Pendency",     headers=t1_headers, data_matrix=t1_data)
+    # Gap col F (col 6)
+    # Table 2: Aging wise report (cols 7 to 12 -> G to L)
+    write_side_table(ws, start_col=7,  start_row=start_row, title="Aging wise report", headers=t2_headers, data_matrix=t2_data)
+    # Gap col M (col 13)
+    # Table 3: Priority Table (cols 14 to 20 -> N to T)
+    write_side_table(ws, start_col=14, start_row=start_row, title="Priority Table",    headers=t3_headers, data_matrix=t3_data)
 
     ws.column_dimensions['A'].width = 3
-    ws.column_dimensions['H'].width = 4
-    ws.column_dimensions['P'].width = 4
+    ws.column_dimensions['F'].width = 4
+    ws.column_dimensions['M'].width = 4
 
     for col in ws.columns:
         col_letter = get_column_letter(col[0].column)
-        if col_letter in ['A', 'H', 'P']:
+        if col_letter in ['A', 'F', 'M']:
             continue
         max_len = max(len(str(cell.value or '')) for cell in col)
-        ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 13)
 
 
 def generate_forward_pendency_report(input_file: Path, output_file: Path):
@@ -264,6 +360,9 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
     log.info(f"Loading input workbook for Forward Pendency Report (Single-Pass Stream): {input_path}")
+
+    target_date = extract_reference_date(input_path)
+    log.info(f"Target reference date for CPD/DID classification: {target_date}")
 
     all_sheets = get_sheet_names(input_path)
     sheet_map = {name.lower(): name for name in all_sheets}
@@ -277,9 +376,9 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
 
     log.info(f"Using sheet '{target_sheet}' for Forward Pendency Report.")
 
-    t1_pivot = defaultdict(lambda: defaultdict(int))
-    t2_pivot = defaultdict(lambda: defaultdict(int))
-    t3_pivot = defaultdict(lambda: defaultdict(int))
+    t_cpd_pivot = defaultdict(lambda: defaultdict(int))
+    t_aging_pivot = defaultdict(lambda: defaultdict(int))
+    t_prio_pivot = defaultdict(lambda: defaultdict(int))
 
     total_filtered = 0
     cpd_count = 0
@@ -293,22 +392,32 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
             'sdc': ['sourcedc', 'dc', 'sourcedccode', 'sourcedcname', 'sourcehub', 'origin', 'origindc', 'source_dc'],
             'prio': ['customerpriorityv2', 'customerpriority', 'custpriorityv2', 'priority', 'prio', 'customer_priority_v2'],
             'shipment': ['pendingshipments', 'trackingno', 'waybill', 'trackingid', 'shipment', 'awb', 'tracking_number'],
-            'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt', 'attempt_status']
+            'attempt': ['attemptstatus', 'attempt', 'lateststatus', 'laststatus', 'deliveryattempt', 'attempt_status'],
+            'cpd': ['cpdvalue', 'cpd_value', 'cpd']
         })
 
-        aging_col_idx = cf.get('aging', 8)
-        sdc_idx = cf.get('sdc', 24)
-        prio_idx = cf.get('prio', 20)
-        shipment_idx = cf.get('shipment', 2)
+        aging_col_idx = cf.get('aging', 20)
+        sdc_idx = cf.get('sdc', 15)
+        prio_idx = cf.get('prio', 13)
+        shipment_idx = cf.get('shipment', 1)
         attempt_idx = cf.get('attempt', 23)
+        cpd_val_idx = cf.get('cpd', 6)
 
         raw_header_out = list(headers)
-        if aging_col_idx < len(raw_header_out):
-            raw_header_out.insert(aging_col_idx + 1, 'Aging Category')
-        else:
-            raw_header_out.append('Aging Category')
+        insert_cpd_pos = cpd_val_idx + 1
+        raw_header_out.insert(insert_cpd_pos, "Shipment Priority")
 
-        cpd_headers = ["PendingShipments", "Source_DC", "Aging Category", "Attempt_Status", "CustomerPriorityV2"]
+        adjusted_aging_pos = (aging_col_idx + 1) if aging_col_idx < cpd_val_idx else (aging_col_idx + 2)
+        raw_header_out.insert(adjusted_aging_pos, "Aging Category")
+
+        cpd_headers = [
+            "PendingShipments",
+            "Source_DC",
+            "Aging Category",
+            "Attempt_Status",
+            "CustomerPriorityV2",
+            "Shipment Priority"
+        ]
 
         cpd_writer = XmlSheetWriter("CPD-DID pendency", cpd_headers)
         raw_writer = XmlSheetWriter("RAW", raw_header_out)
@@ -330,35 +439,44 @@ def generate_forward_pendency_report(input_file: Path, output_file: Path):
                     raw_prio = row[prio_idx] if len(row) > prio_idx else None
                     prio = normalize_priority(raw_prio)
 
-                    # Aggregate pivots
-                    t1_pivot[sdc_upper][aging_cat] += 1
-                    t2_pivot[sdc_upper][prio] += 1
-                    if prio == "P3":
-                        t3_pivot[sdc_upper]["CPD (P3)"] += 1
-                    elif prio == "P2":
-                        t3_pivot[sdc_upper]["DID (P2)"] += 1
+                    cpd_val = row[cpd_val_idx] if len(row) > cpd_val_idx else None
+                    ship_prio = compute_shipment_priority(cpd_val, target_date)
 
-                    # Write RAW row (insert Aging Category safely and ensure sdc is normalized)
+                    # Aggregate pivots
+                    t_aging_pivot[sdc_upper][aging_cat] += 1
+                    t_prio_pivot[sdc_upper][prio] += 1
+                    if ship_prio in ("CPD", "DID"):
+                        t_cpd_pivot[sdc_upper][ship_prio] += 1
+
+                    # Write RAW row (format dates and insert computed columns)
                     r_out = list(row)
                     r_out[sdc_idx] = sdc_upper
-                    if aging_col_idx < len(r_out):
-                        r_out.insert(aging_col_idx + 1, aging_cat)
-                    else:
-                        r_out.append(aging_cat)
+                    r_out[cpd_val_idx] = format_excel_datetime(cpd_val)
+                    if len(r_out) > 9 and r_out[9]:
+                        r_out[9] = format_excel_datetime(r_out[9])
+                    if len(r_out) > 11 and r_out[11]:
+                        r_out[11] = format_excel_datetime(r_out[11])
+
+                    r_out.insert(insert_cpd_pos, ship_prio)
+                    r_out.insert(adjusted_aging_pos, aging_cat)
                     raw_writer.write_row(r_out)
 
-                    # Write CPD-DID row if P0, P1, P2 or P3
-                    if prio in ("P0", "P1", "P2", "P3"):
+                    # Write CPD-DID row if CPD, DID, or P0/P1
+                    is_cpd_did = ship_prio in ("CPD", "DID")
+                    is_p0_p1 = prio in ("P0", "P1")
+                    if is_cpd_did or is_p0_p1:
                         cpd_count += 1
                         shipment = row[shipment_idx] if len(row) > shipment_idx and row[shipment_idx] is not None else ""
                         attempt_stat = row[attempt_idx] if len(row) > attempt_idx and row[attempt_idx] is not None else ""
-                        cpd_writer.write_row([shipment, sdc_upper, aging_cat, attempt_stat, prio])
+                        cpd_writer.write_row([shipment, sdc_upper, aging_cat, attempt_stat, prio, ship_prio])
 
     log.info(f"Filtered {total_filtered} matching rows ({cpd_count} CPD-DID rows).")
 
-    # Build Summary sheet
+    # Build Summary sheet with pre-registered placeholder tabs for clean OpenXML assembly
     out_wb = Workbook()
-    build_summary_sheet_from_pivots(out_wb, t1_pivot, t2_pivot, t3_pivot)
+    build_summary_sheet_from_pivots(out_wb, t_cpd_pivot, t_aging_pivot, t_prio_pivot)
+    out_wb.create_sheet("CPD-DID pendency")
+    out_wb.create_sheet("RAW")
 
     # Assemble final .xlsx
     assemble_stream_workbook(out_wb, [cpd_writer, raw_writer], output_path)
